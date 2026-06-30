@@ -281,32 +281,105 @@ struct SignedRequest {
     headers: reqwest::header::HeaderMap,
 }
 
+fn aws_config_path() -> std::path::PathBuf {
+    std::env::var("AWS_CONFIG_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_else(|_| ".".to_string());
+            std::path::PathBuf::from(home).join(".aws").join("config")
+        })
+}
+
+fn aws_credentials_path() -> std::path::PathBuf {
+    std::env::var("AWS_SHARED_CREDENTIALS_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_else(|_| ".".to_string());
+            std::path::PathBuf::from(home).join(".aws").join("credentials")
+        })
+}
+
 fn load_region() -> String {
     std::env::var("AWS_REGION")
         .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+        .or_else(|_| read_region_from_config())
         .unwrap_or_else(|_| "us-east-1".to_string())
 }
 
+fn read_region_from_config() -> Result<String, std::env::VarError> {
+    let profile = std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".to_string());
+    let config_path = aws_config_path();
+    let text = std::fs::read_to_string(config_path).map_err(|_| std::env::VarError::NotPresent)?;
+    let section = if profile == "default" {
+        "default".to_string()
+    } else {
+        format!("profile {}", profile)
+    };
+    parse_ini_value(&text, &section, "region")
+        .ok_or(std::env::VarError::NotPresent)
+}
+
 fn load_credentials() -> ProviderResult<AwsCredentials> {
-    let access_key_id = std::env::var("AWS_ACCESS_KEY_ID")
-        .or_else(|_| std::env::var("AWS_ACCESS_KEY"))
-        .map_err(|_| ProviderError::Auth(
-            "AWS_ACCESS_KEY_ID not set. Set AWS credentials or configure AWS_PROFILE.".to_string()
-        ))?;
+    let profile = std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".to_string());
 
-    let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY")
-        .or_else(|_| std::env::var("AWS_SECRET_KEY"))
-        .map_err(|_| ProviderError::Auth(
-            "AWS_SECRET_ACCESS_KEY not set.".to_string()
-        ))?;
+    let from_file = || -> Option<AwsCredentials> {
+        let cred_path = aws_credentials_path();
+        let text = std::fs::read_to_string(cred_path).ok()?;
+        let access_key_id = parse_ini_value(&text, &profile, "aws_access_key_id")?;
+        let secret_access_key = parse_ini_value(&text, &profile, "aws_secret_access_key")?;
+        let session_token = parse_ini_value(&text, &profile, "aws_session_token");
+        Some(AwsCredentials {
+            access_key_id,
+            secret_access_key,
+            session_token,
+        })
+    };
 
-    let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
+    let from_env = || -> Option<AwsCredentials> {
+        let access_key_id = std::env::var("AWS_ACCESS_KEY_ID")
+            .or_else(|_| std::env::var("AWS_ACCESS_KEY")).ok()?;
+        let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY")
+            .or_else(|_| std::env::var("AWS_SECRET_KEY")).ok()?;
+        let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
+        Some(AwsCredentials { access_key_id, secret_access_key, session_token })
+    };
 
-    Ok(AwsCredentials {
-        access_key_id,
-        secret_access_key,
-        session_token,
+    from_env().or_else(from_file).ok_or_else(|| {
+        ProviderError::Auth(
+            "AWS credentials not found. Set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY env vars \
+             or configure ~/.aws/credentials."
+                .to_string(),
+        )
     })
+}
+
+fn parse_ini_value(text: &str, section: &str, key: &str) -> Option<String> {
+    let mut in_target_section = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            let name = &line[1..line.len() - 1].trim();
+            in_target_section = section == *name;
+            continue;
+        }
+        if in_target_section {
+            if let Some(eq) = line.find('=') {
+                let k = line[..eq].trim();
+                let v = line[eq + 1..].trim();
+                if k == key {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn url_encode_model(model: &str) -> String {
