@@ -1,5 +1,6 @@
 use clap::Parser;
 use rs_agent::ai::anthropic::AnthropicProvider;
+use rs_agent::ai::bedrock::BedrockProvider;
 use rs_agent::ai::opencode_cli::OpenCodeCliProvider;
 use rs_agent::ai::openai::OpenAIProvider;
 use rs_agent::ai::provider::Provider;
@@ -32,8 +33,12 @@ fn get_provider(name: &str, base_url: Option<&str>, default_model: Option<&str>)
             None,
             default_model.map(|s| s.to_string()),
         ))),
+        "bedrock" => Ok(Arc::new(BedrockProvider::new(
+            base_url.map(|s| s.to_string()),
+            None,
+        ))),
         _ => Err(format!(
-            "Unknown provider: {}. Supported: openai, anthropic, opencode, opencode-cli",
+            "Unknown provider: {}. Supported: openai, anthropic, opencode, opencode-cli, bedrock",
             name
         )),
     }
@@ -42,6 +47,7 @@ fn get_provider(name: &str, base_url: Option<&str>, default_model: Option<&str>)
 fn get_default_model(provider: &str) -> &str {
     match provider {
         "anthropic" => "claude-sonnet-4-20250514",
+        "bedrock" => "anthropic.claude-3-5-sonnet-20241022-v2:0",
         "opencode" | "opencode-cli" => "opencode/deepseek-v4-flash-free",
         _ => "gpt-4o",
     }
