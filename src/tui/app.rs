@@ -206,6 +206,7 @@ impl App {
             AgentEvent::Done => {
                 self.status = "ready".to_string();
                 self.input_mode = InputMode::Insert;
+                self.input.clear();
             }
             AgentEvent::ToolUseDelta { input: _ } => {}
         }
@@ -241,6 +242,7 @@ impl App {
             KeyCode::Enter => {
                 if !self.input.trim().is_empty() {
                     let text = std::mem::take(&mut self.input);
+                    self.input.push_str(&text);
                     self.input_mode = InputMode::Waiting;
 
                     self.messages.push(ChatMessage {
@@ -307,19 +309,17 @@ impl App {
             }
         }
 
-        let total_lines = lines.len();
-        let visible_rows = (area.height as usize).saturating_sub(1);
-        let scroll_offset = total_lines.saturating_sub(visible_rows) as u16;
+        let inner_height = (area.height as usize).saturating_sub(1);
+        let start = lines.len().saturating_sub(inner_height);
+        let visible_lines: Vec<Line> = lines.into_iter().skip(start).collect();
 
-        let chat = Paragraph::new(lines)
+        let chat = Paragraph::new(visible_lines)
             .block(
                 Block::default()
                     .borders(Borders::TOP)
                     .title(" Chat ")
                     .title_alignment(ratatui::layout::Alignment::Center),
-            )
-            .wrap(Wrap { trim: false })
-            .scroll((0, scroll_offset));
+            );
 
         frame.render_widget(chat, area);
     }

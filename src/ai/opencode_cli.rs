@@ -150,6 +150,7 @@ impl OpenCodeCliProvider {
     }
 
     fn parse_tool_calls(text: &str) -> Vec<(String, String, serde_json::Value)> {
+        let stripped = text.replace("<tool_call>", "").replace("</tool_call>", "");
         let re = Regex::new(r"<tool_call>([\s\S]*?)</tool_call>").unwrap();
         let mut calls = Vec::new();
         for cap in re.captures_iter(text) {
@@ -204,11 +205,11 @@ impl OpenCodeCliProvider {
         }
         if calls.is_empty() {
             let bare_re = Regex::new(r#"\{\s*"name"\s*:"#).unwrap();
-            if let Some(m) = bare_re.find(text) {
+            if let Some(m) = bare_re.find(&stripped) {
                 let start = m.start();
                 let mut depth = 0i32;
-                let mut end = text.len();
-                for (i, ch) in text[start..].char_indices() {
+                let mut end = stripped.len();
+                for (i, ch) in stripped[start..].char_indices() {
                     if ch == '{' { depth += 1; }
                     else if ch == '}' {
                         depth -= 1;
@@ -219,7 +220,7 @@ impl OpenCodeCliProvider {
                     }
                 }
                 if depth == 0 {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text[start..end]) {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&stripped[start..end]) {
                         if let Some(name) = value["name"].as_str() {
                             if value["arguments"].is_object() {
                                 let id = value["id"]
@@ -505,13 +506,98 @@ impl Provider for OpenCodeCliProvider {
                                                         }));
                                                         content_index += 1;
                                                     }
+                                                    tool_call_buffer.clear();
+                                                } else if tool_call_buffer.contains("<tool_call>") {
+                                                    // Try to merge {"name":...} from outside with {"arguments":...} inside <tool_call>
+                                                    let stripped = tool_call_buffer
+                                                        .replace("<tool_call>", "")
+                                                        .replace("</tool_call>", "");
+                                                    // Find name from any {"name":...} object in the buffer
+                                                    let mut tool_name = String::new();
+                                                    let mut tool_args: Option<serde_json::Value> = None;
+                                                    // Extract all JSON objects from stripped text and merge
+                                                    let mut pos = 0usize;
+                                                    let bytes = stripped.as_bytes();
+                                                    while pos < bytes.len() {
+                                                        // Find next '{'
+                                                        if let Some(open) = stripped[pos..].find('{') {
+                                                            let abs_open = pos + open;
+                                                            let mut depth = 0i32;
+                                                            let mut close = bytes.len();
+                                                            for (i, ch) in stripped[abs_open..].char_indices() {
+                                                                if ch == '{' { depth += 1; }
+                                                                else if ch == '}' {
+                                                                    depth -= 1;
+                                                                    if depth == 0 {
+                                                                        close = abs_open + i + 1;
+                                                                        break;
+                                                                    }
+                                                                }
+                                                            }
+                                                            if depth == 0 {
+                                                                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&stripped[abs_open..close]) {
+                                                                    if let Some(n) = val["name"].as_str() {
+                                                                        if !n.is_empty() {
+                                                                            tool_name = n.to_string();
+                                                                        }
+                                                                    }
+                                                                    if val["arguments"].is_object() {
+                                                                        tool_args = Some(val["arguments"].clone());
+                                                                    }
+                                                                }
+                                                                pos = close;
+                                                            } else {
+                                                                pos = abs_open + 1;
+                                                            }
+                                                        } else {
+                                                            break;
+                                                        }
+                                                    }
+                                                    if !tool_name.is_empty() && tool_args.is_some() {
+                                                        tool_call_pending = true;
+                                                        let args_str = serde_json::to_string(&tool_args.unwrap()).unwrap_or_default();
+                                                        let id = format!("call_{}", content_index);
+                                                        let _ = tx.send(Ok(StreamDelta {
+                                                            content_index,
+                                                            r#type: DeltaType::ToolCallStart {
+                                                                id,
+                                                                name: tool_name,
+                                                                input: args_str,
+                                                            },
+                                                        }));
+                                                        content_index += 1;
+                                                    } else if let Some(ref args) = tool_args {
+                                                        // Have arguments but no name — try to extract name from JSON keys
+                                                        if let Some(name_from_args) = args.get("name").and_then(|v| v.as_str()) {
+                                                            tool_call_pending = true;
+                                                            let args_str = serde_json::to_string(args).unwrap_or_default();
+                                                            let id = format!("call_{}", content_index);
+                                                            let _ = tx.send(Ok(StreamDelta {
+                                                                content_index,
+                                                                r#type: DeltaType::ToolCallStart {
+                                                                    id,
+                                                                    name: name_from_args.to_string(),
+                                                                    input: args_str,
+                                                                },
+                                                            }));
+                                                            content_index += 1;
+                                                        }
+                                                    }
+                                                    if !tool_call_pending {
+                                                        // Failed to extract — emit as text so user sees the raw tool call
+                                                        let _ = tx.send(Ok(StreamDelta {
+                                                            content_index,
+                                                            r#type: DeltaType::Text { text: tool_call_buffer.clone() },
+                                                        }));
+                                                    }
+                                                    tool_call_buffer.clear();
                                                 } else {
                                                     let _ = tx.send(Ok(StreamDelta {
                                                         content_index,
                                                         r#type: DeltaType::Text { text: tool_call_buffer.clone() },
                                                     }));
+                                                    tool_call_buffer.clear();
                                                 }
-                                                tool_call_buffer.clear();
                                             }
                                             if !tool_call_pending {
                                                 let _ = tx.send(Ok(StreamDelta {
