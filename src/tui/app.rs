@@ -40,6 +40,8 @@ pub struct App {
     status: String,
     command_tx: channel::Sender<AppCommand>,
     event_rx: channel::Receiver<(usize, AgentEvent)>,
+    scroll_offset: usize,
+    follow_bottom: bool,
 }
 
 impl App {
@@ -117,6 +119,8 @@ impl App {
             status: "ready".to_string(),
             command_tx,
             event_rx,
+            scroll_offset: 0,
+            follow_bottom: true,
         }
     }
 
@@ -163,6 +167,7 @@ impl App {
                 if let Some(last) = self.messages.last_mut() {
                     last.text.push_str(&text);
                 }
+                self.follow_bottom = true;
             }
             AgentEvent::ThinkingDelta { thinking } => {
                 if let Some(last) = self.messages.last_mut() {
@@ -175,6 +180,7 @@ impl App {
                 if let Some(last) = self.messages.last_mut() {
                     last.text.push_str(&format!("\n🛠 Using {}...", name));
                 }
+                self.follow_bottom = true;
             }
             AgentEvent::ToolResult { id: _, name, result } => {
                 let mut preview: String = result.content.chars().take(100).collect();
@@ -192,6 +198,7 @@ impl App {
                         last.text.push_str(&format!("\n✅ [{}] {}", name, preview));
                     }
                 }
+                self.follow_bottom = true;
             }
             AgentEvent::Error { message } => {
                 if let Some(last) = self.messages.last_mut() {
@@ -233,6 +240,20 @@ impl App {
         match key.code {
             KeyCode::Char('i') => self.input_mode = InputMode::Insert,
             KeyCode::Char('q') => self.should_exit = true,
+            KeyCode::Up => {
+                self.follow_bottom = false;
+                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                self.scroll_offset = self.scroll_offset.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                self.follow_bottom = false;
+                self.scroll_offset = self.scroll_offset.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                self.scroll_offset = self.scroll_offset.saturating_add(10);
+            }
             _ => {}
         }
     }
@@ -254,6 +275,7 @@ impl App {
                         text: String::new(),
                     });
 
+                    self.follow_bottom = true;
                     self.status = "thinking...".to_string();
                     let _ = self.command_tx.send(AppCommand::Submit { text });
                 }
@@ -267,7 +289,7 @@ impl App {
         }
     }
 
-    fn render(&self, frame: &mut Frame) {
+    fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -283,7 +305,7 @@ impl App {
         self.render_status(frame, chunks[2]);
     }
 
-    fn render_messages(&self, frame: &mut Frame, area: Rect) {
+    fn render_messages(&mut self, frame: &mut Frame, area: Rect) {
         let mut lines: Vec<Line> = Vec::new();
         for msg in &self.messages {
             let (prefix, color) = match msg.role.as_str() {
@@ -310,7 +332,11 @@ impl App {
         }
 
         let inner_height = (area.height as usize).saturating_sub(1);
-        let start = lines.len().saturating_sub(inner_height);
+        let total = lines.len();
+        if self.follow_bottom || self.scroll_offset + inner_height > total {
+            self.scroll_offset = total.saturating_sub(inner_height);
+        }
+        let start = self.scroll_offset.min(total.saturating_sub(inner_height));
         let visible_lines: Vec<Line> = lines.into_iter().skip(start).collect();
 
         let chat = Paragraph::new(visible_lines)
@@ -324,7 +350,7 @@ impl App {
         frame.render_widget(chat, area);
     }
 
-    fn render_input(&self, frame: &mut Frame, area: Rect) {
+    fn render_input(&mut self, frame: &mut Frame, area: Rect) {
         let mode_indicator = match self.input_mode {
             InputMode::Normal => " NORMAL ",
             InputMode::Insert => " INSERT ",
@@ -358,7 +384,7 @@ impl App {
         }
     }
 
-    fn render_status(&self, frame: &mut Frame, area: Rect) {
+    fn render_status(&mut self, frame: &mut Frame, area: Rect) {
         let status = Line::from(vec![
             Span::styled(" ^C quit | ", Style::default().fg(Color::DarkGray)),
             Span::styled(
