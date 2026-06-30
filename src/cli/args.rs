@@ -1,0 +1,32 @@
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+#[command(name = "rs-agent", version, about = "Minimalist AI agent toolkit")]
+pub struct Cli {
+    #[arg(long, default_value = "openai")]
+    pub provider: String,
+
+    #[arg(long)]
+    pub model: Option<String>,
+
+    #[arg(long)]
+    pub api_key: Option<String>,
+
+    #[arg(long)]
+    pub api_key_env: Option<String>,
+
+    #[arg(long, default_value = "false")]
+    pub stream: bool,
+
+    #[arg(short = 'p', long)]
+    pub prompt: Option<String>,
+
+    #[arg(long)]
+    pub base_url: Option<String>,
+
+    #[arg(long, default_value_t = 300)]
+    pub timeout: u64,
+
+    #[arg(long, default_value = "false")]
+    pub list_models: bool,
+}

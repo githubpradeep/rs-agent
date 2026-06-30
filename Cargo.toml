@@ -1,0 +1,41 @@
+[package]
+name = "rs-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Minimalist AI agent toolkit: unified LLM API, agent loop, TUI, coding agent CLI"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+tokio-stream = "0.1"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Utilities
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+directories = "6"
+crossbeam-channel = "0.5"
+regex = "1"
+tempfile = "3"
