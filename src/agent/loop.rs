@@ -203,14 +203,13 @@ impl AgentLoop {
         let mut stop_reason: Option<StopReason> = None;
         let model = String::new();
         let msg_id: Option<String> = None;
-
         while let Some(result) = stream.next().await {
             match result {
                 Ok(delta) => {
                     let idx = delta.content_index as usize;
                     match delta.r#type {
                         DeltaType::Text { text } => {
-                            if content_blocks.len() <= idx { content_blocks.push(None); }
+                            if content_blocks.len() <= idx { content_blocks.resize(idx + 1, None); }
                             callback(AgentEvent::TextDelta { text: text.clone() });
                             if let Some(Some(b)) = content_blocks.get_mut(idx) {
                                 if b.content_type == ContentType::Text {
@@ -225,7 +224,7 @@ impl AgentLoop {
                             }
                         }
                         DeltaType::Thinking { thinking } => {
-                            if content_blocks.len() <= idx { content_blocks.push(None); }
+                            if content_blocks.len() <= idx { content_blocks.resize(idx + 1, None); }
                             callback(AgentEvent::ThinkingDelta { thinking: thinking.clone() });
                             if let Some(Some(b)) = content_blocks.get_mut(idx) {
                                 if b.content_type == ContentType::Thinking {
@@ -245,8 +244,8 @@ impl AgentLoop {
                             }
                         }
                         DeltaType::ToolCallStart { id, name, input } => {
-                            if content_blocks.len() <= idx { content_blocks.push(None); }
-                            if tool_arg_buf.len() <= idx { tool_arg_buf.push(String::new()); }
+                            if content_blocks.len() <= idx { content_blocks.resize(idx + 1, None); }
+                            if tool_arg_buf.len() <= idx { tool_arg_buf.resize(idx + 1, String::new()); }
                             callback(AgentEvent::ToolUseStart { id: id.clone(), name: name.clone() });
                             content_blocks[idx] = Some(Content {
                                 content_type: ContentType::ToolUse,
@@ -260,7 +259,8 @@ impl AgentLoop {
                         DeltaType::ToolCallDelta { input } => {
                             callback(AgentEvent::ToolUseDelta { input: input.clone() });
                             if tool_arg_buf.len() <= idx {
-                                tool_arg_buf.push(input);
+                                tool_arg_buf.resize(idx + 1, String::new());
+                                tool_arg_buf[idx] = input;
                             } else {
                                 tool_arg_buf[idx].push_str(&input);
                             }

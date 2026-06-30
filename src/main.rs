@@ -47,7 +47,7 @@ fn get_provider(name: &str, base_url: Option<&str>, default_model: Option<&str>)
 fn get_default_model(provider: &str) -> &str {
     match provider {
         "anthropic" => "claude-sonnet-4-20250514",
-        "bedrock" => "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "bedrock" => "us.anthropic.claude-opus-4-8",
         "opencode" | "opencode-cli" => "opencode/deepseek-v4-flash-free",
         _ => "gpt-4o",
     }
@@ -69,6 +69,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if cli.provider.to_lowercase() == "opencode-cli" {
         std::env::set_var("OPENCODE_API_KEY", "cli-mode-no-key-needed");
+    }
+
+    if cli.provider.to_lowercase() == "bedrock" {
+        if std::env::var("AWS_ACCESS_KEY_ID").is_err() {
+            rs_agent::ai::bedrock::export_credentials_from_file();
+        }
     }
 
     let env_name = provider.api_key_env_var().to_string();

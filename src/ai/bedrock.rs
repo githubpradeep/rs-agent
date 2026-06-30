@@ -34,7 +34,7 @@ impl BedrockProvider {
         format!(
             "https://bedrock-runtime.{region}.amazonaws.com/model/{model}/{path}",
             region = self.region,
-            model = url_encode_model(model),
+            model = model,
         )
     }
 
@@ -145,39 +145,38 @@ impl BedrockProvider {
             });
         }
 
-        let stream = response
-            .bytes_stream()
-            .flat_map(move |chunk| {
-                let result = match chunk {
-                    Ok(bytes) => {
-                        let text = String::from_utf8_lossy(&bytes);
-                        let mut deltas = Vec::new();
-                        for line in text.lines() {
-                            let line = line.trim();
-                            if line.is_empty() {
-                                continue;
-                            }
-                            let json_str = if let Some(s) = line.strip_prefix("data: ") {
-                                if s == "[DONE]" {
-                                    continue;
-                                }
-                                s
-                            } else {
-                                line
+        let byte_stream = response.bytes_stream();
+        let stream = futures::stream::unfold(
+            (byte_stream, Vec::new()),
+            |(mut stream, mut buf)| async move {
+                loop {
+                    if buf.len() >= 4 {
+                        let total_len = u32::from_be_bytes(buf[..4].try_into().unwrap()) as usize;
+                        if buf.len() >= total_len {
+                            let msg_bytes = buf[..total_len].to_vec();
+                            buf.drain(..total_len);
+                            let result = match parse_converse_stream_event(&msg_bytes) {
+                                Some(delta) => Ok(delta),
+                                None => continue,
                             };
-                            if let Some(delta) = parse_converse_stream_event(json_str) {
-                                deltas.push(delta);
-                            }
+                            return Some((result, (stream, buf)));
                         }
-                        Ok(deltas)
                     }
-                    Err(e) => Err(ProviderError::Stream(e.to_string())),
-                };
-                futures::stream::iter(match result {
-                    Ok(deltas) => deltas.into_iter().map(Ok).collect::<Vec<_>>(),
-                    Err(e) => vec![Err(e)],
-                })
-            });
+                    match stream.next().await {
+                        Some(Ok(chunk)) => {
+                            buf.extend_from_slice(&chunk);
+                        }
+                        Some(Err(e)) => {
+                            return Some((
+                                Err(ProviderError::Stream(e.to_string())),
+                                (stream, buf),
+                            ));
+                        }
+                        None => return None,
+                    }
+                }
+            },
+        );
 
         let boxed: BoxStream = Box::pin(stream);
         Ok(boxed)
@@ -217,7 +216,7 @@ impl Provider for BedrockProvider {
             .map_err(|e| ProviderError::Other(e.to_string()))?;
 
         let url = format!(
-            "https://bedrock-runtime.{region}.amazonaws.com/foundation-models",
+            "https://bedrock.{region}.amazonaws.com/foundation-models",
             region = self.region
         );
 
@@ -239,8 +238,10 @@ impl Provider for BedrockProvider {
             .await
             .map_err(|e| ProviderError::Other(e.to_string()))?;
 
-        if !resp.status().is_success() {
-            return Ok(Vec::new());
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(ProviderError::Http(status.as_u16(), text));
         }
 
         let data: serde_json::Value = resp
@@ -248,7 +249,7 @@ impl Provider for BedrockProvider {
             .await
             .map_err(|e| ProviderError::Parse(e.to_string()))?;
 
-        let models = data["models"]
+        let models = data["modelSummaries"]
             .as_array()
             .map(|arr| {
                 arr.iter()
@@ -323,6 +324,25 @@ fn read_region_from_config() -> Result<String, std::env::VarError> {
         .ok_or(std::env::VarError::NotPresent)
 }
 
+pub fn export_credentials_from_file() {
+    let profile = std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".to_string());
+    let cred_path = aws_credentials_path();
+    let text = std::fs::read_to_string(cred_path).ok();
+    let region = load_region();
+    if let Some(ref text) = text {
+        if let Some(ak) = parse_ini_value(text, &profile, "aws_access_key_id") {
+            std::env::set_var("AWS_ACCESS_KEY_ID", &ak);
+        }
+        if let Some(sk) = parse_ini_value(text, &profile, "aws_secret_access_key") {
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", &sk);
+        }
+        if let Some(st) = parse_ini_value(text, &profile, "aws_session_token") {
+            std::env::set_var("AWS_SESSION_TOKEN", &st);
+        }
+    }
+    std::env::set_var("AWS_REGION", &region);
+}
+
 fn load_credentials() -> ProviderResult<AwsCredentials> {
     let profile = std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".to_string());
 
@@ -382,10 +402,6 @@ fn parse_ini_value(text: &str, section: &str, key: &str) -> Option<String> {
     None
 }
 
-fn url_encode_model(model: &str) -> String {
-    model.replace(':', "%3A")
-}
-
 fn sign_request(
     url: &str,
     method: &str,
@@ -402,7 +418,14 @@ fn sign_request(
     let timestamp = format_timestamp(now);
     let date = &timestamp[..8];
 
-    let (host, canonical_uri, canonical_query) = parse_url(url);
+    let parsed_url = reqwest::Url::parse(url)
+        .map_err(|e| ProviderError::Other(e.to_string()))?;
+    let host = parsed_url.host_str().unwrap_or("").to_string();
+    let canonical_query = parsed_url.query().unwrap_or("");
+
+    // SigV4 canonical URI must use RFC 3986 percent-encoding for all
+    // characters except unreserved (A-Z, a-z, 0-9, -, _, ., ~)
+    let canonical_uri = percent_encode_path(parsed_url.path());
 
     let body_hash = hex::encode(Sha256::digest(body));
 
@@ -509,35 +532,32 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
-fn parse_url(url: &str) -> (String, String, String) {
-    let without_scheme = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
-    let (host, rest) = match without_scheme.split_once('/') {
-        Some((h, r)) => (h.to_string(), format!("/{}", r)),
-        None => (without_scheme.to_string(), "/".to_string()),
-    };
-    let (path, query) = match rest.split_once('?') {
-        Some((p, q)) => (p.to_string(), q.to_string()),
-        None => (rest, String::new()),
-    };
-    (host, path, query)
+fn percent_encode_path(path: &str) -> String {
+    let mut result = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                result.push(byte as char);
+            }
+            _ => {
+                result.push_str(&format!("%{:02X}", byte));
+            }
+        }
+    }
+    result
 }
 
 // ── Bedrock Converse API body builder ─────────────────────────────
 
 fn build_converse_body(request: &ChatRequest) -> ProviderResult<serde_json::Value> {
-    let mut body = serde_json::json!({
-        "anthropic_version": "bedrock-2023-05-31",
-    });
+    let mut body = serde_json::Map::new();
 
     let messages = convert_messages(&request.messages, &request.system)?;
-    body["messages"] = serde_json::json!(messages);
+    body.insert("messages".to_string(), serde_json::json!(messages));
 
     if let Some(system) = &request.system {
         if !system.is_empty() {
-            body["system"] = serde_json::json!([{"type": "text", "text": system}]);
+            body.insert("system".to_string(), serde_json::json!([{"text": system}]));
         }
     }
 
@@ -545,14 +565,11 @@ fn build_converse_body(request: &ChatRequest) -> ProviderResult<serde_json::Valu
         "maxTokens": request.max_tokens,
     });
 
-    if let Some(temp) = request.temperature {
-        inference_config["temperature"] = serde_json::json!(temp);
-    }
     if let Some(top_p) = request.top_p {
         inference_config["topP"] = serde_json::json!(top_p);
     }
 
-    body["inferenceConfig"] = inference_config;
+    body.insert("inferenceConfig".to_string(), inference_config);
 
     if !request.tools.is_empty() {
         let tools: Vec<serde_json::Value> = request
@@ -570,12 +587,12 @@ fn build_converse_body(request: &ChatRequest) -> ProviderResult<serde_json::Valu
                 })
             })
             .collect();
-        body["toolConfig"] = serde_json::json!({
+        body.insert("toolConfig".to_string(), serde_json::json!({
             "tools": tools
-        });
+        }));
     }
 
-    Ok(body)
+    Ok(serde_json::Value::Object(body))
 }
 
 fn convert_messages(
@@ -716,40 +733,186 @@ fn parse_converse_response(data: serde_json::Value) -> ProviderResult<AssistantM
     })
 }
 
-fn parse_converse_stream_event(json_str: &str) -> Option<StreamDelta> {
-    let value: serde_json::Value = serde_json::from_str(json_str).ok()?;
+fn parse_event_stream_message(data: &[u8]) -> Option<(String, serde_json::Value)> {
+    if data.len() < 12 {
+        return None;
+    }
 
-    match value["type"].as_str() {
-        Some("contentBlockStart") => {
-            let index = value["contentBlockIndex"].as_u64().unwrap_or(0) as u32;
-            value["start"]["toolUse"].as_object().map(|tool_use| StreamDelta {
-                content_index: index,
-                r#type: DeltaType::ToolCallStart {
-                    id: tool_use["toolUseId"].as_str().unwrap_or("").to_string(),
-                    name: tool_use["name"].as_str().unwrap_or("").to_string(),
-                    input: String::new(),
-                },
-            })
+    let total_length = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
+    let headers_length = u32::from_be_bytes(data[4..8].try_into().unwrap()) as usize;
+
+    if data.len() < total_length {
+        return None;
+    }
+
+    let mut pos: usize = 12;
+    let headers_end = pos + headers_length;
+    let mut event_type = String::new();
+
+    while pos + 1 < headers_end {
+        let name_len = data[pos] as usize;
+        pos += 1;
+        if pos + name_len > headers_end {
+            break;
         }
-        Some("contentBlockDelta") => {
-            let index = value["contentBlockIndex"].as_u64().unwrap_or(0) as u32;
-            match value["delta"]["type"].as_str() {
-                Some("text") => Some(StreamDelta {
-                    content_index: index,
-                    r#type: DeltaType::Text {
-                        text: value["delta"]["text"].as_str().unwrap_or("").to_string(),
-                    },
-                }),
-                Some("toolUse") => Some(StreamDelta {
-                    content_index: index,
-                    r#type: DeltaType::ToolCallDelta {
-                        input: value["delta"]["input"].as_str().unwrap_or("").to_string(),
-                    },
-                }),
-                _ => None,
+        let name = std::str::from_utf8(&data[pos..pos + name_len]).ok()?;
+        pos += name_len;
+
+        if pos >= headers_end {
+            break;
+        }
+        let value_type = data[pos];
+        pos += 1;
+
+        let value = parse_header_value(data, &mut pos, value_type, headers_end);
+        if name == ":event-type" {
+            if let Some(val) = value.and_then(|v| v.as_str().map(|s| s.to_string())) {
+                event_type = val;
             }
         }
-        Some("messageStop") => {
+    }
+
+    if event_type.is_empty() {
+        return None;
+    }
+
+    let payload_start = pos;
+    let payload_end = total_length - 4;
+
+    if payload_start >= payload_end {
+        return None;
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&data[payload_start..payload_end]).ok()?;
+    Some((event_type, json))
+}
+
+fn parse_header_value(
+    data: &[u8],
+    pos: &mut usize,
+    value_type: u8,
+    end: usize,
+) -> Option<serde_json::Value> {
+    match value_type {
+        0 => Some(serde_json::Value::Bool(true)),
+        1 => Some(serde_json::Value::Bool(false)),
+        2 => {
+            if *pos + 1 > end {
+                return None;
+            }
+            let v = data[*pos];
+            *pos += 1;
+            Some(serde_json::json!(v))
+        }
+        3 => {
+            if *pos + 2 > end {
+                return None;
+            }
+            let v = i16::from_be_bytes(data[*pos..*pos + 2].try_into().ok()?);
+            *pos += 2;
+            Some(serde_json::json!(v))
+        }
+        4 => {
+            if *pos + 4 > end {
+                return None;
+            }
+            let v = i32::from_be_bytes(data[*pos..*pos + 4].try_into().ok()?);
+            *pos += 4;
+            Some(serde_json::json!(v))
+        }
+        5 => {
+            if *pos + 8 > end {
+                return None;
+            }
+            let v = i64::from_be_bytes(data[*pos..*pos + 8].try_into().ok()?);
+            *pos += 8;
+            Some(serde_json::json!(v))
+        }
+        6 | 7 => {
+            if *pos + 2 > end {
+                return None;
+            }
+            let len = u16::from_be_bytes(data[*pos..*pos + 2].try_into().ok()?) as usize;
+            *pos += 2;
+            if *pos + len > end {
+                return None;
+            }
+            if value_type == 6 {
+                let bytes = data[*pos..*pos + len].to_vec();
+                *pos += len;
+                Some(serde_json::Value::Array(
+                    bytes.into_iter().map(|b| serde_json::json!(b)).collect(),
+                ))
+            } else {
+                let s = std::str::from_utf8(&data[*pos..*pos + len])
+                    .ok()?
+                    .to_string();
+                *pos += len;
+                Some(serde_json::Value::String(s))
+            }
+        }
+        8 => {
+            if *pos + 8 > end {
+                return None;
+            }
+            *pos += 8;
+            Some(serde_json::Value::Null)
+        }
+        9 => {
+            if *pos + 16 > end {
+                return None;
+            }
+            *pos += 16;
+            Some(serde_json::Value::Null)
+        }
+        _ => None,
+    }
+}
+
+fn parse_converse_stream_event(data: &[u8]) -> Option<StreamDelta> {
+    let (event_type, value) = parse_event_stream_message(data)?;
+
+    match event_type.as_str() {
+        "contentBlockStart" => {
+            let index = value["contentBlockIndex"].as_u64().unwrap_or(0) as u32;
+            if let Some(tool_use) = value["start"]["toolUse"].as_object() {
+                Some(StreamDelta {
+                    content_index: index,
+                    r#type: DeltaType::ToolCallStart {
+                        id: tool_use["toolUseId"].as_str().unwrap_or("").to_string(),
+                        name: tool_use["name"].as_str().unwrap_or("").to_string(),
+                        input: String::new(),
+                    },
+                })
+            } else {
+                None
+            }
+        }
+        "contentBlockDelta" => {
+            let index = value["contentBlockIndex"].as_u64().unwrap_or(0) as u32;
+            let delta = &value["delta"];
+            if let Some(text) = delta["text"].as_str() {
+                Some(StreamDelta {
+                    content_index: index,
+                    r#type: DeltaType::Text {
+                        text: text.to_string(),
+                    },
+                })
+            } else if delta["toolUse"].is_object() {
+                Some(StreamDelta {
+                    content_index: index,
+                    r#type: DeltaType::ToolCallDelta {
+                        input: delta["toolUse"]["input"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string(),
+                    },
+                })
+            } else {
+                None
+            }
+        }
+        "messageStop" => {
             let stop_reason = value["stopReason"].as_str().map(|r| match r {
                 "end_turn" => StopReason::EndTurn,
                 "tool_use" => StopReason::ToolUse,
