@@ -3,7 +3,7 @@ use crate::agent::state::AgentState;
 use crate::agent::AgentLoop;
 use crate::ai::provider::Provider;
 use crossbeam_channel as channel;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -129,7 +129,7 @@ impl App {
         let mut stdout = io::stdout();
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(&mut stdout))?;
-        crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
+        crossterm::execute!(io::stdout(), EnterAlternateScreen, crossterm::event::EnableMouseCapture)?;
 
         loop {
             terminal.draw(|f| self.render(f))?;
@@ -149,7 +149,7 @@ impl App {
 
         let _ = self.command_tx.send(AppCommand::Exit);
         terminal::disable_raw_mode()?;
-        crossterm::execute!(io::stdout(), LeaveAlternateScreen)?;
+        crossterm::execute!(io::stdout(), LeaveAlternateScreen, crossterm::event::DisableMouseCapture)?;
         Ok(())
     }
 
@@ -221,6 +221,18 @@ impl App {
 
     fn handle_event(&mut self, event: Event) -> io::Result<()> {
         match event {
+            Event::Mouse(mouse) => {
+                self.follow_bottom = false;
+                match mouse.kind {
+                    MouseEventKind::ScrollDown => {
+                        self.scroll_offset = self.scroll_offset.saturating_add(3);
+                    }
+                    MouseEventKind::ScrollUp => {
+                        self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                    }
+                    _ => {}
+                }
+            }
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.should_exit = true;
