@@ -33,6 +33,7 @@ pub struct AgentLoop {
     max_iterations: usize,
     permission_tx: Option<channel::Sender<PendingPermission>>,
     compacted_up_to: usize,
+    overflow_retried: bool,
 }
 
 impl AgentLoop {
@@ -44,6 +45,7 @@ impl AgentLoop {
             max_iterations: 25,
             permission_tx: None,
             compacted_up_to: 0,
+            overflow_retried: false,
         }
     }
 
@@ -142,10 +144,21 @@ impl AgentLoop {
         Ok(())
     }
 
+    fn is_context_overflow(err: &str) -> bool {
+        let lower = err.to_lowercase();
+        lower.contains("context_length_exceeded")
+            || (lower.contains("context length") && (lower.contains("exceed") || lower.contains("too long")))
+            || lower.contains("maximum context")
+            || lower.contains("prompt is too long")
+            || lower.contains("too many tokens")
+            || lower.contains("request too large")
+    }
+
     async fn run_loop(
         &mut self,
         callback: &mut dyn FnMut(AgentEvent),
     ) -> Result<(), String> {
+        self.overflow_retried = false;
         let tool_defs_json = serde_json::to_string(&self.tools.tool_defs()).unwrap_or_default();
 
         for _ in 0..self.max_iterations {
@@ -168,7 +181,19 @@ impl AgentLoop {
                 let _ = self.compact(callback).await;
             }
 
-            let assistant_msg = self.stream_assistant(callback).await?;
+            let assistant_result = self.stream_assistant(callback).await;
+            let assistant_msg = match assistant_result {
+                Ok(msg) => msg,
+                Err(e) if !self.overflow_retried && Self::is_context_overflow(&e) => {
+                    callback(AgentEvent::Error {
+                        message: format!("Context overflow detected, compacting and retrying..."),
+                    });
+                    self.overflow_retried = true;
+                    let _ = self.compact(callback).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
 
             let used = self.state.estimated_context_tokens(&tool_defs_json);
             callback(AgentEvent::TokenUpdate { used, limit });
