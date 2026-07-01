@@ -119,6 +119,10 @@ impl AgentTool for BashTool {
         }
     }
 
+    fn requires_permission(&self) -> bool {
+        true
+    }
+
     fn execution_mode(&self) -> ToolExecutionMode {
         ToolExecutionMode::Sequential
     }

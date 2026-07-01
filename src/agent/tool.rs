@@ -10,6 +10,9 @@ pub trait AgentTool: Send + Sync {
     fn execution_mode(&self) -> ToolExecutionMode {
         ToolExecutionMode::Parallel
     }
+    fn requires_permission(&self) -> bool {
+        false
+    }
     async fn execute(
         &self,
         tool_call_id: &str,

@@ -29,4 +29,7 @@ pub struct Cli {
 
     #[arg(long, default_value = "false")]
     pub list_models: bool,
+
+    #[arg(short = 'a', long, default_value = "false")]
+    pub approve: bool,
 }

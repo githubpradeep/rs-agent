@@ -39,6 +39,10 @@ impl AgentTool for WriteTool {
         })
     }
 
+    fn requires_permission(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, _tool_call_id: &str, args: Value) -> ToolExecuteResult {
         let parsed: WriteArgs = match serde_json::from_value(args) {
             Ok(a) => a,

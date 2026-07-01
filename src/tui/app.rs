@@ -2,6 +2,7 @@ use crate::agent::r#loop::AgentEvent;
 use crate::agent::state::AgentState;
 use crate::agent::AgentLoop;
 use crate::ai::provider::Provider;
+use crate::permission::{PendingPermission, PermissionReply, TrustStore};
 use crossbeam_channel as channel;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
@@ -52,12 +53,18 @@ pub struct App {
     picker_selection: usize,
     picker_files: Vec<String>,
     picker_files_loaded: bool,
+    pending_permission: Option<PendingPermission>,
+    permission_rx: channel::Receiver<PendingPermission>,
+    trust_store: TrustStore,
+    #[allow(dead_code)]
+    approved: bool,
 }
 
 impl App {
-    pub fn new(provider: Arc<dyn Provider>, model: String, timeout_secs: u64) -> Self {
+    pub fn new(provider: Arc<dyn Provider>, model: String, timeout_secs: u64, approve: bool) -> Self {
         let (command_tx, command_rx) = channel::unbounded::<AppCommand>();
         let (event_tx, event_rx) = channel::unbounded::<(usize, AgentEvent)>();
+        let (permission_tx, permission_rx) = channel::unbounded::<PendingPermission>();
 
         let provider_name = provider.name().to_string();
         let provider2 = provider.clone();
@@ -84,6 +91,9 @@ impl App {
                     );
 
                 let mut agent_loop = AgentLoop::new(provider2, state);
+                if !approve {
+                    agent_loop.set_permission_channel(permission_tx);
+                }
                 crate::tools::register_default_tools(&mut agent_loop);
 
                 loop {
@@ -115,6 +125,8 @@ impl App {
             });
         });
 
+        let trust_store = TrustStore::new();
+
         Self {
             messages: vec![ChatMessage {
                 role: "system".to_string(),
@@ -138,6 +150,10 @@ impl App {
             picker_selection: 0,
             picker_files: Vec::new(),
             picker_files_loaded: false,
+            pending_permission: None,
+            permission_rx,
+            trust_store,
+            approved: approve,
         }
     }
 
@@ -157,6 +173,10 @@ impl App {
 
             while let Ok((_idx, event)) = self.event_rx.try_recv() {
                 self.handle_agent_event(event);
+            }
+
+            if let Ok(pending) = self.permission_rx.try_recv() {
+                self.pending_permission = Some(pending);
             }
 
             if self.should_exit {
@@ -250,15 +270,21 @@ impl App {
                     _ => {}
                 }
             }
-            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.should_exit = true;
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if self.pending_permission.is_some() {
+                    self.handle_permission_key(key);
+                } else {
+                    match key.code {
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            self.should_exit = true;
+                        }
+                        _ => match self.input_mode {
+                            InputMode::Waiting => {}
+                            InputMode::Normal => self.handle_normal_key(key),
+                            InputMode::Insert => self.handle_insert_key(key),
+                        },
+                    }
                 }
-                _ => match self.input_mode {
-                    InputMode::Waiting => {}
-                    InputMode::Normal => self.handle_normal_key(key),
-                    InputMode::Insert => self.handle_insert_key(key),
-                },
             },
             _ => {}
         }
@@ -425,6 +451,9 @@ impl App {
         if self.picker_active {
             self.render_picker(frame, area);
         }
+        if self.pending_permission.is_some() {
+            self.render_permission_prompt(frame, area);
+        }
     }
 
     fn render_messages(&mut self, frame: &mut Frame, area: Rect) {
@@ -528,6 +557,34 @@ impl App {
         frame.render_widget(Paragraph::new(status), area);
     }
 
+    fn handle_permission_key(&mut self, key: crossterm::event::KeyEvent) {
+        if let Some(pending) = self.pending_permission.take() {
+            match key.code {
+                KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Enter => {
+                    let tool = pending.request.tool_name.clone();
+                    let _ = pending.reply_tx.send(PermissionReply::Allow);
+                    self.status = format!("allowed {}", tool);
+                }
+                KeyCode::Char('t') | KeyCode::Char('T') => {
+                    let tool = pending.request.tool_name.clone();
+                    let cwd = std::env::current_dir()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    self.trust_store.set_trusted(&cwd, true);
+                    let _ = pending.reply_tx.send(PermissionReply::Allow);
+                    self.status = format!("trusted project, allowed {}", tool);
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Esc => {
+                    let _ = pending.reply_tx.send(PermissionReply::Deny);
+                    self.status = "denied".to_string();
+                }
+                _ => {
+                    self.pending_permission = Some(pending);
+                }
+            }
+        }
+    }
+
     fn render_picker(&mut self, frame: &mut Frame, area: Rect) {
         if self.picker_results.is_empty() {
             return;
@@ -567,5 +624,58 @@ impl App {
         );
 
         frame.render_widget(list, picker_area);
+    }
+
+    fn render_permission_prompt(&mut self, frame: &mut Frame, area: Rect) {
+        let pending = match self.pending_permission.as_ref() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let tool_name = &pending.request.tool_name;
+        let input_preview: String = pending
+            .request
+            .tool_input
+            .chars()
+            .take(120)
+            .collect();
+
+        let prompt_height = 8u16;
+        let prompt_y = area.height.saturating_sub(4 + prompt_height + 2);
+        let prompt_area = Rect {
+            x: area.x + 2,
+            y: area.y + prompt_y,
+            width: area.width.saturating_sub(4).min(80),
+            height: prompt_height,
+        };
+
+        let text = vec![
+            Line::from(Span::styled(
+                format!(" ⚠  {} requires approval", tool_name),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!(" {}", input_preview),
+                Style::default().fg(Color::White),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                " (A)llow once  |  (T)rust project  |  (D)eny  ",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+
+        let paragraph = Paragraph::new(text)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Permission ")
+                    .border_style(Style::default().fg(Color::Yellow)),
+            );
+
+        frame.render_widget(paragraph, prompt_area);
     }
 }

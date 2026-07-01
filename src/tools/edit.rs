@@ -44,6 +44,10 @@ impl AgentTool for EditTool {
         })
     }
 
+    fn requires_permission(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, _tool_call_id: &str, args: Value) -> ToolExecuteResult {
         let parsed: EditArgs = match serde_json::from_value(args) {
             Ok(a) => a,

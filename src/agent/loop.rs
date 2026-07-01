@@ -3,6 +3,8 @@ use crate::agent::state::AgentState;
 use crate::agent::tool::{ToolExecutionMode, ToolExecuteResult};
 use crate::ai::provider::Provider;
 use crate::ai::types::*;
+use crate::permission::{PendingPermission, PermissionReply};
+use crossbeam_channel as channel;
 use futures::StreamExt;
 use std::sync::Arc;
 use tracing;
@@ -24,6 +26,7 @@ pub struct AgentLoop {
     tools: ToolRegistry,
     state: AgentState,
     max_iterations: usize,
+    permission_tx: Option<channel::Sender<PendingPermission>>,
 }
 
 impl AgentLoop {
@@ -33,6 +36,7 @@ impl AgentLoop {
             tools: ToolRegistry::new(),
             state,
             max_iterations: 25,
+            permission_tx: None,
         }
     }
 
@@ -55,6 +59,10 @@ impl AgentLoop {
 
     pub fn tools(&self) -> &ToolRegistry {
         &self.tools
+    }
+
+    pub fn set_permission_channel(&mut self, tx: channel::Sender<PendingPermission>) {
+        self.permission_tx = Some(tx);
     }
 
     pub async fn run(
@@ -426,6 +434,27 @@ impl AgentLoop {
     ) -> ToolExecuteResult {
         match self.tools.get(name) {
             Some(tool) => {
+                if let Some(ref tx) = self.permission_tx {
+                    if tool.requires_permission() {
+                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                        let _ = tx.send(PendingPermission {
+                            request: crate::permission::PermissionRequest {
+                                tool_name: name.to_string(),
+                                tool_input: input.to_string(),
+                            },
+                            reply_tx,
+                        });
+                        match reply_rx.await {
+                            Ok(PermissionReply::Allow) => {}
+                            Ok(PermissionReply::Deny) => {
+                                return ToolExecuteResult::error("Permission denied by user");
+                            }
+                            Err(_) => {
+                                return ToolExecuteResult::error("Permission prompt cancelled");
+                            }
+                        }
+                    }
+                }
                 tracing::info!(tool = name, "executing tool");
                 tool.execute(tool_call_id, input.clone()).await
             }

@@ -164,7 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let mut app = App::new(provider, model, cli.timeout);
+    let mut app = App::new(provider, model, cli.timeout, cli.approve);
     app.run()?;
 
     Ok(())
