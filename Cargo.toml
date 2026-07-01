@@ -46,6 +46,9 @@ tempfile = "3"
 globset = "0.4"
 walkdir = "2"
 
+# Web tools
+scraper = "0.20"
+
 # AWS Bedrock (SigV4 signing)
 sha2 = "0.10"
 hmac = "0.12"
