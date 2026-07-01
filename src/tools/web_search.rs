@@ -38,10 +38,6 @@ impl AgentTool for WebSearchTool {
         "Search the web for current information. Returns relevant results with snippets and links. Use this for real-time information, recent events, or facts you're unsure about."
     }
 
-    fn requires_permission(&self) -> bool {
-        true
-    }
-
     fn input_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",

@@ -62,6 +62,7 @@ pub struct App {
     trust_store: TrustStore,
     #[allow(dead_code)]
     approved: bool,
+    auto_mode: bool,
     token_used: usize,
     token_limit: usize,
     near_limit: bool,
@@ -69,7 +70,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(provider: Arc<dyn Provider>, model: String, timeout_secs: u64, approve: bool, resume: Option<SessionData>, system_prompt: Option<String>, max_iterations: usize) -> Self {
+    pub fn new(provider: Arc<dyn Provider>, model: String, timeout_secs: u64, approve: bool, resume: Option<SessionData>, system_prompt: Option<String>, max_iterations: usize, auto_mode: bool) -> Self {
         let (command_tx, command_rx) = channel::unbounded::<AppCommand>();
         let (event_tx, event_rx) = channel::unbounded::<(usize, AgentEvent)>();
         let (permission_tx, permission_rx) = channel::unbounded::<PendingPermission>();
@@ -243,6 +244,7 @@ impl App {
             permission_rx,
             trust_store,
             approved: approve,
+            auto_mode,
             token_used: 0,
             token_limit: crate::ai::token_count::get_context_limit(&model),
             near_limit: false,
@@ -269,7 +271,15 @@ impl App {
             }
 
             if let Ok(pending) = self.permission_rx.try_recv() {
-                self.pending_permission = Some(pending);
+                let cwd = std::env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let is_trusted = self.approved || self.trust_store.is_trusted(&cwd);
+                if is_trusted || self.auto_allow(&pending.request.tool_name) {
+                    let _ = pending.reply_tx.send(PermissionReply::Allow);
+                } else {
+                    self.pending_permission = Some(pending);
+                }
             }
 
             if self.should_exit {
@@ -495,6 +505,13 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn auto_allow(&self, tool_name: &str) -> bool {
+        if !self.auto_mode {
+            return false;
+        }
+        matches!(tool_name, "read" | "grep" | "ls" | "find" | "webfetch" | "websearch")
     }
 
     fn start_picker(&mut self) {

@@ -221,7 +221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         store.load(id).map_err(|e| eprintln!("{}", e)).ok()
     });
 
-    let mut app = App::new(provider, model, cli.timeout, cli.approve, resume_session, Some(system_prompt), cli.max_iterations);
+    let mut app = App::new(provider, model, cli.timeout, cli.approve, resume_session, Some(system_prompt), cli.max_iterations, cli.auto_mode);
     app.run()?;
 
     Ok(())

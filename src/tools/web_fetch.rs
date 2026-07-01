@@ -281,10 +281,6 @@ impl AgentTool for WebFetchTool {
         "Fetch and retrieve the content of a URL. Returns the content as text, markdown, or raw HTML. Use this to read web pages, documentation, APIs, and other online resources."
     }
 
-    fn requires_permission(&self) -> bool {
-        true
-    }
-
     fn input_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",

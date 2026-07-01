@@ -50,4 +50,7 @@ pub struct Cli {
 
     #[arg(long, default_value_t = 100)]
     pub max_iterations: usize,
+
+    #[arg(long, default_value = "false")]
+    pub auto_mode: bool,
 }
