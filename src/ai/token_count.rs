@@ -13,7 +13,7 @@ pub fn estimate_message_tokens(msgs: &[Message]) -> usize {
     msgs.iter().map(|m| estimate_message(m)).sum()
 }
 
-fn estimate_message(msg: &Message) -> usize {
+pub fn estimate_message(msg: &Message) -> usize {
     let mut total = 4;
     for content in &msg.content {
         if let Some(ref text) = content.text {

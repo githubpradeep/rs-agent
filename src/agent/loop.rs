@@ -2,6 +2,7 @@ use crate::agent::registry::ToolRegistry;
 use crate::agent::state::AgentState;
 use crate::agent::tool::{ToolExecutionMode, ToolExecuteResult};
 use crate::ai::provider::Provider;
+use crate::ai::token_count;
 use crate::ai::types::*;
 use crate::permission::{PendingPermission, PermissionReply};
 use crossbeam_channel as channel;
@@ -460,21 +461,64 @@ impl AgentLoop {
         &mut self,
         callback: &mut dyn FnMut(AgentEvent),
     ) -> Result<(), String> {
-        let keep = 8usize;
+        const KEEP_BUDGET: usize = 20_000;
+        const TRUNCATE_LEN: usize = 2000;
+
         let total = self.state.messages.len();
-        if total <= self.compacted_up_to + keep {
+        if total <= self.compacted_up_to + 2 {
             return Ok(());
         }
-        let split = total.saturating_sub(keep);
+
+        // Walk backwards from newest, find split point by token budget
+        let mut accumulated = 0usize;
+        let mut split = total;
+        for i in (0..total).rev() {
+            let t = token_count::estimate_message(&self.state.messages[i]);
+            if accumulated + t > KEEP_BUDGET && accumulated > 0 {
+                break;
+            }
+            accumulated += t;
+            split = i;
+        }
+
+        // Adjust split to nearest user message boundary (turn boundary)
+        for i in split..total {
+            if self.state.messages[i].role == Role::User {
+                split = i;
+                break;
+            }
+        }
+
         if split <= self.compacted_up_to {
             return Ok(());
         }
 
-        let to_summarize: Vec<Message> = self.state.messages[self.compacted_up_to..split].to_vec();
+        let to_summarize: Vec<Message> = self.state.messages[..split].to_vec();
         let keep_msgs: Vec<Message> = self.state.messages[split..].to_vec();
 
+        // Extract previous compaction summary for incremental update
+        let previous_summary = to_summarize.iter().find_map(|m| {
+            if m.role == Role::System {
+                m.content.iter().find_map(|c| {
+                    c.text.as_deref().and_then(|t| {
+                        t.strip_prefix("[Compacted summary of earlier conversation]\n")
+                    })
+                })
+            } else {
+                None
+            }
+        });
+
+        // Serialize conversation for summarization with truncation
         let mut conv_text = String::new();
         for msg in &to_summarize {
+            if msg.role == Role::System && msg.content.iter().any(|c| {
+                c.text.as_deref().map_or(false, |t| {
+                    t.starts_with("[Compacted summary of earlier conversation]")
+                })
+            }) {
+                continue;
+            }
             let role = match msg.role {
                 Role::User => "User",
                 Role::Assistant => "Assistant",
@@ -482,8 +526,14 @@ impl AgentLoop {
                 Role::System => "System",
             };
             for c in &msg.content {
-                if let Some(ref text) = c.text {
-                    conv_text.push_str(&format!("[{}] {}\n\n", role, text));
+                let text = c.text.as_deref().unwrap_or("");
+                let truncated = if text.len() > TRUNCATE_LEN {
+                    format!("{}... [truncated {} chars]", &text[..TRUNCATE_LEN], text.len())
+                } else {
+                    text.to_string()
+                };
+                if !truncated.is_empty() {
+                    conv_text.push_str(&format!("[{}] {}\n\n", role, truncated));
                 }
             }
         }
@@ -497,25 +547,48 @@ impl AgentLoop {
         let api_key = std::env::var(self.provider.api_key_env_var())
             .map_err(|_| format!("{} not set", self.provider.api_key_env_var()))?;
 
+        let user_msg = if let Some(prev) = previous_summary {
+            format!(
+                "Update the anchored summary below with the new conversation. \
+                 Preserve still-true details, remove stale details, and merge in new facts.\n\n\
+                 <previous-summary>\n{prev}\n</previous-summary>\n\n\
+                 <new-conversation>\n{conv_text}\n</new-conversation>"
+            )
+        } else {
+            format!(
+                "Summarize the following conversation. Use this exact structure:\n\
+                 ## Goal\n...\n\
+                 ## Constraints & Preferences\n...\n\
+                 ## Progress\n\
+                 ### Done\n...\n\
+                 ### In Progress\n...\n\
+                 ### Blocked\n...\n\
+                 ## Key Decisions\n...\n\
+                 ## Next Steps\n...\n\
+                 ## Critical Context\n...\n\
+                 ## Relevant Files\n...\n\n\
+                 <conversation>\n{conv_text}\n</conversation>"
+            )
+        };
+
+        let system = "You are a conversation summarizer. \
+                      Do NOT continue the conversation or respond to questions. \
+                      ONLY output the structured summary with the requested sections. \
+                      Be concise and factual. Use third person past tense.";
+
         let request = ChatRequest {
             model: self.state.model.clone(),
             messages: vec![Message {
                 role: Role::User,
                 content: vec![Content {
                     content_type: ContentType::Text,
-                    text: Some(format!(
-                        "Summarize this conversation concisely, preserving key decisions, file changes, and results:\n\n{}",
-                        conv_text
-                    )),
+                    text: Some(user_msg),
                     ..Default::default()
                 }],
             }],
-            system: Some(
-                "You are a conversation summarizer. Write a brief summary (under 200 words) capturing the key points, decisions, files read/edited, and commands run. Use third person past tense."
-                    .to_string(),
-            ),
+            system: Some(system.to_string()),
             tools: Vec::new(),
-            max_tokens: 1024,
+            max_tokens: 2048,
             temperature: Some(0.0),
             top_p: None,
             stop_sequences: None,
