@@ -180,16 +180,44 @@ impl App {
 
         if let Some(ref resume_data) = resume {
             for msg in &resume_data.messages {
-                let (role, text) = match &msg.role {
-                    crate::ai::types::Role::User => ("user", msg.content.first().and_then(|c| c.text.as_deref()).unwrap_or("")),
-                    crate::ai::types::Role::Assistant => ("assistant", msg.content.first().and_then(|c| c.text.as_deref()).unwrap_or("")),
-                    _ => continue,
-                };
-                if !text.is_empty() {
-                    initial_msgs.push(ChatMessage {
-                        role: role.to_string(),
-                        text: text.to_string(),
-                    });
+                match &msg.role {
+                    crate::ai::types::Role::User => {
+                        let text = msg.content.first().and_then(|c| c.text.as_deref()).unwrap_or("");
+                        if !text.is_empty() {
+                            initial_msgs.push(ChatMessage { role: "user".to_string(), text: text.to_string() });
+                        }
+                    }
+                    crate::ai::types::Role::Assistant => {
+                        let mut text = String::new();
+                        for c in &msg.content {
+                            match c.content_type {
+                                crate::ai::types::ContentType::Text => {
+                                    if let Some(ref t) = c.text {
+                                        text.push_str(t);
+                                    }
+                                }
+                                crate::ai::types::ContentType::ToolUse => {
+                                    let name = c.name.as_deref().unwrap_or("tool");
+                                    let input = c.input.as_ref().map(|v| v.to_string()).unwrap_or_default();
+                                    let preview: String = input.chars().take(120).collect();
+                                    text.push_str(&format!("\n🛠 {} {}\n", name, preview));
+                                }
+                                _ => {}
+                            }
+                        }
+                        if !text.is_empty() {
+                            initial_msgs.push(ChatMessage { role: "assistant".to_string(), text });
+                        }
+                    }
+                    crate::ai::types::Role::Tool => {
+                        let name = msg.content.first().and_then(|c| c.name.as_deref()).unwrap_or("tool");
+                        let result = msg.content.first().and_then(|c| c.text.as_deref()).unwrap_or("");
+                        let preview: String = result.chars().take(200).collect();
+                        if !preview.is_empty() {
+                            initial_msgs.push(ChatMessage { role: "tool".to_string(), text: format!("✅ [{}] {}", name, preview) });
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -581,6 +609,7 @@ impl App {
                 "system" => ("◆ ", Color::Cyan),
                 "user" => ("▶ ", Color::Green),
                 "assistant" => ("▸ ", Color::Yellow),
+                "tool" => ("⚙ ", Color::Cyan),
                 _ => ("  ", Color::White),
             };
             let bold_prefix = Style::default().fg(color).add_modifier(Modifier::BOLD);
