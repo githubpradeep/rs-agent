@@ -347,7 +347,6 @@ impl App {
                 }
             }
             KeyCode::Char('@') => {
-                self.input.push('@');
                 self.start_picker();
             }
             KeyCode::Char(c) => self.input.push(c),
