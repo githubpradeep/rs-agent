@@ -43,6 +43,8 @@ directories = "6"
 crossbeam-channel = "0.5"
 regex = "1"
 tempfile = "3"
+globset = "0.4"
+walkdir = "2"
 
 # AWS Bedrock (SigV4 signing)
 sha2 = "0.10"

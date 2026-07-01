@@ -1,16 +1,18 @@
 pub mod bash;
-pub mod read;
-pub mod write;
 pub mod edit;
+pub mod find;
 pub mod grep;
 pub mod ls;
+pub mod read;
+pub mod write;
 
 pub use bash::BashTool;
-pub use read::ReadTool;
-pub use write::WriteTool;
 pub use edit::EditTool;
+pub use find::FindTool;
 pub use grep::GrepTool;
 pub use ls::LsTool;
+pub use read::ReadTool;
+pub use write::WriteTool;
 
 use crate::agent::tool::SharedTool;
 use crate::agent::AgentLoop;
@@ -23,4 +25,5 @@ pub fn register_default_tools(agent: &mut AgentLoop) {
     agent.register_tool(Arc::new(EditTool) as SharedTool);
     agent.register_tool(Arc::new(GrepTool) as SharedTool);
     agent.register_tool(Arc::new(LsTool) as SharedTool);
+    agent.register_tool(Arc::new(FindTool) as SharedTool);
 }
