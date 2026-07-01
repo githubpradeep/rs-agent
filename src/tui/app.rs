@@ -11,7 +11,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::Frame;
 
 use super::renderer::render_markdown;
@@ -538,7 +538,41 @@ impl App {
         }
     }
 
+    fn wrap_line<'a>(line: &Line<'a>, max_width: usize) -> Vec<Line<'a>> {
+        let text_len: usize = line.spans.iter().map(|s| s.content.len()).sum();
+        if text_len <= max_width {
+            return vec![line.clone()];
+        }
+        let mut result = Vec::new();
+        let mut current_spans: Vec<Span> = Vec::new();
+        let mut current_len = 0usize;
+        for span in &line.spans {
+            let remaining = max_width.saturating_sub(current_len);
+            if span.content.len() <= remaining {
+                current_spans.push(span.clone());
+                current_len += span.content.len();
+            } else {
+                let mut content = &span.content[..];
+                while !content.is_empty() {
+                    let take = max_width.saturating_sub(current_len).min(content.len());
+                    current_spans.push(Span::styled(content[..take].to_string(), span.style.clone()));
+                    current_len += take;
+                    content = &content[take..];
+                    if current_len >= max_width {
+                        result.push(Line::from(std::mem::take(&mut current_spans)));
+                        current_len = 0;
+                    }
+                }
+            }
+        }
+        if !current_spans.is_empty() {
+            result.push(Line::from(current_spans));
+        }
+        result
+    }
+
     fn render_messages(&mut self, frame: &mut Frame, area: Rect) {
+        let max_width = (area.width as usize).saturating_sub(2).max(20);
         let mut lines: Vec<Line> = Vec::new();
         for msg in &self.messages {
             let (prefix, color) = match msg.role.as_str() {
@@ -550,12 +584,12 @@ impl App {
             let bold_prefix = Style::default().fg(color).add_modifier(Modifier::BOLD);
 
             let rendered = render_markdown(&msg.text);
-            for (i, line) in rendered.into_iter().enumerate() {
-                let mut spans = line.spans;
+            for (i, raw_line) in rendered.into_iter().enumerate() {
+                let mut line = raw_line;
                 if i == 0 {
-                    spans.insert(0, Span::styled(prefix, bold_prefix));
+                    line.spans.insert(0, Span::styled(prefix, bold_prefix));
                 }
-                lines.push(Line::from(spans));
+                lines.extend(Self::wrap_line(&line, max_width));
             }
             lines.push(Line::from(""));
         }
@@ -569,7 +603,6 @@ impl App {
         let visible_lines: Vec<Line> = lines.into_iter().skip(start).collect();
 
         let chat = Paragraph::new(visible_lines)
-            .wrap(Wrap { trim: false })
             .block(
                 Block::default()
                     .borders(Borders::TOP)
@@ -610,7 +643,7 @@ impl App {
                     .title(mode_indicator)
                     .border_style(border_style),
             )
-            .wrap(Wrap { trim: false });
+            ;
 
         frame.render_widget(input, area);
 
