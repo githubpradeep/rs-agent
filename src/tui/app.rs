@@ -8,13 +8,14 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::Frame;
 
 use super::renderer::render_markdown;
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use ratatui::Frame;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
+use walkdir::WalkDir;
 
 #[derive(Clone)]
 struct ChatMessage {
@@ -44,6 +45,13 @@ pub struct App {
     event_rx: channel::Receiver<(usize, AgentEvent)>,
     scroll_offset: usize,
     follow_bottom: bool,
+    picker_active: bool,
+    picker_prefix: String,
+    picker_query: String,
+    picker_results: Vec<String>,
+    picker_selection: usize,
+    picker_files: Vec<String>,
+    picker_files_loaded: bool,
 }
 
 impl App {
@@ -123,6 +131,13 @@ impl App {
             event_rx,
             scroll_offset: 0,
             follow_bottom: true,
+            picker_active: false,
+            picker_prefix: String::new(),
+            picker_query: String::new(),
+            picker_results: Vec::new(),
+            picker_selection: 0,
+            picker_files: Vec::new(),
+            picker_files_loaded: false,
         }
     }
 
@@ -273,6 +288,43 @@ impl App {
     }
 
     fn handle_insert_key(&mut self, key: crossterm::event::KeyEvent) {
+        if self.picker_active {
+            match key.code {
+                KeyCode::Up => {
+                    self.picker_selection = self.picker_selection.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    let max = self.picker_results.len().saturating_sub(1);
+                    self.picker_selection = self.picker_selection.saturating_add(1).min(max);
+                }
+                KeyCode::Enter | KeyCode::Tab => {
+                    if let Some(path) = self.picker_results.get(self.picker_selection).cloned() {
+                        self.input = format!("{}{} ", self.picker_prefix, path);
+                    }
+                    self.picker_active = false;
+                }
+                KeyCode::Esc => {
+                    self.input = self.picker_prefix.clone();
+                    self.picker_active = false;
+                }
+                KeyCode::Backspace => {
+                    if !self.picker_query.is_empty() {
+                        self.picker_query.pop();
+                        self.update_picker_results();
+                    } else {
+                        self.input = self.picker_prefix.clone();
+                        self.picker_active = false;
+                    }
+                }
+                KeyCode::Char(c) => {
+                    self.picker_query.push(c);
+                    self.update_picker_results();
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::Enter => {
                 if !self.input.trim().is_empty() {
@@ -294,13 +346,67 @@ impl App {
                     let _ = self.command_tx.send(AppCommand::Submit { text });
                 }
             }
+            KeyCode::Char('@') => {
+                self.input.push('@');
+                self.start_picker();
+            }
             KeyCode::Char(c) => self.input.push(c),
             KeyCode::Backspace => {
                 self.input.pop();
             }
-            KeyCode::Esc => self.input_mode = InputMode::Normal,
+            KeyCode::Esc => {
+                self.picker_active = false;
+                self.input_mode = InputMode::Normal;
+            }
             _ => {}
         }
+    }
+
+    fn start_picker(&mut self) {
+        self.picker_prefix = self.input.clone();
+        self.picker_query = String::new();
+        self.picker_selection = 0;
+        self.picker_active = true;
+        self.update_picker_results();
+    }
+
+    fn update_picker_results(&mut self) {
+        if !self.picker_files_loaded {
+            self.load_picker_files();
+        }
+        let query = self.picker_query.to_lowercase();
+        self.picker_results = self
+            .picker_files
+            .iter()
+            .filter(|f| query.is_empty() || f.to_lowercase().contains(&query))
+            .take(20)
+            .cloned()
+            .collect();
+        self.picker_selection = self
+            .picker_selection
+            .min(self.picker_results.len().saturating_sub(1));
+    }
+
+    fn load_picker_files(&mut self) {
+        self.picker_files.clear();
+        let cwd = std::env::current_dir().unwrap_or_default();
+        for entry in WalkDir::new(&cwd)
+            .into_iter()
+            .filter_entry(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        {
+            if let Ok(entry) = entry {
+                if entry.file_type().is_file() {
+                    if let Ok(relative) = entry.path().strip_prefix(&cwd) {
+                        let path = relative.to_string_lossy().to_string();
+                        if !path.is_empty() {
+                            self.picker_files.push(path);
+                        }
+                    }
+                }
+            }
+        }
+        self.picker_files.sort();
+        self.picker_files_loaded = true;
     }
 
     fn render(&mut self, frame: &mut Frame) {
@@ -317,6 +423,9 @@ impl App {
         self.render_messages(frame, chunks[0]);
         self.render_input(frame, chunks[1]);
         self.render_status(frame, chunks[2]);
+        if self.picker_active {
+            self.render_picker(frame, area);
+        }
     }
 
     fn render_messages(&mut self, frame: &mut Frame, area: Rect) {
@@ -373,7 +482,13 @@ impl App {
             _ => Style::default().fg(Color::DarkGray),
         };
 
-        let input = Paragraph::new(self.input.as_str())
+        let display_text = if self.picker_active {
+            format!("{}@{}", self.picker_prefix, self.picker_query)
+        } else {
+            self.input.clone()
+        };
+
+        let input = Paragraph::new(display_text.as_str())
             .style(match self.input_mode {
                 InputMode::Waiting => Style::default().fg(Color::DarkGray),
                 _ => Style::default().fg(Color::White),
@@ -389,7 +504,12 @@ impl App {
         frame.render_widget(input, area);
 
         if self.input_mode == InputMode::Insert {
-            let x = (self.input.len() as u16 + 1).min(area.width.max(1) - 2);
+            let cursor_len = if self.picker_active {
+                self.picker_prefix.len() + 1 + self.picker_query.len()
+            } else {
+                self.input.len()
+            };
+            let x = (cursor_len as u16 + 1).min(area.width.max(1).saturating_sub(2));
             frame.set_cursor_position(ratatui::layout::Position::new(area.x + x, area.y + 1));
         }
     }
@@ -407,5 +527,46 @@ impl App {
             ),
         ]);
         frame.render_widget(Paragraph::new(status), area);
+    }
+
+    fn render_picker(&mut self, frame: &mut Frame, area: Rect) {
+        if self.picker_results.is_empty() {
+            return;
+        }
+
+        let picker_height = (self.picker_results.len() as u16).min(10).max(1);
+        let picker_y = area.height.saturating_sub(4 + picker_height + 1);
+        let picker_area = Rect {
+            x: area.x + 1,
+            y: area.y + picker_y,
+            width: area.width.saturating_sub(2).min(60),
+            height: picker_height + 2,
+        };
+
+        let items: Vec<ListItem> = self
+            .picker_results
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                let style = if i == self.picker_selection {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Cyan)
+                };
+                ListItem::new(path.as_str()).style(style)
+            })
+            .collect();
+
+        let list = List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Files ")
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+
+        frame.render_widget(list, picker_area);
     }
 }
