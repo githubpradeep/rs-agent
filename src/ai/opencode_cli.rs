@@ -12,6 +12,7 @@ pub struct OpenCodeCliProvider {
     pub name: String,
     pub bin: String,
     pub default_model: String,
+    pub timeout_secs: u64,
 }
 
 impl Default for OpenCodeCliProvider {
@@ -20,6 +21,7 @@ impl Default for OpenCodeCliProvider {
             name: "opencode-cli".to_string(),
             bin: "opencode".to_string(),
             default_model: "opencode/deepseek-v4-flash-free".to_string(),
+            timeout_secs: 300,
         }
     }
 }
@@ -31,7 +33,13 @@ impl OpenCodeCliProvider {
             bin: bin.unwrap_or_else(|| "opencode".to_string()),
             default_model: default_model
                 .unwrap_or_else(|| "opencode/deepseek-v4-flash-free".to_string()),
+            timeout_secs: 300,
         }
+    }
+
+    pub fn with_timeout(mut self, secs: u64) -> Self {
+        self.timeout_secs = secs;
+        self
     }
 
     fn build_prompt(&self, request: &ChatRequest) -> String {
@@ -322,6 +330,7 @@ impl Provider for OpenCodeCliProvider {
         let prompt = self.build_prompt(&request);
         let model = request.model.clone();
         let bin = self.bin.clone();
+        let timeout_secs = self.timeout_secs;
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -633,7 +642,7 @@ impl Provider for OpenCodeCliProvider {
                             }
                         }
                     }
-                    _ = tokio::time::sleep(Duration::from_secs(120)) => {
+                    _ = tokio::time::sleep(Duration::from_secs(timeout_secs)) => {
                         let _ = child.kill().await;
                         let _ = tx.send(Err(ProviderError::Timeout));
                         break;

@@ -11,7 +11,7 @@ use rs_agent::tui::App;
 use std::io::Write;
 use std::sync::Arc;
 
-fn get_provider(name: &str, base_url: Option<&str>, default_model: Option<&str>) -> Result<Arc<dyn Provider>, String> {
+fn get_provider(name: &str, base_url: Option<&str>, default_model: Option<&str>, timeout_secs: u64) -> Result<Arc<dyn Provider>, String> {
     match name.to_lowercase().as_str() {
         "openai" => Ok(Arc::new(OpenAIProvider::new(
             base_url.map(|s| s.to_string()),
@@ -34,7 +34,7 @@ fn get_provider(name: &str, base_url: Option<&str>, default_model: Option<&str>)
         "opencode-cli" => Ok(Arc::new(OpenCodeCliProvider::new(
             None,
             default_model.map(|s| s.to_string()),
-        ))),
+        ).with_timeout(timeout_secs))),
         "bedrock" => Ok(Arc::new(BedrockProvider::new(
             base_url.map(|s| s.to_string()),
             None,
@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .unwrap_or_else(|| get_default_model(provider_name).to_string());
 
-    let provider = get_provider(provider_name, cli.base_url.as_deref(), cli.model.as_deref())?;
+    let provider = get_provider(provider_name, cli.base_url.as_deref(), cli.model.as_deref(), cli.timeout)?;
 
     if cli.provider.to_lowercase() == "opencode-cli" {
         std::env::set_var("OPENCODE_API_KEY", "cli-mode-no-key-needed");
