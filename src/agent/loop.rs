@@ -272,9 +272,10 @@ impl AgentLoop {
                 Ok(delta) => {
                     let idx = delta.content_index as usize;
                     match delta.r#type {
-                        DeltaType::Text { text } => {
-                            if content_blocks.len() <= idx { content_blocks.resize(idx + 1, None); }
-                            callback(AgentEvent::TextDelta { text: text.clone() });
+                            DeltaType::Text { text } => {
+                                if content_blocks.len() <= idx { content_blocks.resize(idx + 1, None); }
+                                let display_text = text.replace("<tool_call>", "").replace("</tool_call>", "");
+                                callback(AgentEvent::TextDelta { text: display_text });
                             if let Some(Some(b)) = content_blocks.get_mut(idx) {
                                 if b.content_type == ContentType::Text {
                                     let existing = b.text.take().unwrap_or_default();
