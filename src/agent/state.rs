@@ -1,3 +1,4 @@
+use crate::ai::token_count;
 use crate::ai::types::*;
 
 
@@ -8,6 +9,8 @@ pub struct AgentState {
     pub provider: String,
     pub messages: Vec<Message>,
     pub thinking_budget: Option<u32>,
+    pub total_input_tokens: usize,
+    pub total_output_tokens: usize,
 }
 
 impl AgentState {
@@ -18,6 +21,8 @@ impl AgentState {
             provider,
             messages: Vec::new(),
             thinking_budget: None,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
         }
     }
 
@@ -49,9 +54,33 @@ impl AgentState {
     }
 
     pub fn add_assistant(&mut self, msg: &AssistantMessage) {
+        if let Some(ref usage) = msg.usage {
+            self.total_input_tokens += usage.input_tokens as usize;
+            self.total_output_tokens += usage.output_tokens as usize;
+        }
         self.messages.push(Message {
             role: Role::Assistant,
             content: msg.content.clone(),
         });
+    }
+
+    pub fn estimated_context_tokens(&self, tool_defs_json: &str) -> usize {
+        let sys = token_count::estimate_tokens(&self.system_prompt);
+        let msgs = token_count::estimate_message_tokens(&self.messages);
+        let tools = token_count::estimate_tokens(tool_defs_json);
+        sys + msgs + tools + 20
+    }
+
+    pub fn context_limit(&self) -> usize {
+        token_count::get_context_limit(&self.model)
+    }
+
+    pub fn context_usage_fraction(&self, tool_defs_json: &str) -> f64 {
+        let used = self.estimated_context_tokens(tool_defs_json);
+        let limit = self.context_limit();
+        if limit == 0 {
+            return 0.0;
+        }
+        (used as f64) / (limit as f64)
     }
 }

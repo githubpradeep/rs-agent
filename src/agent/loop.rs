@@ -19,6 +19,8 @@ pub enum AgentEvent {
     TurnEnd { stop_reason: Option<StopReason> },
     Error { message: String },
     Done,
+    ContextWarning { fraction: f64, used: usize, limit: usize },
+    TokenUpdate { used: usize, limit: usize },
 }
 
 pub struct AgentLoop {
@@ -139,8 +141,31 @@ impl AgentLoop {
         &mut self,
         callback: &mut dyn FnMut(AgentEvent),
     ) -> Result<(), String> {
+        let tool_defs_json = serde_json::to_string(&self.tools.tool_defs()).unwrap_or_default();
+
         for _ in 0..self.max_iterations {
+            let used = self.state.estimated_context_tokens(&tool_defs_json);
+            let limit = self.state.context_limit();
+            let fraction = used as f64 / limit as f64;
+
+            if fraction >= 0.95 {
+                callback(AgentEvent::Error {
+                    message: format!(
+                        "Context limit approaching ({}/{} tokens, {:.0}%). Please use a new session.",
+                        used, limit, fraction * 100.0
+                    ),
+                });
+                return Err("Context limit exceeded".to_string());
+            }
+
+            if fraction >= 0.80 {
+                callback(AgentEvent::ContextWarning { fraction, used, limit });
+            }
+
             let assistant_msg = self.stream_assistant(callback).await?;
+
+            let used = self.state.estimated_context_tokens(&tool_defs_json);
+            callback(AgentEvent::TokenUpdate { used, limit });
 
             let tool_calls: Vec<Content> = assistant_msg
                 .content

@@ -58,6 +58,9 @@ pub struct App {
     trust_store: TrustStore,
     #[allow(dead_code)]
     approved: bool,
+    token_used: usize,
+    token_limit: usize,
+    near_limit: bool,
 }
 
 impl App {
@@ -154,6 +157,9 @@ impl App {
             permission_rx,
             trust_store,
             approved: approve,
+            token_used: 0,
+            token_limit: crate::ai::token_count::get_context_limit(&model),
+            near_limit: false,
         }
     }
 
@@ -251,8 +257,18 @@ impl App {
                 self.status = "ready".to_string();
                 self.input_mode = InputMode::Insert;
                 self.input.clear();
+                self.near_limit = false;
             }
             AgentEvent::ToolUseDelta { input: _ } => {}
+            AgentEvent::ContextWarning { fraction: _, used, limit } => {
+                self.token_used = used;
+                self.token_limit = limit;
+                self.near_limit = true;
+            }
+            AgentEvent::TokenUpdate { used, limit } => {
+                self.token_used = used;
+                self.token_limit = limit;
+            }
         }
     }
 
@@ -543,16 +559,29 @@ impl App {
     }
 
     fn render_status(&mut self, frame: &mut Frame, area: Rect) {
+        let status_color = if self.near_limit {
+            Color::Red
+        } else if self.status == "ready" {
+            Color::Green
+        } else {
+            Color::Yellow
+        };
+
+        let token_str = if self.token_limit > 0 {
+            let pct = self.token_used as f64 / self.token_limit as f64 * 100.0;
+            if self.near_limit {
+                format!(" ⚠ {:.0}%", pct)
+            } else {
+                format!(" {:.1}K/{}K", self.token_used as f64 / 1000.0, self.token_limit / 1000)
+            }
+        } else {
+            String::new()
+        };
+
         let status = Line::from(vec![
             Span::styled(" ^C quit | ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                &self.status,
-                Style::default().fg(if self.status == "ready" {
-                    Color::Green
-                } else {
-                    Color::Yellow
-                }),
-            ),
+            Span::styled(&self.status, Style::default().fg(status_color)),
+            Span::styled(token_str, Style::default().fg(if self.near_limit { Color::Red } else { Color::DarkGray })),
         ]);
         frame.render_widget(Paragraph::new(status), area);
     }
