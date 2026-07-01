@@ -5,6 +5,7 @@ use rs_agent::ai::opencode_cli::OpenCodeCliProvider;
 use rs_agent::ai::openai::OpenAIProvider;
 use rs_agent::ai::provider::Provider;
 use rs_agent::cli::Cli;
+use rs_agent::context;
 use rs_agent::session::SessionStore;
 use rs_agent::tui::App;
 use std::io::Write;
@@ -107,23 +108,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    let base_prompt = cli.system_prompt.clone().unwrap_or_else(|| {
+        "You are an expert coding assistant operating inside rs-agent, a coding agent harness. \
+         You help users by reading files, executing commands, editing code, and writing new files.\n\n\
+         Guidelines:\n\
+         - Use `read` to examine files instead of cat or sed.\n\
+         - Use `bash` to execute commands. Prefer bash over read for file listing (ls, find).\n\
+         - Use `edit` for precise changes to existing files.\n\
+         - Use `write` to create new files or complete rewrites.\n\
+         - Use `grep` to search for patterns in the codebase.\n\
+         - When writing code, first understand the patterns, then implement, then test.\n\
+         - Always check if the code compiles/runs correctly after making changes."
+            .to_string()
+    });
+
+    let mut system_prompt = base_prompt;
+
+    for arg in &cli.append_system_prompt {
+        let resolved = context::resolve_append_arg(arg)
+            .unwrap_or_else(|e| { eprintln!("Warning: {}", e); String::new() });
+        if !resolved.is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&resolved);
+        }
+    }
+
+    if !cli.no_context_files {
+        let context_files = context::discover_context_files();
+        let context_section = context::build_context_section(&context_files);
+        if !context_section.is_empty() {
+            system_prompt.push_str(&context_section);
+        }
+        if !context_files.is_empty() {
+            eprintln!("Loaded {} project context file(s)", context_files.len());
+            for cf in &context_files {
+                eprintln!("  {}", cf.path.display());
+            }
+        }
+    }
+
     if let Some(prompt) = &cli.prompt {
         let mut agent = rs_agent::agent::AgentLoop::new(
             provider.clone(),
             rs_agent::agent::state::AgentState::new(model, provider_name.to_string())
-                .with_system_prompt(
-                    "You are an expert coding assistant operating inside rs-agent, a coding agent harness. \
-                     You help users by reading files, executing commands, editing code, and writing new files.\n\n\
-                     Guidelines:\n\
-                     - Use `read` to examine files instead of cat or sed.\n\
-                     - Use `bash` to execute commands. Prefer bash over read for file listing (ls, find).\n\
-                     - Use `edit` for precise changes to existing files.\n\
-                     - Use `write` to create new files or complete rewrites.\n\
-                     - Use `grep` to search for patterns in the codebase.\n\
-                     - When writing code, first understand the patterns, then implement, then test.\n\
-                     - Always check if the code compiles/runs correctly after making changes."
-                    .to_string(),
-                ),
+                .with_system_prompt(system_prompt),
         );
         rs_agent::tools::register_default_tools(&mut agent);
 
@@ -146,18 +174,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| e.to_string())?;
 
         println!();
-        println!("--- Final messages ---");
-        for msg in &agent.state().messages {
-            let role = match msg.role {
-                rs_agent::ai::types::Role::User => "user",
-                rs_agent::ai::types::Role::Assistant => "assistant",
-                rs_agent::ai::types::Role::Tool => "tool",
-                rs_agent::ai::types::Role::System => "system",
-            };
-            for content in &msg.content {
-                match &content.text {
-                    Some(text) if !text.is_empty() => println!("[{}] {}", role, text),
-                    _ => {}
+        if !has_error {
+            println!("--- Final messages ---");
+            for msg in &agent.state().messages {
+                let role = match msg.role {
+                    rs_agent::ai::types::Role::User => "user",
+                    rs_agent::ai::types::Role::Assistant => "assistant",
+                    rs_agent::ai::types::Role::Tool => "tool",
+                    rs_agent::ai::types::Role::System => "system",
+                };
+                for content in &msg.content {
+                    match &content.text {
+                        Some(text) if !text.is_empty() => println!("[{}] {}", role, text),
+                        _ => {}
+                    }
                 }
             }
         }
@@ -191,7 +221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         store.load(id).map_err(|e| eprintln!("{}", e)).ok()
     });
 
-    let mut app = App::new(provider, model, cli.timeout, cli.approve, resume_session);
+    let mut app = App::new(provider, model, cli.timeout, cli.approve, resume_session, Some(system_prompt));
     app.run()?;
 
     Ok(())

@@ -38,4 +38,13 @@ pub struct Cli {
 
     #[arg(long, default_value = "false")]
     pub list_sessions: bool,
+
+    #[arg(long, default_value = "false")]
+    pub no_context_files: bool,
+
+    #[arg(long)]
+    pub system_prompt: Option<String>,
+
+    #[arg(long)]
+    pub append_system_prompt: Vec<String>,
 }

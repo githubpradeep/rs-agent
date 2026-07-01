@@ -69,7 +69,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(provider: Arc<dyn Provider>, model: String, timeout_secs: u64, approve: bool, resume: Option<SessionData>) -> Self {
+    pub fn new(provider: Arc<dyn Provider>, model: String, timeout_secs: u64, approve: bool, resume: Option<SessionData>, system_prompt: Option<String>) -> Self {
         let (command_tx, command_rx) = channel::unbounded::<AppCommand>();
         let (event_tx, event_rx) = channel::unbounded::<(usize, AgentEvent)>();
         let (permission_tx, permission_rx) = channel::unbounded::<PendingPermission>();
@@ -86,25 +86,28 @@ impl App {
         let resume_msgs = resume.as_ref().map(|s| s.messages.clone()).unwrap_or_default();
         let session_id_for_thread = session_id.clone();
         let created_at_for_thread = created_at.clone();
+        let system_prompt_for_thread = system_prompt.clone();
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
+                let sp = system_prompt_for_thread.unwrap_or_else(|| {
+                    "You are an expert coding assistant operating inside rs-agent, a coding agent harness. \
+                     You help users by reading files, executing commands, editing code, and writing new files.\n\n\
+                     Guidelines:\n\
+                     - Use `read` to examine files instead of cat or sed. For text files, read shows content with line numbers.\n\
+                     - Use `bash` to execute commands. Prefer using bash over read for file listing (ls, find).\n\
+                     - Use `edit` for precise changes to existing files. Provide exact oldText to match.\n\
+                     - Use `write` to create new files or complete rewrites.\n\
+                     - Use `grep` to search for patterns in the codebase.\n\
+                     - Use `ls` to list directory contents.\n\
+                     - When writing code, first understand the existing patterns, then implement, then test.\n\
+                     - Always check if the code compiles/runs correctly after making changes."
+                        .to_string()
+                });
+
                 let mut state = AgentState::new(model2, provider_name)
-                    .with_system_prompt(
-                        "You are an expert coding assistant operating inside rs-agent, a coding agent harness. \
-                         You help users by reading files, executing commands, editing code, and writing new files.\n\n\
-                         Guidelines:\n\
-                         - Use `read` to examine files instead of cat or sed. For text files, read shows content with line numbers.\n\
-                         - Use `bash` to execute commands. Prefer using bash over read for file listing (ls, find).\n\
-                         - Use `edit` for precise changes to existing files. Provide exact oldText to match.\n\
-                         - Use `write` to create new files or complete rewrites.\n\
-                         - Use `grep` to search for patterns in the codebase.\n\
-                         - Use `ls` to list directory contents.\n\
-                         - When writing code, first understand the existing patterns, then implement, then test.\n\
-                         - Always check if the code compiles/runs correctly after making changes."
-                            .to_string(),
-                    );
+                    .with_system_prompt(sp);
 
                 for msg in &resume_msgs {
                     state.add_message(msg.clone());
