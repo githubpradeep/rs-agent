@@ -5,6 +5,7 @@ use rs_agent::ai::opencode_cli::OpenCodeCliProvider;
 use rs_agent::ai::openai::OpenAIProvider;
 use rs_agent::ai::provider::Provider;
 use rs_agent::cli::Cli;
+use rs_agent::session::SessionStore;
 use rs_agent::tui::App;
 use std::io::Write;
 use std::sync::Arc;
@@ -164,7 +165,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let mut app = App::new(provider, model, cli.timeout, cli.approve);
+    let store = SessionStore::new();
+
+    if cli.list_sessions {
+        match store.list() {
+            Ok(sessions) => {
+                if sessions.is_empty() {
+                    println!("No saved sessions.");
+                } else {
+                    println!("Saved sessions:");
+                    for id in &sessions {
+                        if let Ok(data) = store.load(id) {
+                            let msgs = data.messages.len();
+                            println!("  {}  ({} messages, {})", id, msgs, data.model);
+                        }
+                    }
+                }
+            }
+            Err(e) => eprintln!("Error listing sessions: {}", e),
+        }
+        return Ok(());
+    }
+
+    let resume_session = cli.resume.as_ref().and_then(|id| {
+        store.load(id).map_err(|e| eprintln!("{}", e)).ok()
+    });
+
+    let mut app = App::new(provider, model, cli.timeout, cli.approve, resume_session);
     app.run()?;
 
     Ok(())

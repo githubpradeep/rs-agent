@@ -2,7 +2,9 @@ use crate::agent::r#loop::AgentEvent;
 use crate::agent::state::AgentState;
 use crate::agent::AgentLoop;
 use crate::ai::provider::Provider;
+use crate::ai::types::Message;
 use crate::permission::{PendingPermission, PermissionReply, TrustStore};
+use crate::session::{SessionData, SessionStore};
 use crossbeam_channel as channel;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
@@ -31,8 +33,10 @@ enum InputMode {
     Waiting,
 }
 
+#[allow(dead_code)]
 enum AppCommand {
     Submit { text: String },
+    Init { messages: Vec<Message> },
     Exit,
 }
 
@@ -61,10 +65,11 @@ pub struct App {
     token_used: usize,
     token_limit: usize,
     near_limit: bool,
+    session_id: String,
 }
 
 impl App {
-    pub fn new(provider: Arc<dyn Provider>, model: String, timeout_secs: u64, approve: bool) -> Self {
+    pub fn new(provider: Arc<dyn Provider>, model: String, timeout_secs: u64, approve: bool, resume: Option<SessionData>) -> Self {
         let (command_tx, command_rx) = channel::unbounded::<AppCommand>();
         let (event_tx, event_rx) = channel::unbounded::<(usize, AgentEvent)>();
         let (permission_tx, permission_rx) = channel::unbounded::<PendingPermission>();
@@ -73,11 +78,19 @@ impl App {
         let provider2 = provider.clone();
         let model2 = model.clone();
         let timeout = std::time::Duration::from_secs(timeout_secs);
+        let session_id =
+            resume.as_ref().map(|s| s.id.clone()).unwrap_or_else(SessionStore::generate_id);
+        let created_at = resume.as_ref().map(|s| s.created_at.clone()).unwrap_or_else(|| {
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+        });
+        let resume_msgs = resume.as_ref().map(|s| s.messages.clone()).unwrap_or_default();
+        let session_id_for_thread = session_id.clone();
+        let created_at_for_thread = created_at.clone();
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
-                let state = AgentState::new(model2, provider_name)
+                let mut state = AgentState::new(model2, provider_name)
                     .with_system_prompt(
                         "You are an expert coding assistant operating inside rs-agent, a coding agent harness. \
                          You help users by reading files, executing commands, editing code, and writing new files.\n\n\
@@ -93,16 +106,27 @@ impl App {
                             .to_string(),
                     );
 
+                for msg in &resume_msgs {
+                    state.add_message(msg.clone());
+                }
+
                 let mut agent_loop = AgentLoop::new(provider2, state);
                 if !approve {
                     agent_loop.set_permission_channel(permission_tx);
                 }
                 crate::tools::register_default_tools(&mut agent_loop);
 
+                let store = SessionStore::new();
+
                 loop {
                     let cmd = command_rx.recv().unwrap_or(AppCommand::Exit);
                     match cmd {
                         AppCommand::Exit => break,
+                        AppCommand::Init { messages } => {
+                            for msg in messages {
+                                agent_loop.state_mut().add_message(msg);
+                            }
+                        }
                         AppCommand::Submit { text } => {
                             let result = tokio::time::timeout(
                                 timeout,
@@ -111,6 +135,7 @@ impl App {
                                 }),
                             )
                             .await;
+                            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
                             match result {
                                 Ok(Ok(())) => {}
                                 Ok(Err(e)) => {
@@ -122,6 +147,18 @@ impl App {
                                     }));
                                 }
                             }
+                            let s = agent_loop.state();
+                            let _ = store.save(&SessionData {
+                                id: session_id_for_thread.clone(),
+                                created_at: created_at_for_thread.clone(),
+                                updated_at: now,
+                                model: s.model.clone(),
+                                provider: s.provider.clone(),
+                                system_prompt: s.system_prompt.clone(),
+                                messages: s.messages.clone(),
+                                total_input_tokens: s.total_input_tokens,
+                                total_output_tokens: s.total_output_tokens,
+                            });
                         }
                     }
                 }
@@ -130,14 +167,32 @@ impl App {
 
         let trust_store = TrustStore::new();
 
+        let mut initial_msgs = vec![ChatMessage {
+            role: "system".to_string(),
+            text: format!(
+                "Rs Agent - Minimalist AI Agent Toolkit\nModel: {}\nSession: {}\n\nType a message to start a conversation.\ni: insert mode | Esc: normal mode | ^C: quit",
+                model, session_id
+            ),
+        }];
+
+        if let Some(ref resume_data) = resume {
+            for msg in &resume_data.messages {
+                let (role, text) = match &msg.role {
+                    crate::ai::types::Role::User => ("user", msg.content.first().and_then(|c| c.text.as_deref()).unwrap_or("")),
+                    crate::ai::types::Role::Assistant => ("assistant", msg.content.first().and_then(|c| c.text.as_deref()).unwrap_or("")),
+                    _ => continue,
+                };
+                if !text.is_empty() {
+                    initial_msgs.push(ChatMessage {
+                        role: role.to_string(),
+                        text: text.to_string(),
+                    });
+                }
+            }
+        }
+
         Self {
-            messages: vec![ChatMessage {
-                role: "system".to_string(),
-                text: format!(
-                    "Rs Agent - Minimalist AI Agent Toolkit\nModel: {}\n\nType a message to start a conversation.\ni: insert mode | Esc: normal mode | ^C: quit",
-                    model
-                ),
-            }],
+            messages: initial_msgs,
             input: String::new(),
             input_mode: InputMode::Insert,
             should_exit: false,
@@ -160,6 +215,7 @@ impl App {
             token_used: 0,
             token_limit: crate::ai::token_count::get_context_limit(&model),
             near_limit: false,
+            session_id,
         }
     }
 
@@ -578,8 +634,12 @@ impl App {
             String::new()
         };
 
+        let sess = format!(" [{}]", &self.session_id);
+
         let status = Line::from(vec![
-            Span::styled(" ^C quit | ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" ^C quit", Style::default().fg(Color::DarkGray)),
+            Span::styled(sess, Style::default().fg(Color::DarkGray)),
+            Span::styled(" | ", Style::default().fg(Color::DarkGray)),
             Span::styled(&self.status, Style::default().fg(status_color)),
             Span::styled(token_str, Style::default().fg(if self.near_limit { Color::Red } else { Color::DarkGray })),
         ]);

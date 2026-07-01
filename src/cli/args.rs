@@ -32,4 +32,10 @@ pub struct Cli {
 
     #[arg(short = 'a', long, default_value = "false")]
     pub approve: bool,
+
+    #[arg(short = 'r', long)]
+    pub resume: Option<String>,
+
+    #[arg(long, default_value = "false")]
+    pub list_sessions: bool,
 }
