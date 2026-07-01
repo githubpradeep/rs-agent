@@ -7,7 +7,9 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEv
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
+use ratatui::text::{Line, Span};
+
+use super::renderer::render_markdown;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 use std::io;
@@ -326,18 +328,13 @@ impl App {
                 "assistant" => ("▸ ", Color::Yellow),
                 _ => ("  ", Color::White),
             };
-            let style = Style::default().fg(color);
-            let bold_style = style.add_modifier(Modifier::BOLD);
+            let bold_prefix = Style::default().fg(color).add_modifier(Modifier::BOLD);
 
-            let text = Text::from(msg.text.as_str());
-            for (i, line) in text.lines.into_iter().enumerate() {
-                let mut spans: Vec<Span> = line
-                    .spans
-                    .into_iter()
-                    .map(|s| s.style(style))
-                    .collect();
+            let rendered = render_markdown(&msg.text);
+            for (i, line) in rendered.into_iter().enumerate() {
+                let mut spans = line.spans;
                 if i == 0 {
-                    spans.insert(0, Span::styled(prefix, bold_style));
+                    spans.insert(0, Span::styled(prefix, bold_prefix));
                 }
                 lines.push(Line::from(spans));
             }
@@ -352,6 +349,7 @@ impl App {
         let visible_lines: Vec<Line> = lines.into_iter().skip(start).collect();
 
         let chat = Paragraph::new(visible_lines)
+            .wrap(Wrap { trim: false })
             .block(
                 Block::default()
                     .borders(Borders::TOP)
