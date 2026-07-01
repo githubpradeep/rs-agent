@@ -539,28 +539,30 @@ impl App {
     }
 
     fn wrap_line<'a>(line: &Line<'a>, max_width: usize) -> Vec<Line<'a>> {
-        let text_len: usize = line.spans.iter().map(|s| s.content.len()).sum();
+        let text_len: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
         if text_len <= max_width {
             return vec![line.clone()];
         }
         let mut result = Vec::new();
         let mut current_spans: Vec<Span> = Vec::new();
-        let mut current_len = 0usize;
+        let mut current_chars = 0usize;
         for span in &line.spans {
-            let remaining = max_width.saturating_sub(current_len);
-            if span.content.len() <= remaining {
+            let span_chars: Vec<char> = span.content.chars().collect();
+            let remaining = max_width.saturating_sub(current_chars);
+            if span_chars.len() <= remaining {
                 current_spans.push(span.clone());
-                current_len += span.content.len();
+                current_chars += span_chars.len();
             } else {
-                let mut content = &span.content[..];
-                while !content.is_empty() {
-                    let take = max_width.saturating_sub(current_len).min(content.len());
-                    current_spans.push(Span::styled(content[..take].to_string(), span.style.clone()));
-                    current_len += take;
-                    content = &content[take..];
-                    if current_len >= max_width {
+                let mut i = 0;
+                while i < span_chars.len() {
+                    let take = max_width.saturating_sub(current_chars).min(span_chars.len() - i);
+                    let segment: String = span_chars[i..i + take].iter().collect();
+                    current_spans.push(Span::styled(segment, span.style.clone()));
+                    current_chars += take;
+                    i += take;
+                    if current_chars >= max_width {
                         result.push(Line::from(std::mem::take(&mut current_spans)));
-                        current_len = 0;
+                        current_chars = 0;
                     }
                 }
             }
