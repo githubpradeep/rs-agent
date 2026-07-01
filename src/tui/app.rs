@@ -325,6 +325,13 @@ impl App {
                 self.token_used = used;
                 self.token_limit = limit;
             }
+            AgentEvent::Compacting => {
+                self.status = "compacting...".to_string();
+            }
+            AgentEvent::Compacted { summary: _ } => {
+                self.status = "compacted".to_string();
+                self.near_limit = false;
+            }
         }
     }
 

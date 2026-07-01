@@ -21,6 +21,8 @@ pub enum AgentEvent {
     Done,
     ContextWarning { fraction: f64, used: usize, limit: usize },
     TokenUpdate { used: usize, limit: usize },
+    Compacting,
+    Compacted { summary: String },
 }
 
 pub struct AgentLoop {
@@ -29,6 +31,7 @@ pub struct AgentLoop {
     state: AgentState,
     max_iterations: usize,
     permission_tx: Option<channel::Sender<PendingPermission>>,
+    compacted_up_to: usize,
 }
 
 impl AgentLoop {
@@ -39,6 +42,7 @@ impl AgentLoop {
             state,
             max_iterations: 25,
             permission_tx: None,
+            compacted_up_to: 0,
         }
     }
 
@@ -158,8 +162,9 @@ impl AgentLoop {
                 return Err("Context limit exceeded".to_string());
             }
 
-            if fraction >= 0.80 {
+            if fraction >= 0.65 {
                 callback(AgentEvent::ContextWarning { fraction, used, limit });
+                let _ = self.compact(callback).await;
             }
 
             let assistant_msg = self.stream_assistant(callback).await?;
@@ -448,6 +453,107 @@ impl AgentLoop {
             }
         }
 
+        Ok(())
+    }
+
+    async fn compact(
+        &mut self,
+        callback: &mut dyn FnMut(AgentEvent),
+    ) -> Result<(), String> {
+        let keep = 8usize;
+        let total = self.state.messages.len();
+        if total <= self.compacted_up_to + keep {
+            return Ok(());
+        }
+        let split = total.saturating_sub(keep);
+        if split <= self.compacted_up_to {
+            return Ok(());
+        }
+
+        let to_summarize: Vec<Message> = self.state.messages[self.compacted_up_to..split].to_vec();
+        let keep_msgs: Vec<Message> = self.state.messages[split..].to_vec();
+
+        let mut conv_text = String::new();
+        for msg in &to_summarize {
+            let role = match msg.role {
+                Role::User => "User",
+                Role::Assistant => "Assistant",
+                Role::Tool => "Tool",
+                Role::System => "System",
+            };
+            for c in &msg.content {
+                if let Some(ref text) = c.text {
+                    conv_text.push_str(&format!("[{}] {}\n\n", role, text));
+                }
+            }
+        }
+
+        if conv_text.trim().is_empty() {
+            return Ok(());
+        }
+
+        callback(AgentEvent::Compacting);
+
+        let api_key = std::env::var(self.provider.api_key_env_var())
+            .map_err(|_| format!("{} not set", self.provider.api_key_env_var()))?;
+
+        let request = ChatRequest {
+            model: self.state.model.clone(),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![Content {
+                    content_type: ContentType::Text,
+                    text: Some(format!(
+                        "Summarize this conversation concisely, preserving key decisions, file changes, and results:\n\n{}",
+                        conv_text
+                    )),
+                    ..Default::default()
+                }],
+            }],
+            system: Some(
+                "You are a conversation summarizer. Write a brief summary (under 200 words) capturing the key points, decisions, files read/edited, and commands run. Use third person past tense."
+                    .to_string(),
+            ),
+            tools: Vec::new(),
+            max_tokens: 1024,
+            temperature: Some(0.0),
+            top_p: None,
+            stop_sequences: None,
+            stream: false,
+            thinking: None,
+        };
+
+        let result = self
+            .provider
+            .chat(&api_key, request)
+            .await
+            .map_err(|e| format!("Compaction failed: {:?}", e))?;
+
+        let summary = result
+            .content
+            .first()
+            .and_then(|c| c.text.as_deref())
+            .unwrap_or("")
+            .to_string();
+
+        let summary_msg = Message {
+            role: Role::System,
+            content: vec![Content {
+                content_type: ContentType::Text,
+                text: Some(format!(
+                    "[Compacted summary of earlier conversation]\n{}",
+                    summary
+                )),
+                ..Default::default()
+            }],
+        };
+
+        self.state.messages.clear();
+        self.state.messages.push(summary_msg);
+        self.state.messages.extend(keep_msgs);
+        self.compacted_up_to = 1;
+
+        callback(AgentEvent::Compacted { summary });
         Ok(())
     }
 
