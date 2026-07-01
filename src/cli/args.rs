@@ -47,4 +47,7 @@ pub struct Cli {
 
     #[arg(long)]
     pub append_system_prompt: Vec<String>,
+
+    #[arg(long, default_value_t = 100)]
+    pub max_iterations: usize,
 }

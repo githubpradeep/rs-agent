@@ -69,7 +69,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(provider: Arc<dyn Provider>, model: String, timeout_secs: u64, approve: bool, resume: Option<SessionData>, system_prompt: Option<String>) -> Self {
+    pub fn new(provider: Arc<dyn Provider>, model: String, timeout_secs: u64, approve: bool, resume: Option<SessionData>, system_prompt: Option<String>, max_iterations: usize) -> Self {
         let (command_tx, command_rx) = channel::unbounded::<AppCommand>();
         let (event_tx, event_rx) = channel::unbounded::<(usize, AgentEvent)>();
         let (permission_tx, permission_rx) = channel::unbounded::<PendingPermission>();
@@ -113,7 +113,7 @@ impl App {
                     state.add_message(msg.clone());
                 }
 
-                let mut agent_loop = AgentLoop::new(provider2, state);
+                let mut agent_loop = AgentLoop::new(provider2, state).with_max_iterations(max_iterations);
                 if !approve {
                     agent_loop.set_permission_channel(permission_tx);
                 }

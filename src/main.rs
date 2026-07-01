@@ -152,7 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             provider.clone(),
             rs_agent::agent::state::AgentState::new(model, provider_name.to_string())
                 .with_system_prompt(system_prompt),
-        );
+        ).with_max_iterations(cli.max_iterations);
         rs_agent::tools::register_default_tools(&mut agent);
 
         let mut has_error = false;
@@ -221,7 +221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         store.load(id).map_err(|e| eprintln!("{}", e)).ok()
     });
 
-    let mut app = App::new(provider, model, cli.timeout, cli.approve, resume_session, Some(system_prompt));
+    let mut app = App::new(provider, model, cli.timeout, cli.approve, resume_session, Some(system_prompt), cli.max_iterations);
     app.run()?;
 
     Ok(())
