@@ -557,6 +557,7 @@ impl App {
                 }
                 lines.push(Line::from(spans));
             }
+            lines.push(Line::from(""));
         }
 
         let inner_height = (area.height as usize).saturating_sub(1);
