@@ -91,6 +91,7 @@ impl AgentLoop {
                 content: None,
                 signature: None,
                 thinking: None,
+                is_error: false,
             }],
         };
         self.state.add_message(user_msg);
@@ -116,6 +117,7 @@ impl AgentLoop {
                 content: None,
                 signature: None,
                 thinking: None,
+                is_error: false,
             }],
         };
         self.state.add_message(user_msg);
@@ -135,6 +137,7 @@ impl AgentLoop {
                     content: None,
                     signature: None,
                     thinking: None,
+                    is_error: false,
                 }],
             };
             self.state.add_message(follow_up);
@@ -275,16 +278,16 @@ impl AgentLoop {
                             DeltaType::Text { text } => {
                                 if content_blocks.len() <= idx { content_blocks.resize(idx + 1, None); }
                                 let display_text = text.replace("<tool_call>", "").replace("</tool_call>", "");
-                                callback(AgentEvent::TextDelta { text: display_text });
+                                callback(AgentEvent::TextDelta { text: display_text.clone() });
                             if let Some(Some(b)) = content_blocks.get_mut(idx) {
                                 if b.content_type == ContentType::Text {
                                     let existing = b.text.take().unwrap_or_default();
-                                    b.text = Some(existing + &text);
+                                    b.text = Some(existing + &display_text);
                                 }
                             } else {
                                 content_blocks[idx] = Some(Content {
                                     content_type: ContentType::Text,
-                                    text: Some(text), ..Default::default()
+                                    text: Some(display_text), ..Default::default()
                                 });
                             }
                         }
@@ -352,9 +355,10 @@ impl AgentLoop {
             }
         }
 
+        let has_existing_tool_calls = content_blocks.iter().flatten().any(|b| b.content_type == ContentType::ToolUse);
         let mut expanded: Vec<Content> = Vec::new();
         for block in content_blocks.into_iter().flatten() {
-            if block.content_type == ContentType::Text {
+            if !has_existing_tool_calls && block.content_type == ContentType::Text {
                 if let Some(ref text) = block.text {
                     if let Some(start) = text.find("{\"name\"") {
                         let prefix = &text[..start];

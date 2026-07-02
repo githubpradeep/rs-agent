@@ -687,6 +687,7 @@ fn parse_converse_response(data: serde_json::Value) -> ProviderResult<AssistantM
                     content: None,
                     signature: None,
                     thinking: None,
+                    is_error: false,
                 });
             }
             if let Some(tool_use) = block["toolUse"].as_object() {
@@ -700,6 +701,7 @@ fn parse_converse_response(data: serde_json::Value) -> ProviderResult<AssistantM
                     content: None,
                     signature: None,
                     thinking: None,
+                    is_error: false,
                 });
             }
         }

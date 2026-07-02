@@ -35,7 +35,7 @@ impl AgentState {
         self.messages.push(msg);
     }
 
-    pub fn add_tool_result(&mut self, tool_use_id: String, tool_name: String, content: String, _is_error: bool) {
+    pub fn add_tool_result(&mut self, tool_use_id: String, tool_name: String, content: String, is_error: bool) {
         let msg = Message {
             role: Role::Tool,
             content: vec![Content {
@@ -48,6 +48,7 @@ impl AgentState {
                 content: None,
                 signature: None,
                 thinking: None,
+                is_error,
             }],
         };
         self.messages.push(msg);

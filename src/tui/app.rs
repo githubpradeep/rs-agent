@@ -24,6 +24,8 @@ use walkdir::WalkDir;
 struct ChatMessage {
     role: String,
     text: String,
+    thinking: Option<String>,
+    show_thinking: bool,
 }
 
 #[derive(PartialEq)]
@@ -67,6 +69,8 @@ pub struct App {
     token_limit: usize,
     near_limit: bool,
     session_id: String,
+    chat_area_y: u16,
+    thinking_targets: Vec<(usize, usize)>,
 }
 
 impl App {
@@ -93,18 +97,7 @@ impl App {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
                 let sp = system_prompt_for_thread.unwrap_or_else(|| {
-                    "You are an expert coding assistant operating inside rs-agent, a coding agent harness. \
-                     You help users by reading files, executing commands, editing code, and writing new files.\n\n\
-                     Guidelines:\n\
-                     - Use `read` to examine files instead of cat or sed. For text files, read shows content with line numbers.\n\
-                     - Use `bash` to execute commands. Prefer using bash over read for file listing (ls, find).\n\
-                     - Use `edit` for precise changes to existing files. Provide exact oldText to match.\n\
-                     - Use `write` to create new files or complete rewrites.\n\
-                     - Use `grep` to search for patterns in the codebase.\n\
-                     - Use `ls` to list directory contents.\n\
-                     - When writing code, first understand the existing patterns, then implement, then test.\n\
-                     - Always check if the code compiles/runs correctly after making changes."
-                        .to_string()
+                    crate::agent::default_system_prompt()
                 });
 
                 let mut state = AgentState::new(model2, provider_name)
@@ -174,9 +167,11 @@ impl App {
         let mut initial_msgs = vec![ChatMessage {
             role: "system".to_string(),
             text: format!(
-                "Rs Agent - Minimalist AI Agent Toolkit\nModel: {}\nSession: {}\n\nType a message to start a conversation.\ni: insert mode | Esc: normal mode | ^C: quit",
+                "Rs Agent - Minimalist AI Agent Toolkit\nModel: {}\nSession: {}\n\nType a message to start a conversation.\ni: insert mode | Esc: normal mode | ^C: quit\n💭 indicators are clickable: click to show/hide thinking",
                 model, session_id
             ),
+            thinking: None,
+            show_thinking: false,
         }];
 
         if let Some(ref resume_data) = resume {
@@ -185,11 +180,12 @@ impl App {
                     crate::ai::types::Role::User => {
                         let text = msg.content.first().and_then(|c| c.text.as_deref()).unwrap_or("");
                         if !text.is_empty() {
-                            initial_msgs.push(ChatMessage { role: "user".to_string(), text: text.to_string() });
+                            initial_msgs.push(ChatMessage { role: "user".to_string(), text: text.to_string(), thinking: None, show_thinking: false });
                         }
                     }
                     crate::ai::types::Role::Assistant => {
                         let mut text = String::new();
+                        let mut thinking: Option<String> = None;
                         for c in &msg.content {
                             match c.content_type {
                                 crate::ai::types::ContentType::Text => {
@@ -203,11 +199,16 @@ impl App {
                                     let preview: String = input.chars().take(120).collect();
                                     text.push_str(&format!("\n🛠 {} {}\n", name, preview));
                                 }
+                                crate::ai::types::ContentType::Thinking => {
+                                    if let Some(ref t) = c.thinking {
+                                        thinking = Some(t.clone());
+                                    }
+                                }
                                 _ => {}
                             }
                         }
                         if !text.is_empty() {
-                            initial_msgs.push(ChatMessage { role: "assistant".to_string(), text });
+                            initial_msgs.push(ChatMessage { role: "assistant".to_string(), text, thinking, show_thinking: false });
                         }
                     }
                     crate::ai::types::Role::Tool => {
@@ -215,7 +216,7 @@ impl App {
                         let result = msg.content.first().and_then(|c| c.text.as_deref()).unwrap_or("");
                         let preview: String = result.chars().take(200).collect();
                         if !preview.is_empty() {
-                            initial_msgs.push(ChatMessage { role: "tool".to_string(), text: format!("✅ [{}] {}", name, preview) });
+                            initial_msgs.push(ChatMessage { role: "tool".to_string(), text: format!("✅ [{}] {}", name, preview), thinking: None, show_thinking: false });
                         }
                     }
                     _ => {}
@@ -249,6 +250,8 @@ impl App {
             token_limit: crate::ai::token_count::get_context_limit(&model),
             near_limit: false,
             session_id,
+            chat_area_y: 0,
+            thinking_targets: Vec::new(),
         }
     }
 
@@ -302,6 +305,8 @@ impl App {
                     self.messages.push(ChatMessage {
                         role: "assistant".to_string(),
                         text: String::new(),
+                        thinking: None,
+                        show_thinking: false,
                     });
                 }
                 if let Some(last) = self.messages.last_mut() {
@@ -311,9 +316,8 @@ impl App {
             }
             AgentEvent::ThinkingDelta { thinking } => {
                 if let Some(last) = self.messages.last_mut() {
-                    if !last.text.contains("💭") {
-                        last.text.push_str(&format!("\n💭 {}...", thinking));
-                    }
+                    let prev = last.thinking.take().unwrap_or_default();
+                    last.thinking = Some(prev + &thinking);
                 }
             }
             AgentEvent::ToolUseStart { id: _, name } => {
@@ -386,6 +390,22 @@ impl App {
                     }
                     MouseEventKind::ScrollUp => {
                         self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                    }
+                    MouseEventKind::Down(button) if button == crossterm::event::MouseButton::Left => {
+                        let screen_row = mouse.row as usize;
+                        let visible_start = (self.chat_area_y + 1) as usize;
+                        if screen_row >= visible_start {
+                            let visible_idx = screen_row - visible_start;
+                            let content_line = visible_idx + self.scroll_offset;
+                            for &(target_line, msg_idx) in &self.thinking_targets {
+                                if target_line == content_line {
+                                    if let Some(msg) = self.messages.get_mut(msg_idx) {
+                                        msg.show_thinking = !msg.show_thinking;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -481,11 +501,15 @@ impl App {
                     self.messages.push(ChatMessage {
                         role: "user".to_string(),
                         text: text.clone(),
-                    });
+                        thinking: None,
+                        show_thinking: false,
+                                });
                     self.messages.push(ChatMessage {
                         role: "assistant".to_string(),
                         text: String::new(),
-                    });
+                        thinking: None,
+                        show_thinking: false,
+                                });
 
                     self.follow_bottom = true;
                     self.status = "thinking...".to_string();
@@ -619,9 +643,11 @@ impl App {
     }
 
     fn render_messages(&mut self, frame: &mut Frame, area: Rect) {
+        self.chat_area_y = area.y;
         let max_width = (area.width as usize).saturating_sub(2).max(20);
         let mut lines: Vec<Line> = Vec::new();
-        for msg in &self.messages {
+        self.thinking_targets.clear();
+        for (msg_idx, msg) in self.messages.iter().enumerate() {
             let (prefix, color) = match msg.role.as_str() {
                 "system" => ("◆ ", Color::Cyan),
                 "user" => ("▶ ", Color::Green),
@@ -639,6 +665,32 @@ impl App {
                 }
                 lines.extend(Self::wrap_line(&line, max_width));
             }
+
+            if let Some(ref thinking) = msg.thinking {
+                if !thinking.is_empty() {
+                    if msg.show_thinking {
+                        let think_style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
+                        let header = Span::styled("🧠 thinking (click to hide)", think_style);
+                        lines.push(Line::from(header));
+                        for raw_line in render_markdown(thinking) {
+                            let styled = Line::from(vec![Span::styled(
+                                raw_line.to_string(),
+                                think_style,
+                            )]);
+                            lines.push(styled);
+                        }
+                    } else {
+                        let clickable = Style::default().fg(Color::DarkGray).add_modifier(Modifier::UNDERLINED);
+                        let line_idx = lines.len();
+                        self.thinking_targets.push((line_idx, msg_idx));
+                        lines.push(Line::from(vec![Span::styled(
+                            format!("💭 {}", thinking.chars().take(60).collect::<String>()),
+                            clickable,
+                        )]));
+                    }
+                }
+            }
+
             lines.push(Line::from(""));
         }
 

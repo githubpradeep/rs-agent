@@ -67,7 +67,7 @@ fn convert_to_anthropic_messages(messages: &[Message], system: &Option<String>) 
                         "type": "tool_result",
                         "tool_use_id": c.tool_use_id.as_deref().unwrap_or(""),
                         "content": c.text.as_deref().unwrap_or(""),
-                        "is_error": false
+                        "is_error": c.is_error
                     }));
                 }
                 ContentType::Thinking | ContentType::RedactedThinking => {
@@ -94,7 +94,8 @@ fn convert_to_anthropic_messages(messages: &[Message], system: &Option<String>) 
                     "content": [{
                         "type": "tool_result",
                         "tool_use_id": c.tool_use_id.as_deref().unwrap_or(""),
-                        "content": c.text.as_deref().unwrap_or("")
+                        "content": c.text.as_deref().unwrap_or(""),
+                        "is_error": c.is_error
                     }]
                 }));
                 continue;
@@ -367,8 +368,9 @@ fn parse_anthropic_response(data: serde_json::Value) -> ProviderResult<Assistant
                         input: None,
                         tool_use_id: None,
                         content: None,
-                        signature: None,
-                        thinking: None,
+                    signature: None,
+                    thinking: None,
+                    is_error: false,
                     });
                 }
                 Some("tool_use") => {
@@ -380,8 +382,9 @@ fn parse_anthropic_response(data: serde_json::Value) -> ProviderResult<Assistant
                         input: Some(block["input"].clone()),
                         tool_use_id: None,
                         content: None,
-                        signature: None,
-                        thinking: None,
+                    signature: None,
+                    thinking: None,
+                    is_error: false,
                     });
                 }
                 Some("thinking") => {
@@ -393,8 +396,9 @@ fn parse_anthropic_response(data: serde_json::Value) -> ProviderResult<Assistant
                         input: None,
                         tool_use_id: None,
                         content: None,
-                        signature: block["signature"].as_str().map(|s| s.to_string()),
-                        thinking: block["thinking"].as_str().map(|s| s.to_string()),
+                    signature: block["signature"].as_str().map(|s| s.to_string()),
+                    thinking: block["thinking"].as_str().map(|s| s.to_string()),
+                    is_error: false,
                     });
                 }
                 _ => {}

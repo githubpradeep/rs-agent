@@ -29,6 +29,7 @@ pub struct Content {
     pub content: Option<Vec<Content>>,
     pub signature: Option<String>,
     pub thinking: Option<String>,
+    pub is_error: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

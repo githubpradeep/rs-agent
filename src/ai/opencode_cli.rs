@@ -242,6 +242,187 @@ impl OpenCodeCliProvider {
                 }
             }
         }
+        // Fallback: parse opencode-native <tool_name> + <tool_arguments> format
+        if calls.is_empty() {
+            calls = OpenCodeCliProvider::parse_native_tool_calls(text);
+        }
+        calls
+    }
+
+    fn find_balanced_json_in(s: &str, start: usize) -> Option<(usize, String)> {
+        let bytes = s.as_bytes();
+        let mut brace_pos = start;
+        while brace_pos < bytes.len() && bytes[brace_pos].is_ascii_whitespace() {
+            brace_pos += 1;
+        }
+        if brace_pos >= bytes.len() || bytes[brace_pos] != b'{' {
+            return None;
+        }
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut escaped = false;
+        for i in brace_pos..bytes.len() {
+            if escaped { escaped = false; continue; }
+            match bytes[i] {
+                b'"' if !in_string => in_string = true,
+                b'"' if in_string => in_string = false,
+                b'\\' if in_string => escaped = true,
+                b'{' if !in_string => depth += 1,
+                b'}' if !in_string => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((i + 1, s[brace_pos..i + 1].to_string()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn parse_native_tool_calls(text: &str) -> Vec<(String, String, serde_json::Value)> {
+        let mut calls = Vec::new();
+        let name_re = Regex::new(r"(?s)<tool_name>\s*(.*?)\s*</tool_name>").unwrap();
+        let args_open_re = Regex::new(r"<tool_arguments>\s*").unwrap();
+        let name_matches: Vec<_> = name_re.captures_iter(text).collect();
+        let args_matches: Vec<_> = args_open_re.captures_iter(text).collect();
+
+        // Strategy 1: pair <tool_name> with <tool_arguments>{json}</tool_arguments>
+        if name_matches.len() == 1 && !args_matches.is_empty() {
+            let tool_name = name_matches[0].get(1).unwrap().as_str().trim().to_string();
+            if !tool_name.is_empty() {
+                for args_cap in &args_matches {
+                    let args_start = args_cap.get(0).unwrap().end();
+                    if let Some((obj_end, json_str)) = Self::find_balanced_json_in(text, args_start) {
+                        let after = text[obj_end..].trim();
+                        if after.starts_with("</tool_arguments>") {
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                                let id = value.get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("call_0")
+                                    .to_string();
+                                calls.push((id, tool_name.clone(), value));
+                                return calls;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Strategy 2: Extract JSON from <tool_arguments>, derive name from <tool_name> or JSON
+        for args_cap in &args_matches {
+            let args_start = args_cap.get(0).unwrap().end();
+            if let Some((_obj_end, json_str)) = Self::find_balanced_json_in(text, args_start) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                    let has_name_args = value["name"].as_str().map_or(false, |n| !n.is_empty())
+                        && value["arguments"].is_object();
+                    let name = if has_name_args {
+                        value["name"].as_str().unwrap().to_string()
+                    } else {
+                        name_re.captures(text)
+                            .and_then(|c| c.get(1))
+                            .map(|m| m.as_str().trim().to_string())
+                            .unwrap_or_default()
+                    };
+                    if !name.is_empty() {
+                        let args = if has_name_args {
+                            value["arguments"].clone()
+                        } else {
+                            value.clone()
+                        };
+                        let id = value["id"]
+                            .as_str()
+                            .unwrap_or("call_0")
+                            .to_string();
+                        calls.push((id, name, args));
+                        return calls;
+                    }
+                }
+            }
+        }
+
+        // Strategy 2b: <tool_name>name</tool_name> followed by bare JSON (no <tool_arguments>)
+        if calls.is_empty() && !name_matches.is_empty() {
+            for name_cap in &name_matches {
+                let name_end = name_cap.get(0).unwrap().end();
+                let tool_name = name_cap.get(1).unwrap().as_str().trim().to_string();
+                if tool_name.is_empty() {
+                    continue;
+                }
+                if let Some((obj_end, json_str)) = Self::find_balanced_json_in(text, name_end) {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                        let has_name = value.get("name").and_then(|v| v.as_str()).map_or(false, |n| !n.is_empty());
+                        let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("call_0").to_string();
+                        if has_name && value.get("arguments").map_or(false, |a| a.is_object()) {
+                            calls.push((id, value["name"].as_str().unwrap().to_string(), value["arguments"].clone()));
+                        } else {
+                            calls.push((id, tool_name, value));
+                        }
+                        // Continue scanning after this JSON for more tool calls
+                        let remaining = if obj_end < text.len() { &text[obj_end..] } else { "" };
+                        if !remaining.trim().is_empty() {
+                            let extra = Self::parse_native_tool_calls(remaining);
+                            calls.extend(extra);
+                        }
+                        return calls;
+                    }
+                }
+            }
+        }
+
+        // Strategy 3: fallback — look for JSON objects with "name" and "arguments" anywhere
+        if calls.is_empty() {
+            let bare_re = Regex::new(r#"\{\s*"name"\s*:"#).unwrap();
+            if let Some(m) = bare_re.find(text) {
+                if let Some((_obj_end, json_str)) = Self::find_balanced_json_in(text, m.start()) {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                        let name = value["name"].as_str().unwrap_or("").to_string();
+                        if !name.is_empty() && value["arguments"].is_object() {
+                            let id = value["id"].as_str().unwrap_or("call_0").to_string();
+                            calls.push((id, name, value["arguments"].clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Strategy 4: opencode-native <tool_request> XML format
+        // <tool_request id="N" tool="name"><parameters><key>value</key>...</parameters></tool_request>
+        if calls.is_empty() {
+            let tool_req_re = Regex::new(r#"(?s)<tool_request\s+id="([^"]*)"\s+tool="([^"]*)"\s*>"#).unwrap();
+            let params_re = Regex::new(r"(?s)<parameters>(.*?)</parameters>").unwrap();
+            let param_re = Regex::new(r"(?s)<([a-zA-Z_][a-zA-Z0-9_]*)>(.*?)</[a-zA-Z_][a-zA-Z0-9_]*>").unwrap();
+
+            for req_cap in tool_req_re.captures_iter(text) {
+                let id = req_cap.get(1).unwrap().as_str().to_string();
+                let name = req_cap.get(2).unwrap().as_str().to_string();
+                let req_start = req_cap.get(0).unwrap().start();
+                let rest = &text[req_start..];
+
+                if let Some(params_cap) = params_re.captures(rest) {
+                    let params_xml = params_cap.get(1).unwrap().as_str();
+                    let mut args = serde_json::Map::new();
+                    for param_cap in param_re.captures_iter(params_xml) {
+                        let key = param_cap.get(1).unwrap().as_str().to_string();
+                        let raw_val = param_cap.get(2).unwrap().as_str();
+                        // Try number, then keep as string
+                        let val: serde_json::Value = if let Ok(n) = raw_val.parse::<i64>() {
+                            serde_json::Value::Number(n.into())
+                        } else if let Ok(f) = raw_val.parse::<f64>() {
+                            serde_json::Value::Number(serde_json::Number::from_f64(f).unwrap_or(
+                                serde_json::Number::from_f64(0.0).unwrap()
+                            ))
+                        } else {
+                            serde_json::Value::String(raw_val.to_string())
+                        };
+                        args.insert(key, val);
+                    }
+                    calls.push((id, name, serde_json::Value::Object(args)));
+                }
+            }
+        }
+
         calls
     }
 }
@@ -283,8 +464,9 @@ impl Provider for OpenCodeCliProvider {
                             ),
                             tool_use_id: None,
                             content: None,
-                            signature: None,
-                            thinking: None,
+                        signature: None,
+                        thinking: None,
+                        is_error: false,
                         });
                     }
                     DeltaType::Stop { stop_reason: reason } => {
@@ -309,6 +491,7 @@ impl Provider for OpenCodeCliProvider {
                     content: None,
                     signature: None,
                     thinking: None,
+                    is_error: false,
                 },
             );
         }
@@ -431,9 +614,11 @@ impl Provider for OpenCodeCliProvider {
                                     match event["type"].as_str() {
                                         Some("text") => {
                                             if let Some(part_text) = event["part"]["text"].as_str() {
-                                                let has_tag = part_text.contains("<tool_call>") || tool_call_buffer.contains("<tool_call>");
+                                                let has_tool_call = part_text.contains("<tool_call>") || tool_call_buffer.contains("<tool_call>");
+                                                let has_native = part_text.contains("<tool_name>") || part_text.contains("<tool_arguments>") || part_text.contains("<tool_request")
+                                                    || tool_call_buffer.contains("<tool_name>") || tool_call_buffer.contains("<tool_arguments>") || tool_call_buffer.contains("<tool_request");
                                                 let has_bare = part_text.contains("{\"name\"") || tool_call_buffer.contains("{\"name\"");
-                                                if has_tag {
+                                                if has_tool_call {
                                                     tool_call_buffer.push_str(part_text);
                                                     let re = Regex::new(r"<tool_call>([\s\S]*?)</tool_call>").unwrap();
                                                     let mut calls = Vec::new();
@@ -446,8 +631,9 @@ impl Provider for OpenCodeCliProvider {
                                                                 content_index,
                                                                 r#type: DeltaType::Text { text: before.to_string() },
                                                             }));
+                                                            content_index += 1;
                                                         }
-                                                        if let Some(json_str) = cap.get(1) {
+                                                    if let Some(json_str) = cap.get(1) {
                                                             if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str.as_str()) {
                                                                 let name = value["name"].as_str().unwrap_or("").to_string();
                                                                 let args = value["arguments"].clone();
@@ -456,6 +642,17 @@ impl Provider for OpenCodeCliProvider {
                                                                     .unwrap_or(&format!("call_{}", calls.len()))
                                                                     .to_string();
                                                                 calls.push((id, name, args));
+                                                            } else {
+                                                                // JSON parse failed — captured content may be native format
+                                                                // (<tool_name>/<tool_arguments>) wrapped in <tool_call> tags
+                                                                let native = OpenCodeCliProvider::parse_native_tool_calls(json_str.as_str());
+                                                                if !native.is_empty() {
+                                                                    calls.extend(native);
+                                                                } else {
+                                                                    // Also try parse_tool_calls for any other format
+                                                                    let fallback = OpenCodeCliProvider::parse_tool_calls(json_str.as_str());
+                                                                    calls.extend(fallback);
+                                                                }
                                                             }
                                                         }
                                                         last_end = m.end();
@@ -477,6 +674,25 @@ impl Provider for OpenCodeCliProvider {
                                                         let remaining = &tool_call_buffer[last_end..];
                                                         tool_call_buffer = remaining.to_string();
                                                     }
+                                                } else if has_native {
+                                                    tool_call_buffer.push_str(part_text);
+                                                    let native_calls = OpenCodeCliProvider::parse_native_tool_calls(&tool_call_buffer);
+                                                    if !native_calls.is_empty() {
+                                                        for (id, name, args) in &native_calls {
+                                                            tool_call_pending = true;
+                                                            let args_str = serde_json::to_string(args).unwrap_or_default();
+                                                            let _ = tx.send(Ok(StreamDelta {
+                                                                content_index,
+                                                                r#type: DeltaType::ToolCallStart {
+                                                                    id: id.clone(),
+                                                                    name: name.clone(),
+                                                                    input: args_str.clone(),
+                                                                },
+                                                            }));
+                                                            content_index += 1;
+                                                        }
+                                                        tool_call_buffer.clear();
+                                                    }
                                                 } else if has_bare {
                                                     if let Some(pos) = part_text.find("{\"name\"") {
                                                         if pos > 0 {
@@ -485,6 +701,7 @@ impl Provider for OpenCodeCliProvider {
                                                                 content_index,
                                                                 r#type: DeltaType::Text { text: before.to_string() },
                                                             }));
+                                                            content_index += 1;
                                                         }
                                                         tool_call_buffer.push_str(&part_text[pos..]);
                                                     } else {
@@ -593,7 +810,51 @@ impl Provider for OpenCodeCliProvider {
                                                         }
                                                     }
                                                     if !tool_call_pending {
+                                                        // Try native <tool_name>/<tool_arguments> format
+                                                        let native_calls = OpenCodeCliProvider::parse_native_tool_calls(&tool_call_buffer);
+                                                        if !native_calls.is_empty() {
+                                                            for (id, name, args) in &native_calls {
+                                                                tool_call_pending = true;
+                                                                let args_str = serde_json::to_string(args).unwrap_or_default();
+                                                                let _ = tx.send(Ok(StreamDelta {
+                                                                    content_index,
+                                                                    r#type: DeltaType::ToolCallStart {
+                                                                        id: id.clone(),
+                                                                        name: name.clone(),
+                                                                        input: args_str.clone(),
+                                                                    },
+                                                                }));
+                                                                content_index += 1;
+                                                            }
+                                                        }
+                                                    }
+                                                    if !tool_call_pending {
                                                         // Failed to extract — emit as text so user sees the raw tool call
+                                                        let _ = tx.send(Ok(StreamDelta {
+                                                            content_index,
+                                                            r#type: DeltaType::Text { text: tool_call_buffer.clone() },
+                                                        }));
+                                                    }
+                                                    tool_call_buffer.clear();
+                                                } else if tool_call_buffer.contains("<tool_name>") || tool_call_buffer.contains("<tool_arguments>") {
+                                                    // Try native format
+                                                    let native_calls = OpenCodeCliProvider::parse_native_tool_calls(&tool_call_buffer);
+                                                    if !native_calls.is_empty() {
+                                                        for (id, name, args) in &native_calls {
+                                                            tool_call_pending = true;
+                                                            let args_str = serde_json::to_string(args).unwrap_or_default();
+                                                            let _ = tx.send(Ok(StreamDelta {
+                                                                content_index,
+                                                                r#type: DeltaType::ToolCallStart {
+                                                                    id: id.clone(),
+                                                                    name: name.clone(),
+                                                                    input: args_str.clone(),
+                                                                },
+                                                            }));
+                                                            content_index += 1;
+                                                        }
+                                                    }
+                                                    if !tool_call_pending {
                                                         let _ = tx.send(Ok(StreamDelta {
                                                             content_index,
                                                             r#type: DeltaType::Text { text: tool_call_buffer.clone() },
@@ -681,5 +942,164 @@ impl Provider for OpenCodeCliProvider {
 
     fn default_max_tokens(&self) -> u32 {
         16384
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_native_tool_name_bare_json() {
+        // Format: <tool_name>name</tool_name>\n\n{<json>}
+        let text = "<tool_name>bash</tool_name>\n\n{\n\"command\": \"ls\",\n\"timeout\": 30000\n}\n";
+        let calls = OpenCodeCliProvider::parse_native_tool_calls(text);
+        assert_eq!(calls.len(), 1, "should find one tool call");
+        assert_eq!(calls[0].1, "bash");
+        assert_eq!(calls[0].2["command"], "ls");
+        assert_eq!(calls[0].2["timeout"], 30000);
+    }
+
+    #[test]
+    fn test_parse_native_tool_name_inline_json() {
+        // Format: <tool_name>read</tool_name>\n{"file_path":"/path/to/file"}
+        let text = "<tool_name>read</tool_name>\n{\"file_path\":\"/path/to/file\"}\n";
+        let calls = OpenCodeCliProvider::parse_native_tool_calls(text);
+        assert_eq!(calls.len(), 1, "should find one tool call");
+        assert_eq!(calls[0].1, "read");
+        assert_eq!(calls[0].2["file_path"], "/path/to/file");
+    }
+
+    #[test]
+    fn test_parse_native_tool_arguments_wrap() {
+        // Format: <tool_arguments>{json}</tool_arguments>\n<tool_name>name</tool_name>
+        let text = "<tool_arguments>{\"path\":\".\"}</tool_arguments>\n<tool_name>ls</tool_name>\n";
+        let calls = OpenCodeCliProvider::parse_native_tool_calls(text);
+        assert_eq!(calls.len(), 1, "should find one tool call");
+        assert_eq!(calls[0].1, "ls");
+        assert_eq!(calls[0].2["path"], ".");
+    }
+
+    #[test]
+    fn test_parse_native_multiple_calls() {
+        // Two <tool_name> + bare JSON blocks
+        let text = "<tool_name>read</tool_name>\n{\"file_path\":\"a.rs\"}\n\n<tool_name>read</tool_name>\n{\"file_path\":\"b.rs\"}\n";
+        let calls = OpenCodeCliProvider::parse_native_tool_calls(text);
+        assert_eq!(calls.len(), 2, "should find two tool calls");
+        assert_eq!(calls[0].1, "read");
+        assert_eq!(calls[0].2["file_path"], "a.rs");
+        assert_eq!(calls[1].1, "read");
+        assert_eq!(calls[1].2["file_path"], "b.rs");
+    }
+
+    #[test]
+    fn test_parse_tool_call_fallback() {
+        // Verify parse_tool_calls calls parse_native_tool_calls as fallback
+        let text = "<tool_name>bash</tool_name>\n{\"command\":\"ls\"}\n";
+        let calls = OpenCodeCliProvider::parse_tool_calls(text);
+        assert_eq!(calls.len(), 1, "parse_tool_calls should find native format via fallback");
+        assert_eq!(calls[0].1, "bash");
+    }
+
+    #[test]
+    fn test_find_balanced_json_whitespace() {
+        // JSON with leading whitespace
+        let s = "   \n\n{\"a\":1}";
+        let result = OpenCodeCliProvider::find_balanced_json_in(s, 0);
+        assert!(result.is_some(), "should find JSON after whitespace");
+        let (end, json_str) = result.unwrap();
+        assert_eq!(json_str, "{\"a\":1}");
+        assert_eq!(end, s.len());
+    }
+
+    #[test]
+    fn test_find_balanced_json_nested() {
+        // JSON with nested objects
+        let s = "{\"outer\":{\"inner\":\"value\"}}";
+        let result = OpenCodeCliProvider::find_balanced_json_in(s, 0);
+        assert!(result.is_some());
+        let (end, json_str) = result.unwrap();
+        assert_eq!(json_str, s);
+        assert_eq!(end, s.len());
+    }
+
+    #[test]
+    fn test_native_inside_tool_call_wrapper() {
+        // This is the EXACT format from the user's bug report:
+        // <tool_call> wrapping <tool_arguments> + <tool_name>
+        let text = "<tool_call>\n<tool_arguments>{\"path\":\"/Users/benches\"}</tool_arguments>\n<tool_name>ls</tool_name>\n</tool_call>";
+        // First verify parse_native_tool_calls works on the inner content
+        let inner = "\n<tool_arguments>{\"path\":\"/Users/benches\"}</tool_arguments>\n<tool_name>ls</tool_name>\n";
+        let inner_calls = OpenCodeCliProvider::parse_native_tool_calls(inner);
+        assert_eq!(inner_calls.len(), 1, "inner native content should parse");
+        assert_eq!(inner_calls[0].1, "ls");
+        assert_eq!(inner_calls[0].2["path"], "/Users/benches");
+
+        // Now verify parse_tool_calls handles the wrapped form
+        let calls = OpenCodeCliProvider::parse_tool_calls(text);
+        assert_eq!(calls.len(), 1, "wrapped form should be parseable via parse_tool_calls");
+        assert_eq!(calls[0].1, "ls");
+    }
+
+    #[test]
+    fn test_xml_tool_request_format() {
+        // Exact format from the user's bug report
+        let text = r#"<tool_request id="0" tool="read">
+  <parameters>
+    <file_path>/Users/pradeep.borado/work/scripts/metal-operators/tests/pca_test.rs</file_path>
+    <limit>50</limit>
+    <offset>1</offset>
+  </parameters>
+</tool_request>"#;
+        let calls = OpenCodeCliProvider::parse_native_tool_calls(text);
+        assert_eq!(calls.len(), 1, "should find one tool call in XML format");
+        assert_eq!(calls[0].1, "read");
+        assert_eq!(calls[0].2["file_path"], "/Users/pradeep.borado/work/scripts/metal-operators/tests/pca_test.rs");
+        assert_eq!(calls[0].2["limit"], 50);
+        assert_eq!(calls[0].2["offset"], 1);
+    }
+
+    #[test]
+    fn test_xml_tool_request_multiple() {
+        let text = r#"<tool_request id="0" tool="read">
+  <parameters>
+    <file_path>/a.rs</file_path>
+  </parameters>
+</tool_request>
+<tool_request id="1" tool="grep">
+  <parameters>
+    <pattern>pub fn</pattern>
+    <path>/src</path>
+  </parameters>
+</tool_request>"#;
+        let calls = OpenCodeCliProvider::parse_native_tool_calls(text);
+        assert_eq!(calls.len(), 2, "should find two tool calls");
+        assert_eq!(calls[0].1, "read");
+        assert_eq!(calls[1].1, "grep");
+    }
+
+    #[test]
+    fn test_xml_inside_tool_call_wrapper() {
+        let text = r#"<tool_call>
+<tool_request id="0" tool="read">
+  <parameters>
+    <file_path>/a.rs</file_path>
+  </parameters>
+</tool_request>
+</tool_call>"#;
+        let calls = OpenCodeCliProvider::parse_tool_calls(text);
+        assert_eq!(calls.len(), 1, "should extract XML from <tool_call> wrapper");
+        assert_eq!(calls[0].1, "read");
+    }
+
+    #[test]
+    fn test_find_balanced_json_with_braces_in_string() {
+        // JSON with braces inside string values
+        let s = "{\"code\":\"fn foo() { return 1; }\"}";
+        let result = OpenCodeCliProvider::find_balanced_json_in(s, 0);
+        assert!(result.is_some());
+        let (end, json_str) = result.unwrap();
+        assert_eq!(json_str, s);
+        assert_eq!(end, s.len());
     }
 }

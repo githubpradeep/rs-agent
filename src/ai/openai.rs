@@ -346,6 +346,7 @@ fn parse_openai_response(data: serde_json::Value) -> ProviderResult<AssistantMes
                 content: None,
                 signature: None,
                 thinking: None,
+                is_error: false,
             });
         }
     }
@@ -368,6 +369,7 @@ fn parse_openai_response(data: serde_json::Value) -> ProviderResult<AssistantMes
                 content: None,
                 signature: None,
                 thinking: None,
+                is_error: false,
             });
         }
     }

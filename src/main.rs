@@ -109,17 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let base_prompt = cli.system_prompt.clone().unwrap_or_else(|| {
-        "You are an expert coding assistant operating inside rs-agent, a coding agent harness. \
-         You help users by reading files, executing commands, editing code, and writing new files.\n\n\
-         Guidelines:\n\
-         - Use `read` to examine files instead of cat or sed.\n\
-         - Use `bash` to execute commands. Prefer bash over read for file listing (ls, find).\n\
-         - Use `edit` for precise changes to existing files.\n\
-         - Use `write` to create new files or complete rewrites.\n\
-         - Use `grep` to search for patterns in the codebase.\n\
-         - When writing code, first understand the patterns, then implement, then test.\n\
-         - Always check if the code compiles/runs correctly after making changes."
-            .to_string()
+        rs_agent::agent::default_system_prompt()
     });
 
     let mut system_prompt = base_prompt;
