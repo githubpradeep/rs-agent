@@ -31,10 +31,13 @@ impl BedrockProvider {
 
     fn api_url(&self, model: &str, stream: bool) -> String {
         let path = if stream { "converse-stream" } else { "converse" };
+        // Newer Bedrock models require an inference-profile ID (us./eu./… prefix),
+        // not the bare foundation-model ID. Also percent-encode `:` etc. in the path.
+        let model = normalize_bedrock_model_id(model, &self.region);
+        let model_path = percent_encode_path(&format!("/model/{model}/{path}"));
         format!(
-            "https://bedrock-runtime.{region}.amazonaws.com/model/{model}/{path}",
+            "https://bedrock-runtime.{region}.amazonaws.com{model_path}",
             region = self.region,
-            model = model,
         )
     }
 
@@ -82,7 +85,7 @@ impl BedrockProvider {
             } else if status.as_u16() == 401 || status.as_u16() == 403 {
                 ProviderError::Auth(text)
             } else {
-                ProviderError::Http(status.as_u16(), text)
+                ProviderError::Http(status.as_u16(), enrich_bedrock_http_error(&text))
             });
         }
 
@@ -141,7 +144,7 @@ impl BedrockProvider {
             } else if status.as_u16() == 401 || status.as_u16() == 403 {
                 ProviderError::Auth(text)
             } else {
-                ProviderError::Http(status.as_u16(), text)
+                ProviderError::Http(status.as_u16(), enrich_bedrock_http_error(&text))
             });
         }
 
@@ -311,6 +314,68 @@ fn load_region() -> String {
         .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
         .or_else(|_| read_region_from_config())
         .unwrap_or_else(|_| "us-east-1".to_string())
+}
+
+/// Map an AWS region to the Bedrock cross-region inference profile prefix.
+pub fn inference_profile_prefix_for_region(region: &str) -> &'static str {
+    let r = region.to_lowercase();
+    if r.starts_with("eu-") || r.starts_with("eusc-") {
+        "eu"
+    } else if r.starts_with("ap-southeast-2") || r.starts_with("ap-southeast-4") {
+        // Australia often has dedicated `au.` profiles; `apac.` is the generic fallback.
+        "au"
+    } else if r.starts_with("ap-northeast-1") {
+        "jp"
+    } else if r.starts_with("ap-") {
+        "apac"
+    } else if r.starts_with("ca-") {
+        "ca"
+    } else if r.starts_with("sa-") {
+        "us" // SA often routes via US profiles; bare IDs still fail
+    } else {
+        // us-*, af-*, me-*, il-*, etc.
+        "us"
+    }
+}
+
+/// True when `model` already looks like an inference profile ID or ARN.
+fn is_inference_profile_id(model: &str) -> bool {
+    let m = model.trim();
+    if m.starts_with("arn:aws:bedrock:") {
+        return true;
+    }
+    // System-defined geo / global prefixes (catalog has us./eu./au./jp./global./apac.).
+    const PREFIXES: &[&str] = &[
+        "us.", "eu.", "au.", "jp.", "apac.", "ap.", "ca.", "global.",
+    ];
+    PREFIXES.iter().any(|p| m.starts_with(p))
+}
+
+/// Rewrite bare foundation-model IDs to inference-profile IDs required by Bedrock.
+///
+/// Example: `anthropic.claude-opus-4-8` + `us-west-2` → `us.anthropic.claude-opus-4-8`
+pub fn normalize_bedrock_model_id(model: &str, region: &str) -> String {
+    let model = model.trim();
+    if model.is_empty() || is_inference_profile_id(model) {
+        return model.to_string();
+    }
+    // Application inference profiles sometimes look like `...` without a geo prefix
+    // but contain dots from the vendor — still need a prefix for anthropic/amazon/meta/…
+    let prefix = inference_profile_prefix_for_region(region);
+    format!("{prefix}.{model}")
+}
+
+fn enrich_bedrock_http_error(text: &str) -> String {
+    if text.contains("on-demand throughput") || text.contains("inference profile") {
+        format!(
+            "{text}\n\nHint: Bedrock needs an inference-profile ID (e.g. us.anthropic.claude-…), \
+             not a bare foundation-model ID. rs-agent normally adds the us./eu. prefix from \
+             your AWS region; try /model us.anthropic.claude-opus-4-8 or check model access \
+             in the Bedrock console."
+        )
+    } else {
+        text.to_string()
+    }
 }
 
 fn read_region_from_config() -> Result<String, std::env::VarError> {
@@ -616,6 +681,20 @@ fn convert_messages(
 ) -> ProviderResult<Vec<serde_json::Value>> {
     let mut result = Vec::new();
     let mut system_text = system.clone().unwrap_or_default();
+    // Bedrock Converse requires every toolResult for a given assistant toolUse
+    // turn to live in ONE user message. Our agent stores each result as Role::Tool;
+    // coalesce consecutive tool results here.
+    let mut pending_tool_results: Vec<serde_json::Value> = Vec::new();
+
+    let flush_tool_results = |out: &mut Vec<serde_json::Value>, pending: &mut Vec<serde_json::Value>| {
+        if pending.is_empty() {
+            return;
+        }
+        out.push(serde_json::json!({
+            "role": "user",
+            "content": std::mem::take(pending),
+        }));
+    };
 
     for msg in messages {
         if let Role::System = msg.role {
@@ -627,6 +706,31 @@ fn convert_messages(
             }
             continue;
         }
+
+        // Buffer Role::Tool messages (and ToolResult blocks on user msgs).
+        if msg.role == Role::Tool
+            || msg
+                .content
+                .iter()
+                .any(|c| c.content_type == ContentType::ToolResult)
+        {
+            for c in &msg.content {
+                if c.content_type != ContentType::ToolResult {
+                    continue;
+                }
+                let status = if c.is_error { "error" } else { "success" };
+                pending_tool_results.push(serde_json::json!({
+                    "toolResult": {
+                        "toolUseId": c.tool_use_id.as_deref().unwrap_or(""),
+                        "content": [{"text": c.text.as_deref().unwrap_or("")}],
+                        "status": status
+                    }
+                }));
+            }
+            continue;
+        }
+
+        flush_tool_results(&mut result, &mut pending_tool_results);
 
         let role = match msg.role {
             Role::User => "user",
@@ -655,13 +759,7 @@ fn convert_messages(
                     }));
                 }
                 ContentType::ToolResult => {
-                    content.push(serde_json::json!({
-                        "toolResult": {
-                            "toolUseId": c.tool_use_id.as_deref().unwrap_or(""),
-                            "content": [{"text": c.text.as_deref().unwrap_or("")}],
-                            "status": "success"
-                        }
-                    }));
+                    // Handled above via pending buffer.
                 }
                 ContentType::Thinking => {
                     if let Some(t) = &c.thinking {
@@ -679,7 +777,6 @@ fn convert_messages(
                     }
                 }
                 ContentType::RedactedThinking => {
-                    // Older / non-Claude paths: fall back to plain text.
                     if let Some(t) = &c.thinking {
                         content.push(serde_json::json!({
                             "text": t
@@ -696,6 +793,8 @@ fn convert_messages(
             }));
         }
     }
+
+    flush_tool_results(&mut result, &mut pending_tool_results);
 
     Ok(result)
 }
@@ -1056,5 +1155,115 @@ fn parse_converse_stream_event(data: &[u8]) -> Option<StreamDelta> {
             })
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_adds_us_prefix_for_us_west_2() {
+        assert_eq!(
+            normalize_bedrock_model_id("anthropic.claude-opus-4-8", "us-west-2"),
+            "us.anthropic.claude-opus-4-8"
+        );
+        assert_eq!(
+            normalize_bedrock_model_id("amazon.nova-2-lite-v1:0", "us-east-1"),
+            "us.amazon.nova-2-lite-v1:0"
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_existing_profile_prefix() {
+        assert_eq!(
+            normalize_bedrock_model_id("us.anthropic.claude-opus-4-8", "eu-west-1"),
+            "us.anthropic.claude-opus-4-8"
+        );
+        assert_eq!(
+            normalize_bedrock_model_id("global.anthropic.claude-opus-4-8", "us-west-2"),
+            "global.anthropic.claude-opus-4-8"
+        );
+    }
+
+    #[test]
+    fn normalize_uses_eu_prefix_in_europe() {
+        assert_eq!(
+            normalize_bedrock_model_id("anthropic.claude-sonnet-4-6", "eu-west-1"),
+            "eu.anthropic.claude-sonnet-4-6"
+        );
+    }
+
+    #[test]
+    fn api_url_encodes_colon_and_prefixes() {
+        let p = BedrockProvider::new(Some("us-west-2".into()), None);
+        let url = p.api_url("amazon.nova-2-lite-v1:0", true);
+        assert!(
+            url.contains("us.amazon.nova-2-lite-v1%3A0"),
+            "url was {url}"
+        );
+        assert!(url.contains("converse-stream"));
+    }
+
+    #[test]
+    fn convert_messages_merges_consecutive_tool_results() {
+        let messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![Content {
+                    content_type: ContentType::Text,
+                    text: Some("hi".into()),
+                    ..Default::default()
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    Content {
+                        content_type: ContentType::ToolUse,
+                        id: Some("tooluse_a".into()),
+                        name: Some("read".into()),
+                        input: Some(serde_json::json!({"path": "a"})),
+                        ..Default::default()
+                    },
+                    Content {
+                        content_type: ContentType::ToolUse,
+                        id: Some("tooluse_b".into()),
+                        name: Some("ls".into()),
+                        input: Some(serde_json::json!({"path": "."})),
+                        ..Default::default()
+                    },
+                ],
+            },
+            Message {
+                role: Role::Tool,
+                content: vec![Content {
+                    content_type: ContentType::ToolResult,
+                    tool_use_id: Some("tooluse_a".into()),
+                    text: Some("file a".into()),
+                    name: Some("read".into()),
+                    ..Default::default()
+                }],
+            },
+            Message {
+                role: Role::Tool,
+                content: vec![Content {
+                    content_type: ContentType::ToolResult,
+                    tool_use_id: Some("tooluse_b".into()),
+                    text: Some("listing".into()),
+                    name: Some("ls".into()),
+                    is_error: false,
+                    ..Default::default()
+                }],
+            },
+        ];
+
+        let out = convert_messages(&messages, &None).expect("convert");
+        assert_eq!(out.len(), 3, "user + assistant + one merged tool user msg");
+        assert_eq!(out[2]["role"], "user");
+        let content = out[2]["content"].as_array().expect("content array");
+        assert_eq!(content.len(), 2, "both toolResults in one message");
+        assert_eq!(content[0]["toolResult"]["toolUseId"], "tooluse_a");
+        assert_eq!(content[1]["toolResult"]["toolUseId"], "tooluse_b");
     }
 }

@@ -135,11 +135,13 @@ fn maybe_run_first_launch_wizard(cli: &mut Cli, cfg: &mut Config) -> Result<(), 
     let env_name = match provider.to_lowercase().as_str() {
         "openai" | "opencode" => "OPENAI_API_KEY",
         "opencode-cli" => "OPENCODE_API_KEY",
-        "bedrock" => "AWS_ACCESS_KEY_ID",
+        "bedrock" | "amazon-bedrock" => "AWS_ACCESS_KEY_ID",
         _ => "ANTHROPIC_API_KEY",
     };
-    if !matches!(provider.to_lowercase().as_str(), "opencode-cli" | "bedrock")
-        && std::env::var(env_name).is_err()
+    if !matches!(
+        provider.to_lowercase().as_str(),
+        "opencode-cli" | "bedrock" | "amazon-bedrock"
+    ) && std::env::var(env_name).is_err()
     {
         eprintln!("\nNo {} in the environment yet.", env_name);
         eprintln!("  export {}=...", env_name);
@@ -147,6 +149,15 @@ fn maybe_run_first_launch_wizard(cli: &mut Cli, cfg: &mut Config) -> Result<(), 
         if smoke.eq_ignore_ascii_case("y") || smoke.eq_ignore_ascii_case("yes") {
             eprintln!("Re-run rs-agent after exporting the key; smoke prompt: -p \"reply with pong\"");
         }
+    } else if matches!(
+        provider.to_lowercase().as_str(),
+        "bedrock" | "amazon-bedrock"
+    ) && std::env::var("AWS_ACCESS_KEY_ID").is_err()
+        && !rs_agent::ai::registry::has_configured_auth("amazon-bedrock")
+    {
+        eprintln!("\nNo AWS credentials found yet.");
+        eprintln!("  export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...");
+        eprintln!("  or configure ~/.aws/credentials ([default] or $AWS_PROFILE)");
     }
 
     eprintln!();
@@ -196,7 +207,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::set_var("OPENCODE_API_KEY", "cli-mode-no-key-needed");
     }
 
-    if provider_name.eq_ignore_ascii_case("bedrock") {
+    if provider_name.eq_ignore_ascii_case("bedrock")
+        || provider_name.eq_ignore_ascii_case("amazon-bedrock")
+    {
         if std::env::var("AWS_ACCESS_KEY_ID").is_err() {
             rs_agent::ai::bedrock::export_credentials_from_file();
         }
@@ -215,10 +228,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let provider_lower = provider_name.to_lowercase();
-    if !matches!(provider_lower.as_str(), "opencode-cli" | "bedrock") && std::env::var(&env_name).is_err() {
+    let skips_api_key_env = matches!(
+        provider_lower.as_str(),
+        "opencode-cli" | "bedrock" | "amazon-bedrock"
+    );
+    if !skips_api_key_env && std::env::var(&env_name).is_err() {
         eprintln!("Missing API key for {}.", provider_lower);
         eprintln!("  export {}=sk-...", env_name);
-        eprintln!("Or set api_key in ~/.rs-agent/config.toml (if supported) / pass --api-key.");
+        eprintln!("Or paste a key via /provider|/login (saved to ~/.rs-agent/secrets.toml).");
+        std::process::exit(1);
+    }
+
+    // Bedrock: env optional if ~/.aws/credentials (or AWS_PROFILE) is present.
+    if matches!(provider_lower.as_str(), "bedrock" | "amazon-bedrock")
+        && std::env::var("AWS_ACCESS_KEY_ID").is_err()
+        && !rs_agent::ai::registry::has_configured_auth("amazon-bedrock")
+    {
+        eprintln!("Missing AWS credentials for Bedrock.");
+        eprintln!("  export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...");
+        eprintln!("  or put keys in ~/.aws/credentials under [default] / $AWS_PROFILE");
         std::process::exit(1);
     }
 

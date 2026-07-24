@@ -115,12 +115,28 @@ fn canonicalize_provider(name: &str) -> String {
 
 pub fn default_model_for(provider: &str) -> String {
     let p = canonicalize_provider(provider);
+    if p == "amazon-bedrock" {
+        let models = catalog::models_for_provider(&p);
+        // Prefer a US inference-profile Claude id — bare foundation IDs fail on Bedrock.
+        if let Some(m) = models
+            .iter()
+            .find(|m| m.id.starts_with("us.anthropic.claude-sonnet"))
+        {
+            return m.id.clone();
+        }
+        if let Some(m) = models
+            .iter()
+            .find(|m| m.id.starts_with("us.anthropic."))
+        {
+            return m.id.clone();
+        }
+        return "us.anthropic.claude-opus-4-8".to_string();
+    }
     if let Some(m) = catalog::models_for_provider(&p).first() {
         return m.id.clone();
     }
     match p.as_str() {
         "opencode-cli" => "opencode/deepseek-v4-flash-free".to_string(),
-        "amazon-bedrock" => "us.anthropic.claude-opus-4-8".to_string(),
         _ => "gpt-4o".to_string(),
     }
 }

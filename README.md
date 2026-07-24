@@ -44,6 +44,9 @@ cargo run --release -- --provider anthropic -p "summarize example/rlm_long_doc.m
 
 # One-shot prompt, JSON event stream (for scripting/tooling)
 cargo run --release -- --provider anthropic --mode json -p "list files with ls"
+
+# USP demo (~100KB corpus → repl → llm_query → FINAL). See docs/demo.md
+./scripts/demo-rlm.sh --provider anthropic
 ```
 
 Requirements: a stable Rust toolchain and `python3` on `PATH` (used by the RLM `repl` tool).
@@ -195,7 +198,7 @@ Run `cargo run --release -- --help` for the exact, current flag set.
 | OpenAI | `openai` | `OPENAI_API_KEY` | |
 | OpenRouter | `openrouter` | `OPENROUTER_API_KEY` | Aggregator — hundreds of catalog models once keyed. |
 | Groq / DeepSeek / Together / Fireworks / xAI / … | same id | see `/provider` | OpenAI-compatible; listed from the built-in catalog. |
-| AWS Bedrock | `bedrock` / `amazon-bedrock` | AWS creds | |
+| AWS Bedrock | `bedrock` / `amazon-bedrock` | `~/.aws/credentials` or env | Newer models need inference-profile IDs (`us.anthropic…`); bare IDs are auto-prefixed from your AWS region. |
 | OpenCode (REST) | `opencode` | `OPENCODE_API_KEY` | |
 | OpenCode CLI | `opencode-cli` | (local CLI) | Experimental. `/model` lists whatever `opencode models` returns (full OpenCode catalog). |
 

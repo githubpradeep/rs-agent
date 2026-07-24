@@ -1687,7 +1687,8 @@ impl App {
         {
             std::env::set_var("OPENCODE_API_KEY", "cli-mode-no-key-needed");
         }
-        if mref.provider.eq_ignore_ascii_case("bedrock")
+        if (mref.provider.eq_ignore_ascii_case("bedrock")
+            || mref.provider.eq_ignore_ascii_case("amazon-bedrock"))
             && std::env::var("AWS_ACCESS_KEY_ID").is_err()
         {
             crate::ai::bedrock::export_credentials_from_file();
