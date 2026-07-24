@@ -1,5 +1,6 @@
 use crate::ai::token_count;
 use crate::ai::types::*;
+use crate::agent::mode::AgentMode;
 
 
 #[derive(Debug, Clone)]
@@ -11,6 +12,7 @@ pub struct AgentState {
     pub thinking_budget: Option<u32>,
     pub total_input_tokens: usize,
     pub total_output_tokens: usize,
+    pub mode: AgentMode,
 }
 
 impl AgentState {
@@ -23,12 +25,27 @@ impl AgentState {
             thinking_budget: None,
             total_input_tokens: 0,
             total_output_tokens: 0,
+            mode: AgentMode::Agent,
         }
     }
 
     pub fn with_system_prompt(mut self, prompt: String) -> Self {
         self.system_prompt = prompt;
         self
+    }
+
+    pub fn with_thinking_budget(mut self, budget: Option<u32>) -> Self {
+        self.thinking_budget = budget;
+        self
+    }
+
+    pub fn with_mode(mut self, mode: AgentMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn set_mode(&mut self, mode: AgentMode) {
+        self.mode = mode;
     }
 
     pub fn add_message(&mut self, msg: Message) {

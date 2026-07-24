@@ -943,6 +943,76 @@ impl Provider for OpenCodeCliProvider {
     fn default_max_tokens(&self) -> u32 {
         16384
     }
+
+    async fn fetch_models(&self, _api_key: &str) -> ProviderResult<Vec<String>> {
+        list_opencode_models(&self.bin).await
+    }
+}
+
+/// Run `opencode models` and return model ids (`provider/model` lines).
+pub async fn list_opencode_models(bin: &str) -> ProviderResult<Vec<String>> {
+    let output = tokio::process::Command::new(bin)
+        .arg("models")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ProviderError::Other(
+                    "opencode binary not found on PATH. Install OpenCode CLI to list models."
+                        .to_string(),
+                )
+            } else {
+                ProviderError::Other(format!("failed to run `{bin} models`: {e}"))
+            }
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ProviderError::Other(format!(
+            "`{bin} models` failed: {}",
+            stderr.trim()
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut models: Vec<String> = stdout
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && l.contains('/'))
+        .map(|l| l.to_string())
+        .collect();
+    models.sort();
+    models.dedup();
+    Ok(models)
+}
+
+/// Sync helper for catalog seeding (best-effort; empty if opencode missing).
+pub fn list_opencode_models_blocking(bin: &str) -> Vec<String> {
+    let output = std::process::Command::new(bin)
+        .arg("models")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut models: Vec<String> = stdout
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && l.contains('/'))
+        .map(|l| l.to_string())
+        .collect();
+    models.sort();
+    models.dedup();
+    models
 }
 
 #[cfg(test)]

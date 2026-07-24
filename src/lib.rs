@@ -1,8 +1,12 @@
 pub mod ai;
 pub mod agent;
 pub mod cli;
+pub mod config;
 pub mod context;
 pub mod permission;
+pub mod prompts;
+pub mod rlm;
 pub mod session;
+pub mod skills;
 pub mod tools;
 pub mod tui;

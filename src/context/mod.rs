@@ -23,10 +23,7 @@ fn load_first_from_dir(dir: &Path) -> Option<ContextFile> {
 }
 
 fn config_dir() -> PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".rs-agent")
+    crate::config::config_dir()
 }
 
 pub fn discover_context_files() -> Vec<ContextFile> {
@@ -82,6 +79,52 @@ pub fn build_context_section(files: &[ContextFile]) -> String {
         ));
     }
     section.push_str("</project_context>\n");
+    section
+}
+
+const RS_AGENT_DIR: &str = ".rs-agent";
+const COMMANDS_DIR: &str = "commands";
+
+pub fn discover_agent_commands() -> Vec<ContextFile> {
+    let mut commands = Vec::new();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let cmd_dir = cwd.join(RS_AGENT_DIR).join(COMMANDS_DIR);
+    if !cmd_dir.is_dir() {
+        return commands;
+    }
+    let mut entries: Vec<_> = match std::fs::read_dir(&cmd_dir) {
+        Ok(entries) => entries.filter_map(|e| e.ok()).collect(),
+        Err(_) => return commands,
+    };
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if path.extension().map_or(false, |ext| ext == "md") {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if !content.trim().is_empty() {
+                    commands.push(ContextFile { path, content });
+                }
+            }
+        }
+    }
+    commands
+}
+
+pub fn build_commands_section(commands: &[ContextFile]) -> String {
+    if commands.is_empty() {
+        return String::new();
+    }
+    let mut section = String::from("\n\n<agent_commands>\nAvailable commands the user may reference:\n\n");
+    for cmd in commands {
+        let name = cmd.path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        section.push_str(&format!(
+            "<command name=\"{}\">\n{}\n</command>\n\n",
+            name, cmd.content
+        ));
+    }
+    section.push_str("</agent_commands>\n");
     section
 }
 

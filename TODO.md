@@ -1,82 +1,106 @@
-# rs-agent TODO — Features missing vs reference pi agent
+# rs-agent TODO
 
-## Priority: Foundation (start here)
+Productionize **and** make it pleasant to use day-to-day — then share.
+RLM stays the USP; UI / skills / ergonomics are what make strangers stick around.
 
-- [ ] 1. Add `find` tool (glob-based file search)
-- [ ] 2. Implement session persistence (save/load to disk)
-- [ ] 10. Implement context compaction (auto + manual `/compact`)
-- [ ] 12. Implement token counting and context overflow detection
+## Done (foundation + Wave 1 + Wave 2 + Wave 3)
 
-## Session Management
+- [x] Core agent loop + streaming tools + RLM REPL / call tree
+- [x] File/web tools + `repl`
+- [x] Sessions, compaction, token tracking, context files
+- [x] Abort + steer; API retries; thinking display
+- [x] Config: `~/.rs-agent/config.toml` + project overrides (CLI wins)
+- [x] Skills v1 + prompt templates + 5 starter skills in `skills/`
+- [x] TUI slash: `/help` `/keys` `/clear` `/context` `/commands` `/skills` `/skill` `/prompt` `/reload` `/mode` `/sessions` `/export` `/trust` `/model` `/compact` `/new` `/tree` `/theme` `/rename` `/history`
+- [x] Modes: `plan` / `ask` / `agent` (tool filtering)
+- [x] Input history (Up/Down); `t` thinking toggle; `G` jump bottom
+- [x] Status bar: model · mode · depth · YOLO · session · tree
+- [x] Dangerous-bash heuristics + huge tool-result truncation
+- [x] Session titles + `list_summaries` + markdown export helper
+- [x] Trust store `list` / `clear`
+- [x] LICENSE (MIT), Cargo metadata, CI, CONTRIBUTING, docs/skills + keymap
+- [x] README rewrite (RLM + TUI + skills)
+- [x] First-launch wizard (TTY; writes real `config.toml`)
+- [x] Clear “no API key” / “python3 missing” errors with exact fix commands
+- [x] Bracketed paste; `/history`; `@file` / `#dir` pickers; `/rename`
+- [x] Richer permission cards (once / always / deny)
+- [x] Collapsible tool blocks; tool spinner + elapsed
+- [x] Live `/tree` side panel; REPL stdout panel; soft themes; configurable keybindings
+- [x] Tab-complete `/skill` `/prompt`; `/reload` refreshes system prompt; `/context` toggle
+- [x] `/model` interactive picker (aliases + live `fetch_models`)
+- [x] Mid-session provider+model switch (pi parity: `/model`, `/provider`, Ctrl+P)
+- [x] OpenAI / Bedrock thinking parity; default thinking budget when supported
+- [x] Call tree persistence + RLM smoke tests + example gallery
+- [x] Release workflow + install one-liner (`scripts/install.sh`)
+- [x] `reference/` git-ignored / documented
 
-- [ ] 3. Implement session resume (`-r` flag)
-- [ ] 4. Implement session forking (`/fork`)
-- [ ] 5. Implement session tree navigation (`/tree`)
-- [ ] 6. Implement session naming (`--name`, `/name`)
-- [ ] 7. Implement session export/import (HTML/JSONL)
-- [ ] 8. Implement session sharing (GitHub gist)
-- [ ] 9. Implement ephemeral mode (`--no-session`)
+---
 
-## Context & Compaction
+## A. Day-1 UX (remaining)
 
-- [ ] 11. Implement branch summarization
+### Sessions
+- [ ] Optional session branch / fork — *after* flat sessions feel solid
 
-## Extension & Subagent System
+---
 
-- [ ] 13. Implement extension system (loader, tools, commands, UI, events)
-- [ ] 14. Implement subagent spawning and orchestrator
+## C. Skills & workflows (remaining)
 
-## Interactive Features
+- [x] Tab-complete template / skill names in insert mode
+- [x] Hot-reload that also refreshes system prompt context (`/reload`)
+- [x] `/context` toggle rules on/off for a session
 
-- [ ] 15. Implement slash command system
-- [ ] 16. Implement model switching UI and model cycling
-- [ ] 17. Implement settings UI (`/settings`)
-- [ ] 18. Implement OAuth login/logout
-- [ ] 19. Implement prompt templates
-- [ ] 20. Implement image paste support
-- [ ] 21. Implement external editor (Ctrl+G)
-- [ ] 22. Implement shell commands in editor (`!command`, `!!command`)
-- [ ] 23. Implement file reference (`@` fuzzy search)
-- [ ] 24. Implement message queue (steering/follow-up)
+---
 
-## Context Files
+## B. TUI product surface (remaining)
 
-- [ ] 25. Implement context file discovery (AGENTS.md/CLAUDE.md)
-- [ ] 26. Implement custom/append system prompt files
+_(Wave 3 delivered named themes + single-char keybindings; richer variants deferred.)_
 
-## Security
+## D. RLM polish
 
-- [ ] 27. Implement project trust system
-- [ ] 28. Implement sandbox mode for bash
-- [ ] 29. Implement tool allowlist/denylist
-- [ ] 30. Implement permission system
+- [ ] Integration tests: REPL → `llm_query` / `agent_query` → `FINAL` (needs a live provider)
+- [x] RLM smoke test: `CallTree` register/snapshot/breadcrumb (no network) + REPL exec smoke test (skips if no `python3`)
+- [x] Persist call tree in session JSON (`SessionData::call_tree`; `/tree` falls back to last saved snapshot summary when idle)
+- [x] Stream REPL stdout into TUI
+- [ ] Optional Docker/isolated REPL sandbox — deferred
+- [x] Example gallery beyond `rlm_long_doc.md` (`example/README.md`, `example/rlm_mapreduce.md`)
 
-## Model Management
+---
 
-- [ ] 31. Implement model registry with pricing/context limits
-- [ ] 32. Implement model resolver (pattern matching, provider prefix)
-- [ ] 33. Implement thinking levels (off/minimal/low/medium/high/xhigh)
+## E. Providers
 
-## TUI Enhancements
+- [x] `/model` interactive picker (list from provider)
+- [x] Model aliases from config used in `/model`
+- [x] Mid-session **provider + model** switch (pi parity): registry, `/model provider/id`, `/provider`, `Ctrl-P` cycle
+- [x] Pi-style **static model catalog** (~1000 models) — picker shows catalog for ready providers
+- [x] `/provider` / `/login` interactive picker + paste API key + open console/signup URL (`~/.rs-agent/secrets.toml`)
+- [x] Persist last `/model`/`/provider` selection to `~/.rs-agent/config.toml` (restored on restart)
+- [x] OpenAI / Bedrock thinking parity
+- [x] Mark `opencode-cli` experimental in TUI banner (and already noted in README provider table)
 
-- [ ] 34. Implement TUI markdown rendering
-- [ ] 35. Implement syntax highlighting in TUI
-- [ ] 36. Implement image display in TUI
-- [ ] 37. Implement dynamic border color (thinking level)
-- [ ] 38. Implement footer with stats (tokens, cost, context, model)
-- [ ] 39. Implement configurable keybindings
-- [ ] 40. Implement theme system
-- [ ] 41. Implement autocomplete (file/path/command)
-- [ ] 42. Implement overlay UI system
+---
 
-## Output Modes
+## F. Ship / share
 
-- [ ] 43. Implement JSON mode (`--mode json`)
-- [ ] 44. Implement RPC mode (`--mode rpc`)
+- [x] Release binaries (macOS/Linux) via `.github/workflows/release.yml` on `v*` tags
+- [x] Install one-liner (curl script pointing at release artifacts)
+- [x] Keep `reference/` out of published artifact (git-ignored, untracked; documented in README/CONTRIBUTING)
+- [ ] Tag `v0.1.0` + release notes — *manual; ask before tagging*
+- [ ] Dogfood with 3 outsiders → `v0.2`
 
-## Distribution & Operations
+---
 
-- [ ] 45. Implement binary distribution (Bun-like builds)
-- [ ] 46. Implement self-update mechanism
-- [ ] 47. Implement package manager for extensions
-- [ ] 48. Implement telemetry system
+## H. Later (v0.2+)
+
+- [ ] Windows support
+- [ ] Session fork/share
+- [ ] Docker/isolated REPL sandbox
+- [ ] Thin Rust extension hooks (not full TS plugin VM)
+- [ ] RPC/SDK embed
+- [ ] OAuth flows
+- [ ] Package/marketplace only if skills outgrow git folders
+
+---
+
+## Still out of scope (for now)
+
+Swarm YAML DAGs, maximal oh-my-pi IDE/LSP/DAP surface, telemetry product, cloning pi’s entire extension marketplace before skills work.

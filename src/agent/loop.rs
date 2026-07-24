@@ -1,3 +1,4 @@
+use crate::agent::control::{AbortFlag, SteerQueue};
 use crate::agent::registry::ToolRegistry;
 use crate::agent::state::AgentState;
 use crate::agent::tool::{ToolExecutionMode, ToolExecuteResult};
@@ -5,9 +6,11 @@ use crate::ai::provider::Provider;
 use crate::ai::token_count;
 use crate::ai::types::*;
 use crate::permission::{PendingPermission, PermissionReply};
+use crate::rlm::tree::CallTree;
 use crossbeam_channel as channel;
 use futures::StreamExt;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing;
 
 #[derive(Debug, Clone)]
@@ -17,14 +20,45 @@ pub enum AgentEvent {
     ToolUseStart { id: String, name: String },
     ToolUseDelta { input: String },
     ToolResult { id: String, name: String, result: ToolExecuteResult },
+    /// Streaming REPL stdout/stderr lines while `repl` runs.
+    ReplOutput { stream: String, text: String },
     TurnEnd { stop_reason: Option<StopReason> },
     Error { message: String },
+    Status { message: String },
     Done,
+    Aborted,
     ContextWarning { fraction: f64, used: usize, limit: usize },
     TokenUpdate { used: usize, limit: usize },
     Compacting,
     Compacted { summary: String },
+    TreeUpdate { tree: CallTree },
+    TitleUpdate { title: String },
 }
+
+/// Truncates a tool result to `max` chars by keeping the head and tail and
+/// dropping the middle, so huge outputs (e.g. giant file dumps) don't blow
+/// up the context window while still preserving the most useful parts
+/// (the beginning, which usually has context/headers, and the end, which
+/// usually has the final result/error).
+///
+/// Operates on chars (not bytes) so multi-byte UTF-8 sequences are never split.
+pub fn truncate_tool_output(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+
+    let truncated_count = chars.len() - max;
+    let marker = format!("\n\n...[truncated {} chars]...\n\n", truncated_count);
+
+    let half = max / 2;
+    let head: String = chars[..half].iter().collect();
+    let tail: String = chars[chars.len() - (max - half)..].iter().collect();
+
+    format!("{}{}{}", head, marker, tail)
+}
+
+const MAX_TOOL_OUTPUT_CHARS: usize = 100_000;
 
 pub struct AgentLoop {
     provider: Arc<dyn Provider>,
@@ -34,6 +68,14 @@ pub struct AgentLoop {
     permission_tx: Option<channel::Sender<PendingPermission>>,
     compacted_up_to: usize,
     overflow_retried: bool,
+    blank_retries: u8,
+    abort: AbortFlag,
+    steer: SteerQueue,
+    call_tree: CallTree,
+    rlm_depth: u32,
+    max_rlm_depth: u32,
+    /// Optional sink so tools (e.g. REPL) can emit live events mid-execution.
+    event_sink: Option<channel::Sender<AgentEvent>>,
 }
 
 impl AgentLoop {
@@ -46,12 +88,77 @@ impl AgentLoop {
             permission_tx: None,
             compacted_up_to: 0,
             overflow_retried: false,
+            blank_retries: 0,
+            abort: AbortFlag::new(),
+            steer: SteerQueue::new(),
+            call_tree: CallTree::new(),
+            rlm_depth: 0,
+            max_rlm_depth: 2,
+            event_sink: None,
         }
     }
 
     pub fn with_max_iterations(mut self, max: usize) -> Self {
         self.max_iterations = max;
         self
+    }
+
+    pub fn with_abort(mut self, abort: AbortFlag) -> Self {
+        self.abort = abort;
+        self
+    }
+
+    pub fn with_steer(mut self, steer: SteerQueue) -> Self {
+        self.steer = steer;
+        self
+    }
+
+    pub fn with_rlm_depth(mut self, depth: u32, max_depth: u32) -> Self {
+        self.rlm_depth = depth;
+        self.max_rlm_depth = max_depth;
+        self
+    }
+
+    pub fn with_call_tree(mut self, tree: CallTree) -> Self {
+        self.call_tree = tree;
+        self
+    }
+
+    pub fn with_event_sink(mut self, sink: channel::Sender<AgentEvent>) -> Self {
+        self.event_sink = Some(sink);
+        self
+    }
+
+    pub fn event_sink(&self) -> Option<channel::Sender<AgentEvent>> {
+        self.event_sink.clone()
+    }
+
+    pub fn abort_flag(&self) -> AbortFlag {
+        self.abort.clone()
+    }
+
+    pub fn steer_queue(&self) -> SteerQueue {
+        self.steer.clone()
+    }
+
+    pub fn call_tree(&self) -> &CallTree {
+        &self.call_tree
+    }
+
+    pub fn call_tree_mut(&mut self) -> &mut CallTree {
+        &mut self.call_tree
+    }
+
+    pub fn rlm_depth(&self) -> u32 {
+        self.rlm_depth
+    }
+
+    pub fn max_rlm_depth(&self) -> u32 {
+        self.max_rlm_depth
+    }
+
+    pub fn provider(&self) -> Arc<dyn Provider> {
+        self.provider.clone()
     }
 
     pub fn state(&self) -> &AgentState {
@@ -66,6 +173,10 @@ impl AgentLoop {
         self.tools.register(tool);
     }
 
+    pub fn unregister_tool(&mut self, name: &str) {
+        self.tools.unregister(name);
+    }
+
     pub fn tools(&self) -> &ToolRegistry {
         &self.tools
     }
@@ -74,11 +185,105 @@ impl AgentLoop {
         self.permission_tx = Some(tx);
     }
 
+    pub fn request_abort(&self) {
+        self.abort.abort();
+    }
+
+    pub fn clear_abort(&self) {
+        self.abort.clear();
+    }
+
+    pub fn enqueue_steer(&self, text: String) {
+        self.steer.push(text);
+    }
+
+    pub fn set_model(&mut self, model: String) {
+        self.state.model = model;
+    }
+
+    /// Swap the live provider client and model (pi-style mid-session switch).
+    /// Re-attaches the RLM `repl` tool so sub-calls use the new client.
+    pub fn set_provider_and_model(
+        &mut self,
+        provider: Arc<dyn Provider>,
+        model: String,
+    ) {
+        let max_depth = self.max_rlm_depth;
+        self.state.provider = provider.name().to_string();
+        self.state.model = model;
+        self.provider = provider;
+        // Thinking budget: enable default when new provider supports it and none set.
+        if self.state.thinking_budget.is_none() && self.provider.supports_thinking() {
+            self.state.thinking_budget = Some(10_000);
+        }
+        if !self.provider.supports_thinking() {
+            // Keep budget stored but loop only sends when supports_thinking —
+            // no need to clear.
+        }
+        self.tools.unregister("repl");
+        crate::tools::register_rlm_tools(self, self.rlm_depth, max_depth);
+    }
+
+    pub fn clear_messages(&mut self) {
+        self.state.messages.clear();
+        self.compacted_up_to = 0;
+        self.call_tree = CallTree::new();
+    }
+
+    pub async fn compact_now(
+        &mut self,
+        callback: &mut (dyn FnMut(AgentEvent) + Send),
+    ) -> Result<(), String> {
+        self.compact(callback).await
+    }
+
+    fn check_aborted(&self) -> Result<(), String> {
+        if self.abort.is_aborted() {
+            Err("aborted".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn inject_steer_messages(&mut self, callback: &mut (dyn FnMut(AgentEvent) + Send)) {
+        for text in self.steer.drain() {
+            callback(AgentEvent::Status {
+                message: format!("steering: {}", text.chars().take(80).collect::<String>()),
+            });
+            self.state.add_message(Message {
+                role: Role::User,
+                content: vec![Content {
+                    content_type: ContentType::Text,
+                    text: Some(format!("[steer] {}", text)),
+                    ..Default::default()
+                }],
+            });
+        }
+    }
+
+    fn is_retryable(err: &ProviderError) -> bool {
+        match err {
+            ProviderError::RateLimited(_) | ProviderError::Timeout => true,
+            ProviderError::Http(code, _) if (500..=599).contains(code) => true,
+            _ => false,
+        }
+    }
+
+    fn retry_delay(err: &ProviderError, attempt: u32) -> Duration {
+        match err {
+            ProviderError::RateLimited(secs) if *secs > 0.0 => {
+                Duration::from_secs_f64((*secs).min(60.0))
+            }
+            _ => Duration::from_millis(500 * 2u64.pow(attempt.min(4))),
+        }
+    }
+
     pub async fn run(
         &mut self,
         user_message: &str,
-        callback: &mut dyn FnMut(AgentEvent),
+        callback: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<(), String> {
+        self.abort.clear();
         let user_msg = Message {
             role: Role::User,
             content: vec![Content {
@@ -96,54 +301,45 @@ impl AgentLoop {
         };
         self.state.add_message(user_msg);
 
-        self.run_loop(callback).await
+        match self.run_loop(callback).await {
+            Ok(()) => Ok(()),
+            Err(e) if e == "aborted" => {
+                callback(AgentEvent::Aborted);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn run_with_followups(
         &mut self,
         user_message: &str,
         follow_up_messages: Vec<String>,
-        callback: &mut dyn FnMut(AgentEvent),
+        callback: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<(), String> {
-        let user_msg = Message {
-            role: Role::User,
-            content: vec![Content {
-                content_type: ContentType::Text,
-                text: Some(user_message.to_string()),
-                id: None,
-                name: None,
-                input: None,
-                tool_use_id: None,
-                content: None,
-                signature: None,
-                thinking: None,
-                is_error: false,
-            }],
-        };
-        self.state.add_message(user_msg);
-
-        self.run_loop(callback).await?;
-
+        self.run(user_message, callback).await?;
         for msg in follow_up_messages {
-            let follow_up = Message {
+            if self.abort.is_aborted() {
+                callback(AgentEvent::Aborted);
+                return Ok(());
+            }
+            self.state.add_message(Message {
                 role: Role::User,
                 content: vec![Content {
                     content_type: ContentType::Text,
                     text: Some(msg),
-                    id: None,
-                    name: None,
-                    input: None,
-                    tool_use_id: None,
-                    content: None,
-                    signature: None,
-                    thinking: None,
-                    is_error: false,
+                    ..Default::default()
                 }],
-            };
-            self.state.add_message(follow_up);
-            self.run_loop(callback).await?;
+            });
+            match self.run_loop(callback).await {
+                Ok(()) => {}
+                Err(e) if e == "aborted" => {
+                    callback(AgentEvent::Aborted);
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            }
         }
-
         Ok(())
     }
 
@@ -157,14 +353,29 @@ impl AgentLoop {
             || lower.contains("request too large")
     }
 
+    fn is_blank_assistant(msg: &AssistantMessage) -> bool {
+        if msg.content.is_empty() {
+            return true;
+        }
+        msg.content.iter().all(|c| match c.content_type {
+            ContentType::Text => c.text.as_deref().unwrap_or("").trim().is_empty(),
+            ContentType::Thinking => c.thinking.as_deref().unwrap_or("").trim().is_empty(),
+            _ => false,
+        })
+    }
+
     async fn run_loop(
         &mut self,
-        callback: &mut dyn FnMut(AgentEvent),
+        callback: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<(), String> {
         self.overflow_retried = false;
+        self.blank_retries = 0;
         let tool_defs_json = serde_json::to_string(&self.tools.tool_defs()).unwrap_or_default();
 
         for _ in 0..self.max_iterations {
+            self.check_aborted()?;
+            self.inject_steer_messages(callback);
+
             let used = self.state.estimated_context_tokens(&tool_defs_json);
             let limit = self.state.context_limit();
             let fraction = used as f64 / limit as f64;
@@ -187,9 +398,10 @@ impl AgentLoop {
             let assistant_result = self.stream_assistant(callback).await;
             let assistant_msg = match assistant_result {
                 Ok(msg) => msg,
+                Err(e) if e == "aborted" => return Err(e),
                 Err(e) if !self.overflow_retried && Self::is_context_overflow(&e) => {
                     callback(AgentEvent::Error {
-                        message: format!("Context overflow detected, compacting and retrying..."),
+                        message: "Context overflow detected, compacting and retrying...".to_string(),
                     });
                     self.overflow_retried = true;
                     let _ = self.compact(callback).await;
@@ -209,11 +421,27 @@ impl AgentLoop {
                 .collect();
 
             if tool_calls.is_empty() {
+                if Self::is_blank_assistant(&assistant_msg) && self.blank_retries < 2 {
+                    self.blank_retries += 1;
+                    tracing::warn!(
+                        attempt = self.blank_retries,
+                        "empty assistant response; retrying"
+                    );
+                    callback(AgentEvent::Error {
+                        message: format!(
+                            "Empty model response, retrying ({}/2)...",
+                            self.blank_retries
+                        ),
+                    });
+                    continue;
+                }
+                self.blank_retries = 0;
                 self.state.add_assistant(&assistant_msg);
                 callback(AgentEvent::Done);
                 return Ok(());
             }
 
+            self.blank_retries = 0;
             self.state.add_assistant(&assistant_msg);
 
             let has_sequential = self.tools.iter().any(|t| {
@@ -225,209 +453,240 @@ impl AgentLoop {
             } else {
                 self.execute_tools_parallel(&tool_calls, callback).await?;
             }
+
+            self.check_aborted()?;
+            self.inject_steer_messages(callback);
         }
 
-        callback(AgentEvent::Error { message: format!("Reached max iterations ({})", self.max_iterations) });
+        callback(AgentEvent::Error {
+            message: format!("Reached max iterations ({})", self.max_iterations),
+        });
         Err(format!("Reached max iterations ({})", self.max_iterations))
     }
 
     async fn stream_assistant(
         &self,
-        callback: &mut dyn FnMut(AgentEvent),
+        callback: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<AssistantMessage, String> {
         let api_key = std::env::var(self.provider.api_key_env_var())
             .map_err(|_| format!("{} not set", self.provider.api_key_env_var()))?;
 
+        let thinking = self.state.thinking_budget.filter(|b| *b > 0).map(|b| ThinkingConfig {
+            r#type: "enabled".to_string(),
+            budget_tokens: b,
+        });
+        // Anthropic extended thinking: max_tokens must exceed budget; temperature must be omitted/1.
+        let (max_tokens, temperature) = if let Some(ref t) = thinking {
+            (
+                self.provider
+                    .default_max_tokens()
+                    .saturating_add(t.budget_tokens)
+                    .max(t.budget_tokens.saturating_add(4096)),
+                None,
+            )
+        } else {
+            (self.provider.default_max_tokens(), Some(0.0))
+        };
+
+        let mut system = self.state.system_prompt.clone();
+        if let Some(note) = self.state.mode.system_note() {
+            if !system.is_empty() {
+                system.push_str("\n\n");
+            }
+            system.push_str(note);
+        }
+        let tools: Vec<_> = self
+            .tools
+            .tool_defs()
+            .into_iter()
+            .filter(|t| self.state.mode.allows_tool(&t.name))
+            .collect();
+
         let request = ChatRequest {
             model: self.state.model.clone(),
             messages: self.state.messages.clone(),
-            system: if self.state.system_prompt.is_empty() {
-                None
-            } else {
-                Some(self.state.system_prompt.clone())
-            },
-            tools: self.tools.tool_defs(),
-            max_tokens: self.provider.default_max_tokens(),
-            temperature: Some(0.0),
+            system: if system.is_empty() { None } else { Some(system) },
+            tools,
+            max_tokens,
+            temperature,
             top_p: None,
             stop_sequences: None,
             stream: true,
-            thinking: self.state.thinking_budget.map(|b| ThinkingConfig {
-                r#type: "enabled".to_string(),
-                budget_tokens: b,
-            }),
+            thinking,
         };
 
-        let mut stream = self
-            .provider
-            .chat_stream(&api_key, request)
-            .await
-            .map_err(|e| format!("stream error: {:?}", e))?;
+        let mut last_err = None;
+        for attempt in 0..3u32 {
+            self.check_aborted()?;
+            match self.provider.chat_stream(&api_key, request.clone()).await {
+                Ok(mut stream) => {
+                    let mut content_blocks: Vec<Option<Content>> = Vec::new();
+                    let mut tool_arg_buf: Vec<String> = Vec::new();
+                    let usage: Option<Usage> = None;
+                    let mut stop_reason: Option<StopReason> = None;
+                    let model = String::new();
+                    let msg_id: Option<String> = None;
 
-        let mut content_blocks: Vec<Option<Content>> = Vec::new();
-        let mut tool_arg_buf: Vec<String> = Vec::new();
-        let usage: Option<Usage> = None;
-        let mut stop_reason: Option<StopReason> = None;
-        let model = String::new();
-        let msg_id: Option<String> = None;
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(delta) => {
-                    let idx = delta.content_index as usize;
-                    match delta.r#type {
-                            DeltaType::Text { text } => {
-                                if content_blocks.len() <= idx { content_blocks.resize(idx + 1, None); }
-                                let display_text = text.replace("<tool_call>", "").replace("</tool_call>", "");
-                                callback(AgentEvent::TextDelta { text: display_text.clone() });
-                            if let Some(Some(b)) = content_blocks.get_mut(idx) {
-                                if b.content_type == ContentType::Text {
-                                    let existing = b.text.take().unwrap_or_default();
-                                    b.text = Some(existing + &display_text);
-                                }
-                            } else {
-                                content_blocks[idx] = Some(Content {
-                                    content_type: ContentType::Text,
-                                    text: Some(display_text), ..Default::default()
-                                });
-                            }
-                        }
-                        DeltaType::Thinking { thinking } => {
-                            if content_blocks.len() <= idx { content_blocks.resize(idx + 1, None); }
-                            callback(AgentEvent::ThinkingDelta { thinking: thinking.clone() });
-                            if let Some(Some(b)) = content_blocks.get_mut(idx) {
-                                if b.content_type == ContentType::Thinking {
-                                    let existing = b.thinking.take().unwrap_or_default();
-                                    b.thinking = Some(existing + &thinking);
-                                }
-                            } else {
-                                content_blocks[idx] = Some(Content {
-                                    content_type: ContentType::Thinking,
-                                    thinking: Some(thinking), ..Default::default()
-                                });
-                            }
-                        }
-                        DeltaType::Signature { signature } => {
-                            if let Some(Some(b)) = content_blocks.get_mut(idx) {
-                                b.signature = Some(signature);
-                            }
-                        }
-                        DeltaType::ToolCallStart { id, name, input } => {
-                            if content_blocks.len() <= idx { content_blocks.resize(idx + 1, None); }
-                            if tool_arg_buf.len() <= idx { tool_arg_buf.resize(idx + 1, String::new()); }
-                            callback(AgentEvent::ToolUseStart { id: id.clone(), name: name.clone() });
-                            content_blocks[idx] = Some(Content {
-                                content_type: ContentType::ToolUse,
-                                id: Some(id),
-                                name: Some(name),
-                                input: None,
-                                ..Default::default()
-                            });
-                            tool_arg_buf[idx] = input;
-                        }
-                        DeltaType::ToolCallDelta { input } => {
-                            callback(AgentEvent::ToolUseDelta { input: input.clone() });
-                            if tool_arg_buf.len() <= idx {
-                                tool_arg_buf.resize(idx + 1, String::new());
-                                tool_arg_buf[idx] = input;
-                            } else {
-                                tool_arg_buf[idx].push_str(&input);
-                            }
-                        }
-                        DeltaType::Stop { stop_reason: reason } => {
-                            stop_reason = reason;
-                        }
-                    }
-                }
-                Err(e) => {
-                    callback(AgentEvent::Error { message: format!("stream error: {:?}", e) });
-                    return Err(format!("stream error: {:?}", e));
-                }
-            }
-        }
-
-        for (i, block) in content_blocks.iter_mut().enumerate() {
-            if let Some(b) = block {
-                if b.content_type == ContentType::ToolUse {
-                    if let Some(raw) = tool_arg_buf.get(i) {
-                        b.input = Some(serde_json::from_str(raw).unwrap_or(serde_json::Value::Object(serde_json::Map::new())));
-                    }
-                }
-            }
-        }
-
-        let has_existing_tool_calls = content_blocks.iter().flatten().any(|b| b.content_type == ContentType::ToolUse);
-        let mut expanded: Vec<Content> = Vec::new();
-        for block in content_blocks.into_iter().flatten() {
-            if !has_existing_tool_calls && block.content_type == ContentType::Text {
-                if let Some(ref text) = block.text {
-                    if let Some(start) = text.find("{\"name\"") {
-                        let prefix = &text[..start];
-                        if !prefix.is_empty() {
-                            expanded.push(Content {
-                                content_type: ContentType::Text,
-                                text: Some(prefix.to_string()),
-                                ..Default::default()
-                            });
-                        }
-                        let after = &text[start..];
-                        let mut depth = 0i32;
-                        let mut end = after.len();
-                        for (j, ch) in after.char_indices() {
-                            if ch == '{' { depth += 1; }
-                            else if ch == '}' {
-                                depth -= 1;
-                                if depth == 0 {
-                                    end = j + 1;
-                                    break;
-                                }
-                            }
-                        }
-                        if depth == 0 {
-                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&after[..end]) {
-                                if let Some(name) = value["name"].as_str() {
-                                    if value["arguments"].is_object() {
-                                        callback(AgentEvent::ToolUseStart { id: format!("call_{}", expanded.len()), name: name.to_string() });
-                                        expanded.push(Content {
-                                            content_type: ContentType::ToolUse,
-                                            id: Some(format!("call_{}", expanded.len())),
-                                            name: Some(name.to_string()),
-                                            input: Some(value["arguments"].clone()),
-                                            ..Default::default()
-                                        });
-                                        let suffix = &after[end..];
-                                        if !suffix.is_empty() {
-                                            expanded.push(Content {
+                    while let Some(result) = stream.next().await {
+                        self.check_aborted()?;
+                        match result {
+                            Ok(delta) => {
+                                let idx = delta.content_index as usize;
+                                match delta.r#type {
+                                    DeltaType::Text { text } => {
+                                        if content_blocks.len() <= idx {
+                                            content_blocks.resize(idx + 1, None);
+                                        }
+                                        callback(AgentEvent::TextDelta { text: text.clone() });
+                                        if let Some(Some(b)) = content_blocks.get_mut(idx) {
+                                            if b.content_type == ContentType::Text {
+                                                let existing = b.text.take().unwrap_or_default();
+                                                b.text = Some(existing + &text);
+                                            }
+                                        } else {
+                                            content_blocks[idx] = Some(Content {
                                                 content_type: ContentType::Text,
-                                                text: Some(suffix.to_string()),
+                                                text: Some(text),
                                                 ..Default::default()
                                             });
                                         }
-                                        continue;
                                     }
+                                    DeltaType::Thinking { thinking } => {
+                                        if content_blocks.len() <= idx {
+                                            content_blocks.resize(idx + 1, None);
+                                        }
+                                        callback(AgentEvent::ThinkingDelta {
+                                            thinking: thinking.clone(),
+                                        });
+                                        if let Some(Some(b)) = content_blocks.get_mut(idx) {
+                                            if b.content_type == ContentType::Thinking {
+                                                let existing = b.thinking.take().unwrap_or_default();
+                                                b.thinking = Some(existing + &thinking);
+                                            }
+                                        } else {
+                                            content_blocks[idx] = Some(Content {
+                                                content_type: ContentType::Thinking,
+                                                thinking: Some(thinking),
+                                                ..Default::default()
+                                            });
+                                        }
+                                    }
+                                    DeltaType::Signature { signature } => {
+                                        if let Some(Some(b)) = content_blocks.get_mut(idx) {
+                                            b.signature = Some(signature);
+                                        }
+                                    }
+                                    DeltaType::ToolCallStart { id, name, input } => {
+                                        if content_blocks.len() <= idx {
+                                            content_blocks.resize(idx + 1, None);
+                                        }
+                                        if tool_arg_buf.len() <= idx {
+                                            tool_arg_buf.resize(idx + 1, String::new());
+                                        }
+                                        callback(AgentEvent::ToolUseStart {
+                                            id: id.clone(),
+                                            name: name.clone(),
+                                        });
+                                        content_blocks[idx] = Some(Content {
+                                            content_type: ContentType::ToolUse,
+                                            id: Some(id),
+                                            name: Some(name),
+                                            input: None,
+                                            ..Default::default()
+                                        });
+                                        tool_arg_buf[idx] = input;
+                                    }
+                                    DeltaType::ToolCallDelta { input } => {
+                                        callback(AgentEvent::ToolUseDelta {
+                                            input: input.clone(),
+                                        });
+                                        if tool_arg_buf.len() <= idx {
+                                            tool_arg_buf.resize(idx + 1, String::new());
+                                            tool_arg_buf[idx] = input;
+                                        } else {
+                                            tool_arg_buf[idx].push_str(&input);
+                                        }
+                                    }
+                                    DeltaType::Stop { stop_reason: reason } => {
+                                        stop_reason = reason;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                if Self::is_retryable(&e) && attempt < 2 {
+                                    last_err = Some(e);
+                                    break;
+                                }
+                                callback(AgentEvent::Error {
+                                    message: format!("stream error: {:?}", e),
+                                });
+                                return Err(format!("stream error: {:?}", e));
+                            }
+                        }
+                    }
+
+                    if let Some(err) = last_err.take() {
+                        let delay = Self::retry_delay(&err, attempt);
+                        callback(AgentEvent::Status {
+                            message: format!(
+                                "retrying after {:?} (attempt {}/3)...",
+                                err,
+                                attempt + 1
+                            ),
+                        });
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+
+                    for (i, block) in content_blocks.iter_mut().enumerate() {
+                        if let Some(b) = block {
+                            if b.content_type == ContentType::ToolUse {
+                                if let Some(raw) = tool_arg_buf.get(i) {
+                                    b.input = Some(serde_json::from_str(raw).unwrap_or(
+                                        serde_json::Value::Object(serde_json::Map::new()),
+                                    ));
                                 }
                             }
                         }
                     }
+
+                    return Ok(AssistantMessage {
+                        content: content_blocks.into_iter().flatten().collect(),
+                        stop_reason,
+                        usage,
+                        model,
+                        id: msg_id,
+                    });
                 }
+                Err(e) if Self::is_retryable(&e) && attempt < 2 => {
+                    let delay = Self::retry_delay(&e, attempt);
+                    callback(AgentEvent::Status {
+                        message: format!(
+                            "retrying after {:?} (attempt {}/3)...",
+                            e,
+                            attempt + 1
+                        ),
+                    });
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => return Err(format!("stream error: {:?}", e)),
             }
-            expanded.push(block);
         }
 
-        Ok(AssistantMessage {
-            content: expanded,
-            stop_reason,
-            usage,
-            model,
-            id: msg_id,
-        })
+        Err(format!(
+            "stream error after retries: {:?}",
+            last_err.unwrap_or(ProviderError::Other("unknown".into()))
+        ))
     }
+
 
     async fn execute_tools_sequential(
         &mut self,
         tool_calls: &[Content],
-        callback: &mut dyn FnMut(AgentEvent),
+        callback: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<(), String> {
         for tc in tool_calls {
+            self.check_aborted()?;
             let id = tc.id.as_deref().unwrap_or("");
             let name = tc.name.as_deref().unwrap_or("");
             let input = tc.input.clone().unwrap_or(serde_json::Value::Null);
@@ -438,7 +697,8 @@ impl AgentLoop {
                 name: name.to_string(),
                 result: result.clone(),
             });
-            self.state.add_tool_result(id.to_string(), name.to_string(), result.content.clone(), result.is_error);
+            let stored_content = truncate_tool_output(&result.content, MAX_TOOL_OUTPUT_CHARS);
+            self.state.add_tool_result(id.to_string(), name.to_string(), stored_content, result.is_error);
 
             if result.terminate {
                 break;
@@ -450,7 +710,7 @@ impl AgentLoop {
     async fn execute_tools_parallel(
         &mut self,
         tool_calls: &[Content],
-        callback: &mut dyn FnMut(AgentEvent),
+        callback: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<(), String> {
         struct ToolJob {
             id: String,
@@ -463,22 +723,23 @@ impl AgentLoop {
             input: tc.input.clone().unwrap_or(serde_json::Value::Null),
         }).collect();
 
-        let mut futures = Vec::new();
-        for job in tool_data {
-            let result = self.execute_single_tool(&job.id, &job.name, &job.input).await;
-            futures.push((job, result));
-        }
+        let futures: Vec<_> = tool_data.iter().map(|job| {
+            self.execute_single_tool(&job.id, &job.name, &job.input)
+        }).collect();
 
-        for (job, result) in &futures {
+        let results = futures::future::join_all(futures).await;
+
+        for (job, result) in tool_data.iter().zip(results.iter()) {
             callback(AgentEvent::ToolResult {
                 id: job.id.clone(),
                 name: job.name.clone(),
                 result: result.clone(),
             });
-            self.state.add_tool_result(job.id.clone(), job.name.clone(), result.content.clone(), result.is_error);
+            let stored_content = truncate_tool_output(&result.content, MAX_TOOL_OUTPUT_CHARS);
+            self.state.add_tool_result(job.id.clone(), job.name.clone(), stored_content, result.is_error);
         }
 
-        for (_, result) in futures {
+        for result in &results {
             if result.terminate {
                 break;
             }
@@ -489,7 +750,7 @@ impl AgentLoop {
 
     async fn compact(
         &mut self,
-        callback: &mut dyn FnMut(AgentEvent),
+        callback: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<(), String> {
         const KEEP_BUDGET: usize = 20_000;
         const TRUNCATE_LEN: usize = 2000;
@@ -666,20 +927,37 @@ impl AgentLoop {
         name: &str,
         input: &serde_json::Value,
     ) -> ToolExecuteResult {
+        if !self.state.mode.allows_tool(name) {
+            return ToolExecuteResult::error(format!(
+                "Tool '{}' blocked in {} mode. Switch with /mode agent (or plan/ask).",
+                name,
+                self.state.mode.as_str()
+            ));
+        }
         match self.tools.get(name) {
             Some(tool) => {
                 if let Some(ref tx) = self.permission_tx {
                     if tool.requires_permission() {
+                        let danger_reason = if name == "bash" {
+                            input
+                                .get("command")
+                                .and_then(|v| v.as_str())
+                                .and_then(crate::tools::bash::is_dangerous_command)
+                                .map(|s| s.to_string())
+                        } else {
+                            None
+                        };
                         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                         let _ = tx.send(PendingPermission {
                             request: crate::permission::PermissionRequest {
                                 tool_name: name.to_string(),
                                 tool_input: input.to_string(),
+                                danger_reason,
                             },
                             reply_tx,
                         });
                         match reply_rx.await {
-                            Ok(PermissionReply::Allow) => {}
+                            Ok(PermissionReply::AllowOnce) | Ok(PermissionReply::AllowAlways) => {}
                             Ok(PermissionReply::Deny) => {
                                 return ToolExecuteResult::error("Permission denied by user");
                             }
@@ -694,6 +972,52 @@ impl AgentLoop {
             }
             None => ToolExecuteResult::error(format!("Unknown tool: {}", name)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_output_truncation_tests {
+    use super::truncate_tool_output;
+
+    #[test]
+    fn leaves_short_output_untouched() {
+        let s = "hello world";
+        assert_eq!(truncate_tool_output(s, 100), s);
+    }
+
+    #[test]
+    fn leaves_output_at_exactly_max_untouched() {
+        let s = "a".repeat(50);
+        assert_eq!(truncate_tool_output(&s, 50), s);
+    }
+
+    #[test]
+    fn truncates_long_output_keeping_head_and_tail() {
+        let s = "a".repeat(50) + &"b".repeat(50) + &"c".repeat(50);
+        let out = truncate_tool_output(&s, 60);
+        assert!(out.starts_with(&"a".repeat(30)));
+        assert!(out.ends_with(&"c".repeat(30)));
+        assert!(out.contains("...[truncated"));
+        assert!(out.contains("chars]..."));
+    }
+
+    #[test]
+    fn truncated_marker_reports_correct_dropped_count() {
+        let s = "x".repeat(1000);
+        let out = truncate_tool_output(&s, 100);
+        // 1000 total chars, 100 kept -> 900 dropped.
+        assert!(out.contains("...[truncated 900 chars]..."));
+    }
+
+    #[test]
+    fn does_not_split_multibyte_utf8_chars() {
+        // Each "é" is 2 bytes in UTF-8 but 1 char; ensure char-based slicing
+        // never panics or produces invalid UTF-8 sequences.
+        let s = "é".repeat(200);
+        let out = truncate_tool_output(&s, 50);
+        assert!(out.chars().count() < s.chars().count());
+        // Would panic on invalid UTF-8 boundaries if this were byte-based.
+        let _ = out.len();
     }
 }
 

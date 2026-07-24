@@ -17,6 +17,10 @@ impl ToolRegistry {
         self.tools.insert(tool.name().to_string(), tool);
     }
 
+    pub fn unregister(&mut self, name: &str) {
+        self.tools.remove(name);
+    }
+
     pub fn get(&self, name: &str) -> Option<&SharedTool> {
         self.tools.get(name)
     }

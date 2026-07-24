@@ -105,6 +105,33 @@ fn convert_tools(tools: &[ToolDef]) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Map a thinking token budget to OpenAI `reasoning_effort`.
+fn reasoning_effort_from_budget(budget: u32) -> &'static str {
+    if budget < 5_000 {
+        "low"
+    } else if budget < 15_000 {
+        "medium"
+    } else {
+        "high"
+    }
+}
+
+/// Apply thinking / temperature fields shared by chat and chat_stream bodies.
+fn apply_openai_sampling(body: &mut serde_json::Value, request: &ChatRequest) {
+    if let Some(thinking) = &request.thinking {
+        // Reasoning models reject temperature; use effort instead.
+        body["reasoning_effort"] =
+            serde_json::json!(reasoning_effort_from_budget(thinking.budget_tokens));
+    } else if let Some(temp) = request.temperature {
+        body["temperature"] = serde_json::json!(temp);
+    }
+    if request.thinking.is_none() {
+        if let Some(top_p) = request.top_p {
+            body["top_p"] = serde_json::json!(top_p);
+        }
+    }
+}
+
 #[async_trait]
 impl Provider for OpenAIProvider {
     fn name(&self) -> &str {
@@ -132,12 +159,7 @@ impl Provider for OpenAIProvider {
             "stream": false
         });
 
-        if let Some(temp) = request.temperature {
-            body["temperature"] = serde_json::json!(temp);
-        }
-        if let Some(top_p) = request.top_p {
-            body["top_p"] = serde_json::json!(top_p);
-        }
+        apply_openai_sampling(&mut body, &request);
         if !request.tools.is_empty() {
             body["tools"] = serde_json::json!(convert_tools(&request.tools));
         }
@@ -207,12 +229,7 @@ impl Provider for OpenAIProvider {
             "stream_options": {"include_usage": true}
         });
 
-        if let Some(temp) = request.temperature {
-            body["temperature"] = serde_json::json!(temp);
-        }
-        if let Some(top_p) = request.top_p {
-            body["top_p"] = serde_json::json!(top_p);
-        }
+        apply_openai_sampling(&mut body, &request);
         if !request.tools.is_empty() {
             body["tools"] = serde_json::json!(convert_tools(&request.tools));
         }
@@ -281,7 +298,9 @@ impl Provider for OpenAIProvider {
     }
 
     fn supports_thinking(&self) -> bool {
-        self.name.contains("o") || self.name.contains("reasoning")
+        // Provider-level gate: request model is not available on the trait.
+        // Loop already combines this with a non-zero thinking_budget.
+        true
     }
 
     fn default_max_tokens(&self) -> u32 {
@@ -333,6 +352,26 @@ fn parse_openai_response(data: serde_json::Value) -> ProviderResult<AssistantMes
 
     let message = &choice["message"];
     let mut content = Vec::new();
+
+    let reasoning = message["reasoning_content"]
+        .as_str()
+        .or_else(|| message["reasoning"].as_str());
+    if let Some(thinking) = reasoning {
+        if !thinking.is_empty() {
+            content.push(Content {
+                content_type: ContentType::Thinking,
+                text: None,
+                id: None,
+                name: None,
+                input: None,
+                tool_use_id: None,
+                content: None,
+                signature: None,
+                thinking: Some(thinking.to_string()),
+                is_error: false,
+            });
+        }
+    }
 
     if let Some(text) = message["content"].as_str() {
         if !text.is_empty() {
@@ -460,6 +499,20 @@ fn parse_openai_stream_line(line: &str) -> Option<StreamDelta> {
                     });
                 }
             }
+        }
+    }
+
+    let reasoning = delta["reasoning_content"]
+        .as_str()
+        .or_else(|| delta["reasoning"].as_str());
+    if let Some(thinking) = reasoning {
+        if !thinking.is_empty() {
+            return Some(StreamDelta {
+                content_index: 0,
+                r#type: DeltaType::Thinking {
+                    thinking: thinking.to_string(),
+                },
+            });
         }
     }
 

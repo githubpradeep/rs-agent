@@ -2,7 +2,14 @@
 name = "rs-agent"
 version = "0.1.0"
 edition = "2021"
-description = "Minimalist AI agent toolkit: unified LLM API, agent loop, TUI, coding agent CLI"
+description = "RLM-style recursive coding agent: unified LLM API, agent loop, TUI, and a persistent-REPL recursive-language-model core"
+license = "MIT"
+repository = "https://github.com/githubpradeep/rs-agent"
+homepage = "https://github.com/githubpradeep/rs-agent"
+readme = "README.md"
+keywords = ["agent", "rlm", "llm", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+authors = ["rs-agent contributors"]
 
 [dependencies]
 # Async runtime
@@ -53,4 +60,6 @@ scraper = "0.20"
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
+toml = "1.1.3"
+serde_yaml = "0.9.34"
 

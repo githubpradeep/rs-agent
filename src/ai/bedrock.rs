@@ -262,7 +262,9 @@ impl Provider for BedrockProvider {
     }
 
     fn supports_thinking(&self) -> bool {
-        false
+        // Claude models receive additionalModelRequestFields; other models ignore.
+        // Request model is not available on the Provider trait.
+        true
     }
 
     fn default_max_tokens(&self) -> u32 {
@@ -592,6 +594,19 @@ fn build_converse_body(request: &ChatRequest) -> ProviderResult<serde_json::Valu
         }));
     }
 
+    if let Some(thinking) = &request.thinking {
+        // Anthropic Claude extended thinking via Bedrock Converse.
+        body.insert(
+            "additionalModelRequestFields".to_string(),
+            serde_json::json!({
+                "thinking": {
+                    "type": "enabled",
+                    "budget_tokens": thinking.budget_tokens
+                }
+            }),
+        );
+    }
+
     Ok(serde_json::Value::Object(body))
 }
 
@@ -648,7 +663,23 @@ fn convert_messages(
                         }
                     }));
                 }
-                ContentType::Thinking | ContentType::RedactedThinking => {
+                ContentType::Thinking => {
+                    if let Some(t) = &c.thinking {
+                        let mut reasoning_text = serde_json::json!({ "text": t });
+                        if let Some(sig) = &c.signature {
+                            if !sig.is_empty() {
+                                reasoning_text["signature"] = serde_json::json!(sig);
+                            }
+                        }
+                        content.push(serde_json::json!({
+                            "reasoningContent": {
+                                "reasoningText": reasoning_text
+                            }
+                        }));
+                    }
+                }
+                ContentType::RedactedThinking => {
+                    // Older / non-Claude paths: fall back to plain text.
                     if let Some(t) = &c.thinking {
                         content.push(serde_json::json!({
                             "text": t
@@ -676,7 +707,68 @@ fn parse_converse_response(data: serde_json::Value) -> ProviderResult<AssistantM
 
     if let Some(blocks) = data["output"]["message"]["content"].as_array() {
         for block in blocks {
-            if let Some(text) = block["text"].as_str() {
+            if let Some(reasoning) = block.get("reasoningContent") {
+                let thinking_text = reasoning["reasoningText"]["text"]
+                    .as_str()
+                    .or_else(|| reasoning["text"].as_str())
+                    .or_else(|| reasoning["thinking"].as_str());
+                let signature = reasoning["reasoningText"]["signature"]
+                    .as_str()
+                    .or_else(|| reasoning["signature"].as_str())
+                    .map(|s| s.to_string());
+                if let Some(t) = thinking_text {
+                    if !t.is_empty() || signature.is_some() {
+                        content.push(Content {
+                            content_type: ContentType::Thinking,
+                            text: None,
+                            id: None,
+                            name: None,
+                            input: None,
+                            tool_use_id: None,
+                            content: None,
+                            signature,
+                            thinking: Some(t.to_string()),
+                            is_error: false,
+                        });
+                    }
+                } else if reasoning.get("redactedContent").is_some() {
+                    content.push(Content {
+                        content_type: ContentType::RedactedThinking,
+                        text: None,
+                        id: None,
+                        name: None,
+                        input: None,
+                        tool_use_id: None,
+                        content: None,
+                        signature: None,
+                        thinking: Some(String::new()),
+                        is_error: false,
+                    });
+                }
+            } else if block["type"].as_str() == Some("thinking")
+                || block.get("thinking").and_then(|v| v.as_str()).is_some()
+            {
+                // Anthropic-native thinking block (via additional response fields / some models)
+                let thinking_text = block["thinking"]
+                    .as_str()
+                    .or_else(|| block["text"].as_str());
+                if let Some(t) = thinking_text {
+                    if !t.is_empty() {
+                        content.push(Content {
+                            content_type: ContentType::Thinking,
+                            text: None,
+                            id: None,
+                            name: None,
+                            input: None,
+                            tool_use_id: None,
+                            content: None,
+                            signature: block["signature"].as_str().map(|s| s.to_string()),
+                            thinking: Some(t.to_string()),
+                            is_error: false,
+                        });
+                    }
+                }
+            } else if let Some(text) = block["text"].as_str() {
                 content.push(Content {
                     content_type: ContentType::Text,
                     text: Some(text.to_string()),
@@ -898,6 +990,41 @@ fn parse_converse_stream_event(data: &[u8]) -> Option<StreamDelta> {
                     content_index: index,
                     r#type: DeltaType::Text {
                         text: text.to_string(),
+                    },
+                })
+            } else if let Some(reasoning) = delta.get("reasoningContent") {
+                if let Some(text) = reasoning["text"]
+                    .as_str()
+                    .or_else(|| reasoning["reasoningText"]["text"].as_str())
+                    .or_else(|| reasoning["thinking"].as_str())
+                {
+                    if !text.is_empty() {
+                        return Some(StreamDelta {
+                            content_index: index,
+                            r#type: DeltaType::Thinking {
+                                thinking: text.to_string(),
+                            },
+                        });
+                    }
+                }
+                if let Some(sig) = reasoning["signature"]
+                    .as_str()
+                    .or_else(|| reasoning["reasoningText"]["signature"].as_str())
+                {
+                    Some(StreamDelta {
+                        content_index: index,
+                        r#type: DeltaType::Signature {
+                            signature: sig.to_string(),
+                        },
+                    })
+                } else {
+                    None
+                }
+            } else if let Some(thinking) = delta["thinking"].as_str() {
+                Some(StreamDelta {
+                    content_index: index,
+                    r#type: DeltaType::Thinking {
+                        thinking: thinking.to_string(),
                     },
                 })
             } else if delta["toolUse"].is_object() {

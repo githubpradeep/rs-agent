@@ -8,6 +8,7 @@ use std::time::Duration;
 pub struct AnthropicProvider {
     pub base_url: String,
     pub name: String,
+    pub key_env: String,
 }
 
 impl Default for AnthropicProvider {
@@ -15,15 +16,33 @@ impl Default for AnthropicProvider {
         Self {
             base_url: "https://api.anthropic.com/v1".to_string(),
             name: "anthropic".to_string(),
+            key_env: "ANTHROPIC_API_KEY".to_string(),
         }
     }
 }
 
 impl AnthropicProvider {
     pub fn new(base_url: Option<String>, name: Option<String>) -> Self {
+        Self::with_key_env(base_url, name, None)
+    }
+
+    pub fn with_key_env(
+        base_url: Option<String>,
+        name: Option<String>,
+        key_env: Option<String>,
+    ) -> Self {
+        let name = name.unwrap_or_else(|| "anthropic".to_string());
+        let key_env = key_env.unwrap_or_else(|| {
+            if name == "anthropic" {
+                "ANTHROPIC_API_KEY".to_string()
+            } else {
+                "AI_GATEWAY_API_KEY".to_string()
+            }
+        });
         Self {
             base_url: base_url.unwrap_or_else(|| "https://api.anthropic.com/v1".to_string()),
-            name: name.unwrap_or_else(|| "anthropic".to_string()),
+            name,
+            key_env,
         }
     }
 }
@@ -135,7 +154,7 @@ impl Provider for AnthropicProvider {
     }
 
     fn api_key_env_var(&self) -> &str {
-        "ANTHROPIC_API_KEY"
+        &self.key_env
     }
 
     fn base_url(&self) -> &str {

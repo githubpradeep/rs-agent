@@ -11,13 +11,16 @@ fn syntax_set() -> &'static SyntaxSet {
     SS.get_or_init(|| SyntaxSet::load_defaults_newlines())
 }
 
-fn highlight_code(code: &str, lang: &str) -> Vec<Line<'static>> {
+fn highlight_code(code: &str, lang: &str, syntect_theme: &str) -> Vec<Line<'static>> {
     let ss = syntax_set();
     let ts = syntect::highlighting::ThemeSet::load_defaults();
     let syntax = ss
         .find_syntax_by_token(lang)
         .unwrap_or_else(|| ss.find_syntax_plain_text());
-    let theme = &ts.themes["base16-ocean.dark"];
+    let theme = ts
+        .themes
+        .get(syntect_theme)
+        .unwrap_or(&ts.themes["base16-ocean.dark"]);
     let mut highlighter = HighlightLines::new(syntax, theme);
 
     code.lines()
@@ -42,7 +45,9 @@ fn highlight_code(code: &str, lang: &str) -> Vec<Line<'static>> {
         .collect()
 }
 
-pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
+/// Renders markdown to styled ratatui lines, syntax-highlighting fenced code
+/// blocks using `syntect_theme` (see [`crate::tui::theme::ThemeName::syntect_theme`]).
+pub fn render_markdown(text: &str, syntect_theme: &str) -> Vec<Line<'static>> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TABLES);
@@ -126,7 +131,7 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
                 TagEnd::CodeBlock => {
                     in_code_block = false;
                     if !code_text.is_empty() {
-                        let highlighted = highlight_code(&code_text, &code_lang);
+                        let highlighted = highlight_code(&code_text, &code_lang, syntect_theme);
                         for hl_line in highlighted {
                             let mut s = Vec::with_capacity(hl_line.spans.len() + 1);
                             s.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
