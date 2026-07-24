@@ -423,7 +423,110 @@ impl OpenCodeCliProvider {
             }
         }
 
+        // Strategy 5: MiniMax / ling `<arg_key>` / `<arg_value>` inside `<tool_call>`
+        //   <tool_call>webfetch
+        //   <arg_key>url</arg_key>
+        //   <arg_value>https://...</arg_value>
+        //   </tool_call>
+        if calls.is_empty() {
+            calls = Self::parse_arg_key_tool_calls(text);
+        }
+
         calls
+    }
+
+    /// Parse MiniMax/ling-style tool calls: tool name + `<arg_key>`/`<arg_value>` pairs.
+    fn parse_arg_key_tool_calls(text: &str) -> Vec<(String, String, serde_json::Value)> {
+        let mut calls = Vec::new();
+        if !text.contains("<arg_key>") {
+            return calls;
+        }
+
+        let block_re = Regex::new(r"(?s)<tool_call>\s*(.*?)\s*</tool_call>").unwrap();
+        let key_re = Regex::new(r"(?s)<arg_key>\s*(.*?)\s*</arg_key>").unwrap();
+        let val_re = Regex::new(r"(?s)<arg_value>\s*(.*?)\s*</arg_value>").unwrap();
+
+        let mut bodies: Vec<String> = block_re
+            .captures_iter(text)
+            .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+            .collect();
+
+        // Streaming path may already have stripped the outer `<tool_call>` tags.
+        if bodies.is_empty() {
+            bodies.push(text.to_string());
+        }
+
+        for (idx, body) in bodies.into_iter().enumerate() {
+            let trimmed = body.trim();
+            if trimmed.starts_with('{')
+                || trimmed.contains("<tool_name>")
+                || trimmed.contains("<tool_request")
+                || trimmed.contains("<tool_arguments>")
+                || !trimmed.contains("<arg_key>")
+            {
+                continue;
+            }
+
+            // Tool name = first token before any XML tag.
+            let before_tag = trimmed.split('<').next().unwrap_or("").trim();
+            let name = before_tag
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c: char| c == '"' || c == '\'')
+                .to_string();
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                continue;
+            }
+
+            let keys: Vec<String> = key_re
+                .captures_iter(trimmed)
+                .filter_map(|c| c.get(1).map(|m| m.as_str().trim().to_string()))
+                .filter(|k| !k.is_empty())
+                .collect();
+            let vals: Vec<String> = val_re
+                .captures_iter(trimmed)
+                .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+                .collect();
+            if keys.is_empty() || keys.len() != vals.len() {
+                continue;
+            }
+
+            let mut args = serde_json::Map::new();
+            for (k, v) in keys.iter().zip(vals.iter()) {
+                args.insert(k.clone(), Self::coerce_xml_arg_value(v));
+            }
+            calls.push((
+                format!("call_{idx}"),
+                name,
+                serde_json::Value::Object(args),
+            ));
+        }
+
+        calls
+    }
+
+    fn coerce_xml_arg_value(raw: &str) -> serde_json::Value {
+        let raw = raw.trim();
+        if let Ok(n) = raw.parse::<i64>() {
+            return serde_json::Value::Number(n.into());
+        }
+        if let Ok(f) = raw.parse::<f64>() {
+            if let Some(n) = serde_json::Number::from_f64(f) {
+                return serde_json::Value::Number(n);
+            }
+        }
+        if raw.eq_ignore_ascii_case("true") {
+            return serde_json::Value::Bool(true);
+        }
+        if raw.eq_ignore_ascii_case("false") {
+            return serde_json::Value::Bool(false);
+        }
+        serde_json::Value::String(raw.to_string())
     }
 }
 
@@ -616,7 +719,9 @@ impl Provider for OpenCodeCliProvider {
                                             if let Some(part_text) = event["part"]["text"].as_str() {
                                                 let has_tool_call = part_text.contains("<tool_call>") || tool_call_buffer.contains("<tool_call>");
                                                 let has_native = part_text.contains("<tool_name>") || part_text.contains("<tool_arguments>") || part_text.contains("<tool_request")
-                                                    || tool_call_buffer.contains("<tool_name>") || tool_call_buffer.contains("<tool_arguments>") || tool_call_buffer.contains("<tool_request");
+                                                    || part_text.contains("<arg_key>") || part_text.contains("<arg_value>")
+                                                    || tool_call_buffer.contains("<tool_name>") || tool_call_buffer.contains("<tool_arguments>") || tool_call_buffer.contains("<tool_request")
+                                                    || tool_call_buffer.contains("<arg_key>") || tool_call_buffer.contains("<arg_value>");
                                                 let has_bare = part_text.contains("{\"name\"") || tool_call_buffer.contains("{\"name\"");
                                                 if has_tool_call {
                                                     tool_call_buffer.push_str(part_text);
@@ -643,14 +748,15 @@ impl Provider for OpenCodeCliProvider {
                                                                     .to_string();
                                                                 calls.push((id, name, args));
                                                             } else {
-                                                                // JSON parse failed — captured content may be native format
-                                                                // (<tool_name>/<tool_arguments>) wrapped in <tool_call> tags
+                                                                // JSON parse failed — captured content may be native /
+                                                                // arg_key format wrapped in <tool_call> tags
                                                                 let native = OpenCodeCliProvider::parse_native_tool_calls(json_str.as_str());
                                                                 if !native.is_empty() {
                                                                     calls.extend(native);
                                                                 } else {
-                                                                    // Also try parse_tool_calls for any other format
-                                                                    let fallback = OpenCodeCliProvider::parse_tool_calls(json_str.as_str());
+                                                                    let fallback = OpenCodeCliProvider::parse_tool_calls(
+                                                                        &format!("<tool_call>{}</tool_call>", json_str.as_str()),
+                                                                    );
                                                                     calls.extend(fallback);
                                                                 }
                                                             }
@@ -1160,6 +1266,38 @@ mod tests {
         let calls = OpenCodeCliProvider::parse_tool_calls(text);
         assert_eq!(calls.len(), 1, "should extract XML from <tool_call> wrapper");
         assert_eq!(calls[0].1, "read");
+    }
+
+    #[test]
+    fn test_arg_key_value_webfetch_format() {
+        // Exact format emitted by opencode/ling-3.0-flash-free
+        let text = r#"<tool_call>webfetch
+<arg_key>url</arg_key>
+<arg_value>https://blog.google/innovation-and-ai/technology/developers-tools/multi-token-prediction-gemma-4/</arg_value><arg_key>format</arg_key>
+<arg_value>markdown</arg_value><arg_key>timeout</arg_key>
+<arg_value>30</arg_value>
+</tool_call>"#;
+        let calls = OpenCodeCliProvider::parse_tool_calls(text);
+        assert_eq!(calls.len(), 1, "should parse arg_key/arg_value webfetch call");
+        assert_eq!(calls[0].1, "webfetch");
+        assert_eq!(
+            calls[0].2["url"],
+            "https://blog.google/innovation-and-ai/technology/developers-tools/multi-token-prediction-gemma-4/"
+        );
+        assert_eq!(calls[0].2["format"], "markdown");
+        assert_eq!(calls[0].2["timeout"], 30);
+    }
+
+    #[test]
+    fn test_arg_key_value_bare_body() {
+        let text = r#"webfetch
+<arg_key>url</arg_key>
+<arg_value>https://example.com</arg_value>
+"#;
+        let calls = OpenCodeCliProvider::parse_native_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "webfetch");
+        assert_eq!(calls[0].2["url"], "https://example.com");
     }
 
     #[test]
