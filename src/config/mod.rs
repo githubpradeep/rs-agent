@@ -30,6 +30,7 @@ const USER_CONFIG_TEMPLATE: &str = r#"# rs-agent user config
 # approve = true
 # auto_mode = false
 # rlm_depth = 2
+# rlm_escalate_chars = 10000
 # thinking_budget = 10000
 # max_iterations = 100
 # timeout = 300
@@ -50,7 +51,13 @@ const USER_CONFIG_TEMPLATE: &str = r#"# rs-agent user config
 # toggle_tree = "T"
 # perm_once = "a"
 # perm_always = "t"
+# perm_path = "p"
 # perm_deny = "d"
+
+# [[mcp.servers]]
+# name = "filesystem"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 "#;
 
 /// User-facing configuration, merged from user + project config files.
@@ -65,6 +72,8 @@ pub struct Config {
     pub approve: Option<bool>,
     pub auto_mode: Option<bool>,
     pub rlm_depth: Option<u32>,
+    /// Char threshold for auto Deep Context escalate hints on huge reads (default 10000).
+    pub rlm_escalate_chars: Option<usize>,
     pub thinking_budget: Option<u32>,
     pub max_iterations: Option<usize>,
     pub timeout: Option<u64>,
@@ -74,6 +83,29 @@ pub struct Config {
     pub theme: Option<String>,
     /// Remappable single-key actions (see `tui::keys::default_keybindings`).
     pub keybindings: HashMap<String, String>,
+    /// MCP stdio servers (`[[mcp.servers]]`).
+    #[serde(default)]
+    pub mcp: McpConfig,
+}
+
+/// MCP client configuration.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct McpConfig {
+    pub servers: Vec<McpServerConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// When `Some(false)`, skip connecting this server.
+    pub enabled: Option<bool>,
 }
 
 impl Config {
@@ -128,6 +160,9 @@ impl Config {
         if other.rlm_depth.is_some() {
             self.rlm_depth = other.rlm_depth;
         }
+        if other.rlm_escalate_chars.is_some() {
+            self.rlm_escalate_chars = other.rlm_escalate_chars;
+        }
         if other.thinking_budget.is_some() {
             self.thinking_budget = other.thinking_budget;
         }
@@ -151,6 +186,10 @@ impl Config {
         }
         for (k, v) in other.keybindings {
             self.keybindings.insert(k, v);
+        }
+        if !other.mcp.servers.is_empty() {
+            // Project/user overlay replaces the server list when present.
+            self.mcp = other.mcp;
         }
     }
 
@@ -488,5 +527,22 @@ fast = "haiku"
         let mut cfg = Config::default();
         cfg.merge_from_file(Path::new("/definitely/does/not/exist/config.toml"));
         assert_eq!(cfg, Config::default());
+    }
+
+    #[test]
+    fn parses_mcp_servers() {
+        let cfg = Config::parse_str(
+            r#"
+[[mcp.servers]]
+name = "fs"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.mcp.servers.len(), 1);
+        assert_eq!(cfg.mcp.servers[0].name, "fs");
+        assert_eq!(cfg.mcp.servers[0].command, "npx");
+        assert_eq!(cfg.mcp.servers[0].args.len(), 3);
     }
 }

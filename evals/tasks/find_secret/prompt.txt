@@ -1,0 +1,4 @@
+Explore this workspace with ls/find/grep/read tools.
+Find the secret_token value (looks like RS_AGENT_EVAL_…).
+Write a file named FOUND.txt whose only line is that token value (nothing else).
+Do not invent a token — it must come from a file in this tree.

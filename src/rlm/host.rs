@@ -152,14 +152,14 @@ impl RlmHost {
         Ok(capped)
     }
 
-    async fn agent_query(
+    pub async fn agent_query(
         &self,
         task: &str,
         tools_filter: Option<Vec<String>>,
     ) -> Result<String, String> {
         if self.depth >= self.max_depth {
             return Err(format!(
-                "max RLM depth {} reached; use llm_query instead",
+                "max Deep Context depth {} reached; use a narrower task or llm_query instead",
                 self.max_depth
             ));
         }

@@ -47,9 +47,17 @@ impl AgentTool for ReadTool {
     }
 
     async fn execute(&self, _tool_call_id: &str, args: Value) -> ToolExecuteResult {
-        let parsed: ReadArgs = match serde_json::from_value(args) {
+        let args = crate::tools::normalize_file_tool_args(args);
+        let parsed: ReadArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolExecuteResult::error(format!("Invalid args: {}", e)),
+            Err(e) => {
+                return ToolExecuteResult::error(format!(
+                    "Invalid args: {e}. Expected file_path (alias: path). Got keys: {}",
+                    args.as_object()
+                        .map(|m| m.keys().cloned().collect::<Vec<_>>().join(", "))
+                        .unwrap_or_else(|| "(not an object)".into())
+                ))
+            }
         };
 
         let content = match fs::read_to_string(&parsed.file_path).await {
@@ -79,9 +87,18 @@ impl AgentTool for ReadTool {
             .collect();
 
         let result = numbered.join("\n");
-        if result.len() > 50000 {
-            let truncated = result.chars().take(50000).collect::<String>();
-            ToolExecuteResult::ok(format!("{}\n... (truncated, {} total chars)", truncated, result.len()))
+        let file_chars = content.chars().count();
+        let (result, _escalated) =
+            crate::agent::rlm_escalate::maybe_wrap_huge_output(&parsed.file_path, result, file_chars);
+        // Legacy soft cap still applies if somehow above 50k without escalate wrap
+        if result.len() > 50_000 && !result.contains(crate::agent::rlm_escalate::RLM_ESCALATE_MARKER)
+        {
+            let truncated = result.chars().take(50_000).collect::<String>();
+            ToolExecuteResult::ok(format!(
+                "{}\n... (truncated, {} total chars)",
+                truncated,
+                result.len()
+            ))
         } else {
             ToolExecuteResult::ok(result)
         }

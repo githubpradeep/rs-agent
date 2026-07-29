@@ -42,3 +42,37 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         run: cargo test --all-targets --all-features
+
+  rlm-demo:
+    name: rlm-demo (live, optional)
+    runs-on: ubuntu-latest
+    # Soft-fail so missing secrets / flaky models don't red the PR.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build release binary
+        run: cargo build --release
+      - name: Live RLM demo + escalate eval
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "No provider secrets — skipping live RLM demo/eval"
+            exit 0
+          fi
+          if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+            PROVIDER=anthropic
+          else
+            PROVIDER=openai
+          fi
+          echo "==> demo-rlm.sh ($PROVIDER)"
+          ./scripts/demo-rlm.sh --provider "$PROVIDER"
+          echo "==> eval rlm_escalate ($PROVIDER)"
+          ./scripts/eval-agent.sh --provider "$PROVIDER" --only rlm_escalate

@@ -1,0 +1,3 @@
+The file math_util.py has a bug: add(2, 3) should return 5 but currently fails.
+Fix the bug with the edit or write tool, then run: python3 math_util.py
+The program must print OK and exit 0. Do not leave the assertion failing.

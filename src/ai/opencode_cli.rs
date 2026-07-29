@@ -103,16 +103,21 @@ impl OpenCodeCliProvider {
             let mut transcript = Vec::new();
             for msg in &request.messages {
                 let role = match msg.role {
-                    Role::User => "USER",
-                    Role::Assistant => "ASSISTANT",
-                    Role::Tool => "TOOL RESULT",
-                    Role::System => "SYSTEM",
+                    Role::User => "user",
+                    Role::Assistant => "assistant",
+                    Role::Tool => "tool",
+                    Role::System => "system",
                 };
                 for block in &msg.content {
                     match block.content_type {
                         ContentType::Text => {
                             if let Some(text) = &block.text {
-                                transcript.push(format!("{}: {}", role, text));
+                                // XML-ish tags — weak models echo "ASSISTANT:" / "---" from
+                                // the old format back into the stream and thrash.
+                                transcript.push(format!(
+                                    "<turn role=\"{role}\">\n{}\n</turn>",
+                                    text.trim_end()
+                                ));
                             }
                         }
                         ContentType::ToolUse => {
@@ -120,7 +125,7 @@ impl OpenCodeCliProvider {
                                 (&block.id, &block.name, &block.input)
                             {
                                 transcript.push(format!(
-                                    "ASSISTANT: <tool_call>{}</tool_call>",
+                                    "<turn role=\"assistant\">\n<tool_call>{}</tool_call>\n</turn>",
                                     serde_json::json!({"name": name, "arguments": input, "id": id})
                                 ));
                             }
@@ -129,8 +134,8 @@ impl OpenCodeCliProvider {
                             if let (Some(id), Some(text)) = (&block.tool_use_id, &block.text) {
                                 let tool_name = block.name.as_deref().unwrap_or("?");
                                 transcript.push(format!(
-                                    "TOOL RESULT (id={}, tool={}): {}",
-                                    id, tool_name, text
+                                    "<turn role=\"tool\" id=\"{id}\" name=\"{tool_name}\">\n{}\n</turn>",
+                                    text.trim_end()
                                 ));
                             }
                         }
@@ -142,8 +147,10 @@ impl OpenCodeCliProvider {
                 sections.push("# Conversation transcript\n\n(no prior messages)".to_string());
             } else {
                 sections.push(format!(
-                    "# Conversation transcript\n\n{}",
-                    transcript.join("\n\n---\n\n")
+                    "# Conversation transcript\n\n\
+                     (Do NOT copy or echo <turn> tags, role labels, or separators. \
+                     Continue with new assistant text or a <tool_call> only.)\n\n{}",
+                    transcript.join("\n\n")
                 ));
             }
         } else {
@@ -153,8 +160,83 @@ impl OpenCodeCliProvider {
             );
         }
 
-        sections.push("Now produce the next assistant message for rs-agent.".to_string());
-        sections.join("\n\n---\n\n")
+        sections.push(
+            "Now produce the next assistant message for rs-agent.\n\
+             Output plain text and/or <tool_call>{{...}}</tool_call> only.\n\
+             Never echo prior turns, <turn> tags, or markdown `---` separators."
+                .to_string(),
+        );
+        // Avoid `---` separators — free models parrot them as "---\\n\\nASSISTANT:".
+        sections.join("\n\n====\n\n")
+    }
+
+    /// Drop transcript scaffolding that weak models copy from the bridge prompt.
+    fn sanitize_bridge_text(text: &str) -> Option<String> {
+        if Self::is_transcript_echo_only(text) {
+            return None;
+        }
+        let mut out = String::new();
+        for line in text.lines() {
+            let t = line.trim();
+            if t.is_empty() || t == "---" || t == "====" {
+                continue;
+            }
+            if let Some(rest) = t
+                .strip_prefix("ASSISTANT:")
+                .or_else(|| t.strip_prefix("USER:"))
+                .or_else(|| t.strip_prefix("SYSTEM:"))
+            {
+                let rest = rest.trim();
+                if !rest.is_empty() {
+                    out.push_str(rest);
+                    out.push('\n');
+                }
+                continue;
+            }
+            if t.starts_with("TOOL RESULT") {
+                continue;
+            }
+            if t.starts_with("<turn") || t == "</turn>" {
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        // Chunks without newlines (stream fragments)
+        if out.is_empty() && !text.contains('\n') {
+            let t = text.trim();
+            if let Some(rest) = t.strip_prefix("ASSISTANT:") {
+                let rest = rest.trim();
+                if !rest.is_empty() {
+                    return Some(rest.to_string());
+                }
+            }
+        }
+        let trimmed = out.trim();
+        if trimmed.is_empty() || Self::is_transcript_echo_only(trimmed) {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    fn is_transcript_echo_only(text: &str) -> bool {
+        let mut rest = text.to_string();
+        for pat in [
+            "---",
+            "====",
+            "ASSISTANT:",
+            "USER:",
+            "SYSTEM:",
+            "<turn",
+            "</turn>",
+        ] {
+            rest = rest.replace(pat, "");
+        }
+        let rest = Regex::new(r"(?i)TOOL RESULT\b[^\n:]*:")
+            .unwrap()
+            .replace_all(&rest, "");
+        rest.chars().all(|c| c.is_whitespace())
     }
 
     fn parse_tool_calls(text: &str) -> Vec<(String, String, serde_json::Value)> {
@@ -732,11 +814,15 @@ impl Provider for OpenCodeCliProvider {
                                                         let m = cap.get(0).unwrap();
                                                         if m.start() > last_end {
                                                             let before = &tool_call_buffer[last_end..m.start()];
-                                                            let _ = tx.send(Ok(StreamDelta {
-                                                                content_index,
-                                                                r#type: DeltaType::Text { text: before.to_string() },
-                                                            }));
-                                                            content_index += 1;
+                                                            if let Some(cleaned) =
+                                                                OpenCodeCliProvider::sanitize_bridge_text(before)
+                                                            {
+                                                                let _ = tx.send(Ok(StreamDelta {
+                                                                    content_index,
+                                                                    r#type: DeltaType::Text { text: cleaned },
+                                                                }));
+                                                                content_index += 1;
+                                                            }
                                                         }
                                                     if let Some(json_str) = cap.get(1) {
                                                             if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str.as_str()) {
@@ -803,21 +889,28 @@ impl Provider for OpenCodeCliProvider {
                                                     if let Some(pos) = part_text.find("{\"name\"") {
                                                         if pos > 0 {
                                                             let before = &part_text[..pos];
-                                                            let _ = tx.send(Ok(StreamDelta {
-                                                                content_index,
-                                                                r#type: DeltaType::Text { text: before.to_string() },
-                                                            }));
-                                                            content_index += 1;
+                                                            if let Some(cleaned) =
+                                                                OpenCodeCliProvider::sanitize_bridge_text(before)
+                                                            {
+                                                                let _ = tx.send(Ok(StreamDelta {
+                                                                    content_index,
+                                                                    r#type: DeltaType::Text { text: cleaned },
+                                                                }));
+                                                                content_index += 1;
+                                                            }
                                                         }
                                                         tool_call_buffer.push_str(&part_text[pos..]);
                                                     } else {
                                                         tool_call_buffer.push_str(part_text);
                                                     }
-                                                } else {
+                                                } else if let Some(cleaned) =
+                                                    OpenCodeCliProvider::sanitize_bridge_text(part_text)
+                                                {
                                                     let _ = tx.send(Ok(StreamDelta {
                                                         content_index,
-                                                        r#type: DeltaType::Text { text: part_text.to_string() },
+                                                        r#type: DeltaType::Text { text: cleaned },
                                                     }));
+                                                    content_index += 1;
                                                 }
                                             }
                                         }
@@ -1309,5 +1402,46 @@ mod tests {
         let (end, json_str) = result.unwrap();
         assert_eq!(json_str, s);
         assert_eq!(end, s.len());
+    }
+
+    #[test]
+    fn drops_echoed_assistant_scaffolding() {
+        assert!(OpenCodeCliProvider::sanitize_bridge_text("---\n\nASSISTANT: ").is_none());
+        assert!(OpenCodeCliProvider::sanitize_bridge_text("\n\n---\n\nASSISTANT: ").is_none());
+        let kept = OpenCodeCliProvider::sanitize_bridge_text(
+            "---\n\nASSISTANT: Let me check the shader next.",
+        )
+        .unwrap();
+        assert!(kept.contains("Let me check the shader"));
+        assert!(!kept.contains("ASSISTANT:"));
+        assert!(!kept.contains("---"));
+    }
+
+    #[test]
+    fn prompt_avoids_triple_dash_separators() {
+        let provider = OpenCodeCliProvider::default();
+        let req = ChatRequest {
+            model: "x".into(),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![Content {
+                    content_type: ContentType::Text,
+                    text: Some("hi".into()),
+                    ..Default::default()
+                }],
+            }],
+            system: None,
+            tools: vec![],
+            max_tokens: 100,
+            temperature: None,
+            top_p: None,
+            stop_sequences: None,
+            stream: false,
+            thinking: None,
+        };
+        let prompt = provider.build_prompt(&req);
+        assert!(!prompt.contains("\n---\n"), "prompt should not use --- separators");
+        assert!(prompt.contains("<turn role=\"user\">"));
+        assert!(prompt.contains("Never echo"));
     }
 }

@@ -1,23 +1,27 @@
 # rs-agent
 
-**RLM-style recursive coding agent** in Rust — a real terminal UI, local dev tools, and a skills
-system, built around a recursive-language-model core that keeps big context out of the model's
-window.
+**Your everyday coding agent — with Deep Context.**  
+A Rust TUI for the work you already do (edit, bash, search, sessions, skills), plus a
+persistent-REPL core so big context doesn’t blow the window when the task gets hard.
 
 ## Why rs-agent
 
-- **RLM core (the USP).** Large context (a long doc, a whole repo, a big diff) lives outside the
-  model's context window in a persistent Python REPL. The agent peeks/slices that context in
-  code and calls `llm_query` / `agent_query` recursively — the call graph is a **tree**, not a
-  flat transcript. Parent turns only ever see summaries, never full subtree output. Inspired by
-  [Recursive Language Models](https://arxiv.org/abs/2512.24601), adapted for coding with local
-  tools (`read`, `edit`, `bash`, `grep`, …) plus a `repl` tool.
-- **A TUI you'd actually use day to day.** Vim-flavored modes (insert/normal/waiting), streaming
-  output, clickable thinking traces, an `@file` picker, session resume, and a one-shot `-p` /
-  `--mode json` path for scripting — not just a debug console bolted onto an API client.
+- **Built for daily coding.** Same loop you expect from a modern terminal agent: read / edit /
+  write / bash / grep / find / web tools, vim-flavored TUI, streaming, permissions, sessions,
+  `/model` + `/provider`, skills and prompt templates.
+- **Better when context gets big (the USP).** Deep Context keeps large docs, repos, and diffs in a
+  persistent Python REPL *outside* the model window. The agent peeks and slices in code, then
+  calls `llm_query` / `agent_query` as a **tree** — parents only see summaries, not full
+  subtree dumps. Inspired by [Recursive Language Models](https://arxiv.org/abs/2512.24601).
+  Everyday tasks stay flat and fast; hard context tasks escalate into the tree without you
+  changing tools. Huge `read`s auto-escalate (`[rlm_escalate]` → `repl`). Status bar shows `[D]`
+  and `/tree` opens automatically while Deep Context runs.
 - **Skills.** Drop a markdown file with frontmatter into `skills/` or `~/.rs-agent/skills/` and
-  the agent picks up a new reusable workflow — no plugin runtime, no rebuild. See
-  [`docs/skills.md`](docs/skills.md).
+  the agent picks up a new reusable workflow — optional `tools:` allow-list (Skills 2.0). See
+  [`docs/skills.md`](docs/skills.md). Hooks: [`docs/hooks.md`](docs/hooks.md).
+
+**One line:** Everyday coding agent with Deep Context — load 100KB of source once, query it 100
+times, never hit a limit.
 
 ## Quickstart (Anthropic)
 
@@ -49,7 +53,7 @@ cargo run --release -- --provider anthropic --mode json -p "list files with ls"
 ./scripts/demo-rlm.sh --provider anthropic
 ```
 
-Requirements: a stable Rust toolchain and `python3` on `PATH` (used by the RLM `repl` tool).
+Requirements: a stable Rust toolchain and `python3` on `PATH` (used by the Deep Context `repl` tool).
 
 ## Configuration
 
@@ -63,11 +67,12 @@ model = "claude-sonnet-4-20250514"
 approve = true
 auto_mode = false
 rlm_depth = 2
+rlm_escalate_chars = 10000   # auto Deep Context escalate on huge reads
 thinking_budget = 10000
 max_iterations = 100
 timeout = 300
 base_url = "https://api.anthropic.com/v1"
-disable_mouse = false
+disable_mouse = false   # true = native text selection; Shift+drag also works with mouse on
 theme = "dark"          # dark | light | forest
 
 [model_aliases]
@@ -104,7 +109,7 @@ passed.
 
 A skill is a markdown file (optionally with YAML frontmatter: `name`, `description`, `triggers`)
 that teaches the agent a specific workflow — debugging, PR review, writing a commit message, the
-RLM long-doc pattern, etc. Drop one in:
+Deep Context long-doc pattern, etc. Drop one in:
 
 - `~/.rs-agent/skills/*.md` — available in every project
 - `.rs-agent/skills/*.md` — project-local, shared via your repo
@@ -157,11 +162,16 @@ Slash commands (type in insert mode, `Enter` to run):
 | `/new` | Start a new session |
 | `/model [provider/model\|alias]` | Interactive cross-provider picker, or switch mid-session (pi-style) |
 | `/provider [name]` / `/login` | Provider menu: switch ready providers, or open signup URL + paste API key (`~/.rs-agent/secrets.toml`) |
-| `/tree` | Toggle the RLM call-tree side panel |
+| `/tree` | Toggle the Deep Context call-tree side panel |
+| `/timeline` | Toggle API-message timeline; Enter forks at `@N` ([`docs/timeline.md`](docs/timeline.md)) |
+| `/fork [@N] [label]` | Fork session (optionally truncated at API index N) |
+| `/image <path>` | Queue Kitty-protocol image display |
+| `/lsp start\|stop\|status` | Minimal diagnostics via rust-analyzer ([`docs/lsp.md`](docs/lsp.md)) |
+| `/skill-pack export\|import` | Zip share/import for skills |
 | `/skills`, `/skill <name>` | List / inject a skill |
 | `/prompt` `/p <name> [args]` | Fill a prompt template into the input |
 | `/mode plan\|ask\|agent` | Switch tool permissions (read-only / no tools / full) |
-| `/keys` `/clear` `/context` `/sessions` `/export` `/trust` | UX helpers (see `/help`) |
+| `/keys` `/clear` `/context` `/sessions` `/export [md\|json\|html]` `/trust` | UX helpers (see `/help`) |
 
 Full reference: [`docs/keymap.md`](docs/keymap.md).
 
@@ -171,7 +181,8 @@ Full reference: [`docs/keymap.md`](docs/keymap.md).
 |------|-------------|
 | `--provider` | `anthropic` (recommended), `openai`, `opencode`, `opencode-cli` (experimental), `bedrock` |
 | `--model` | Model override |
-| `--rlm-depth` | Max RLM recursion depth, root → child → leaf (default 2) |
+| `--rlm-depth` | Max Deep Context recursion depth, root → child → leaf (default 2) |
+| `--rlm-escalate-chars` | Char threshold for auto Deep Context escalate on huge reads (default 10000) |
 | `--thinking-budget` | Extended-thinking token budget (Anthropic); `0` disables |
 | `--mode` | Output mode for `-p`: `text` (default) or `json` |
 | `-p, --prompt` | One-shot prompt (non-interactive) |
@@ -214,15 +225,29 @@ The last provider/model is written to `~/.rs-agent/config.toml` and restored nex
 For providers without a key yet, `/provider` opens the console/signup URL and lets you paste
 an API key into `~/.rs-agent/secrets.toml` (also exported to the matching env var for the process).
 
-## RLM workflow
+## Deep Context workflow
 
 1. Put a large payload into the REPL's `context` (or `load_file` / `load_dir`).
 2. Run Python that peeks/chunks the context and calls `llm_query(prompt)` (leaf LM call) or
    `agent_query(task)` (recursive sub-agent with its own tools).
 3. Finish with `FINAL(value)`.
-4. Inspect the call tree with `/tree` in the TUI, or `tree`/`tree_final` events in `--mode json`.
+4. Inspect the call tree with `/tree` in the TUI (auto-opens while `repl` runs; status bar shows
+   `[D]`), or `tree`/`tree_final` events in `--mode json`.
 
 See [`example/rlm_long_doc.md`](example/rlm_long_doc.md) for a worked example.
+
+Example `/tree` panel while Deep Context is running (status bar shows `[D]`):
+
+```
+ Call tree
+ root [running] summarize corpus
+ ├─ repl [running] load + peek
+ │  ├─ llm [done] extract section A
+ │  ├─ llm [done] extract section B
+ │  └─ agent [running] reconcile
+ │     └─ llm [done] FINAL draft
+ └─ …
+```
 
 ```
 User → Root AgentLoop → tools (incl. repl)

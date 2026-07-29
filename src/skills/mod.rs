@@ -1,12 +1,12 @@
-//! Skills v1: markdown + YAML-frontmatter instruction packs discovered from disk.
+//! Skills: markdown + YAML-frontmatter instruction packs discovered from disk.
 //!
-//! A skill is a reusable chunk of model instructions (a "how to do X" recipe)
-//! that can be injected into the system/user context on demand (e.g. via a
-//! future `/skill <name>` command). See [`docs/skills.md`] for the authoring
-//! guide.
+//! Skills 2.0: optional `tools:` frontmatter whitelists built-in tools while the
+//! skill is active. See [`docs/skills.md`] for the authoring guide.
 
+pub mod pack;
 pub mod templates;
 
+pub use pack::{export_pack, import_pack};
 pub use templates::{discover_templates, find_template, render_template, Template};
 
 use std::path::{Path, PathBuf};
@@ -17,6 +17,9 @@ pub struct Skill {
     pub name: String,
     pub description: String,
     pub triggers: Vec<String>,
+    /// Optional allow-list of built-in tool names while this skill is active.
+    /// Empty = no restriction (all tools subject to agent mode).
+    pub tools: Vec<String>,
     pub body: String,
     pub path: PathBuf,
 }
@@ -69,6 +72,9 @@ struct SkillFrontmatter {
     description: Option<String>,
     #[serde(default)]
     triggers: Vec<String>,
+    /// Built-in tool allow-list (e.g. `[read, grep, ls]`).
+    #[serde(default)]
+    tools: Vec<String>,
 }
 
 /// Split a markdown file into `(Some(frontmatter_yaml), body)` if it starts with
@@ -128,10 +134,18 @@ fn parse_skill(path: &Path, content: &str) -> Skill {
                 .to_string()
         });
 
+    let tools: Vec<String> = frontmatter
+        .tools
+        .into_iter()
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+
     Skill {
         name,
         description,
         triggers: frontmatter.triggers,
+        tools,
         body: body_trimmed,
         path: path.to_path_buf(),
     }
@@ -173,9 +187,14 @@ pub fn find_skill<'a>(skills: &'a [Skill], name: &str) -> Option<&'a Skill> {
 /// Format a skill as an XML-ish block suitable for appending to a system or
 /// user message so the model receives the skill's instructions verbatim.
 pub fn format_skill_injection(skill: &Skill) -> String {
+    let tools_attr = if skill.tools.is_empty() {
+        String::new()
+    } else {
+        format!(" tools=\"{}\"", skill.tools.join(","))
+    };
     format!(
-        "<skill name=\"{}\" description=\"{}\">\n{}\n</skill>",
-        skill.name, skill.description, skill.body
+        "<skill name=\"{}\" description=\"{}\"{}>\n{}\n</skill>",
+        skill.name, skill.description, tools_attr, skill.body
     )
 }
 
@@ -190,6 +209,9 @@ pub fn list_skills_summary(skills: &[Skill]) -> String {
         out.push_str(&format!("- {}: {}", skill.name, skill.description));
         if !skill.triggers.is_empty() {
             out.push_str(&format!(" (triggers: {})", skill.triggers.join(", ")));
+        }
+        if !skill.tools.is_empty() {
+            out.push_str(&format!(" [tools: {}]", skill.tools.join(", ")));
         }
         out.push('\n');
     }
@@ -207,6 +229,7 @@ mod tests {
 name: pr-review
 description: Review a pull request for bugs and style
 triggers: ["pr", "pull request", "review"]
+tools: [read, grep, ls, bash]
 ---
 Skill body instructions for the model...
 
@@ -216,6 +239,7 @@ Second paragraph.
         assert_eq!(skill.name, "pr-review");
         assert_eq!(skill.description, "Review a pull request for bugs and style");
         assert_eq!(skill.triggers, vec!["pr", "pull request", "review"]);
+        assert_eq!(skill.tools, vec!["read", "grep", "ls", "bash"]);
         assert!(skill.body.starts_with("Skill body instructions for the model..."));
         assert!(skill.body.contains("Second paragraph."));
     }
@@ -227,6 +251,7 @@ Second paragraph.
         assert_eq!(skill.name, "fix-tests");
         assert_eq!(skill.description, "Fix the failing test.");
         assert!(skill.triggers.is_empty());
+        assert!(skill.tools.is_empty());
         assert_eq!(skill.body.trim_start(), skill.body);
     }
 
@@ -246,7 +271,6 @@ First real line.
     fn no_closing_delimiter_treats_whole_file_as_body() {
         let content = "---\nname: broken\nthis never closes\n";
         let skill = parse_skill(Path::new("/tmp/broken.md"), content);
-        // No closing `---`, so the whole thing is treated as plain content.
         assert_eq!(skill.name, "broken");
         assert!(skill.body.contains("this never closes"));
     }
@@ -257,6 +281,7 @@ First real line.
             name: "PR-Review".to_string(),
             description: "desc".to_string(),
             triggers: vec![],
+            tools: vec![],
             body: "body".to_string(),
             path: PathBuf::from("/tmp/x.md"),
         }];
@@ -271,11 +296,14 @@ First real line.
             name: "debug".to_string(),
             description: "Debug an issue".to_string(),
             triggers: vec![],
+            tools: vec!["read".into(), "bash".into()],
             body: "Reproduce, isolate, fix.".to_string(),
             path: PathBuf::from("/tmp/debug.md"),
         };
         let injected = format_skill_injection(&skill);
-        assert!(injected.starts_with("<skill name=\"debug\" description=\"Debug an issue\">"));
+        assert!(injected.starts_with(
+            "<skill name=\"debug\" description=\"Debug an issue\" tools=\"read,bash\">"
+        ));
         assert!(injected.contains("Reproduce, isolate, fix."));
         assert!(injected.trim_end().ends_with("</skill>"));
     }
@@ -287,6 +315,7 @@ First real line.
                 name: "a".to_string(),
                 description: "does a".to_string(),
                 triggers: vec!["alpha".to_string()],
+                tools: vec!["read".into()],
                 body: String::new(),
                 path: PathBuf::from("/tmp/a.md"),
             },
@@ -294,12 +323,13 @@ First real line.
                 name: "b".to_string(),
                 description: "does b".to_string(),
                 triggers: vec![],
+                tools: vec![],
                 body: String::new(),
                 path: PathBuf::from("/tmp/b.md"),
             },
         ];
         let summary = list_skills_summary(&skills);
-        assert!(summary.contains("- a: does a (triggers: alpha)"));
+        assert!(summary.contains("- a: does a (triggers: alpha) [tools: read]"));
         assert!(summary.contains("- b: does b"));
         assert!(!summary.contains("b (triggers"));
     }

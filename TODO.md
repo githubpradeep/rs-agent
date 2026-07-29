@@ -1,7 +1,8 @@
 # rs-agent TODO
 
-Productionize **and** make it pleasant to use day-to-day — then share.
-RLM stays the USP; UI / skills / ergonomics are what make strangers stick around.
+Productionize **and** make it the everyday coding agent people actually open —
+RLM is the edge that makes it better when context gets hard; TUI / skills / ergonomics
+are what make strangers stick around for daily work.
 
 ## Done (foundation + Wave 1 + Wave 2 + Wave 3)
 
@@ -39,7 +40,7 @@ RLM stays the USP; UI / skills / ergonomics are what make strangers stick around
 ## A. Day-1 UX (remaining)
 
 ### Sessions
-- [ ] Optional session branch / fork — *after* flat sessions feel solid
+- [x] Optional session branch / fork — `/fork [label]` (+ `parent_id` on `SessionData`)
 
 ---
 
@@ -63,6 +64,8 @@ _(Wave 3 delivered named themes + single-char keybindings; richer variants defer
 - [x] Stream REPL stdout into TUI
 - [ ] Optional Docker/isolated REPL sandbox — deferred
 - [x] Example gallery beyond `rlm_long_doc.md` (`example/README.md`, `example/rlm_mapreduce.md`)
+- [x] Auto-escalate to RLM on huge reads (`[rlm_escalate]` + one-shot system note; `rlm_escalate_chars`)
+- [x] Live RLM CI job (`rlm-demo`) + eval task `rlm_escalate`
 
 ---
 
@@ -76,6 +79,14 @@ _(Wave 3 delivered named themes + single-char keybindings; richer variants defer
 - [x] Persist last `/model`/`/provider` selection to `~/.rs-agent/config.toml` (restored on restart)
 - [x] OpenAI / Bedrock thinking parity
 - [x] Mark `opencode-cli` experimental in TUI banner (and already noted in README provider table)
+- [x] Tool-call repair loop: name aliases, schema required-field checks, no silent `{}` on bad JSON, doom-loop guard
+- [x] Weak-model profile: auto sequential tools + stricter system note for flash/free/mini/haiku/…
+- [x] Edit ergonomics: `replace_all`, multi-hunk `edits[]`, fuzzy/whitespace miss hints
+- [x] Permissions 2.0: path-scoped allow (`p` key) persisted in `~/.rs-agent/permissions.json`
+- [x] Compaction pins recent file paths + failed edits into the summary
+- [x] `--auto-mode` = AUTO (file tools + reads); distinct from YOLO (`-a`); status bar label
+- [x] MCP stdio client (`[[mcp.servers]]`) — see `docs/mcp.md`
+- [x] Session `/fork [label]` with `parent_id` (flat store)
 
 ---
 

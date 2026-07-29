@@ -1,0 +1,7 @@
+Find the secret evaluation token buried in corpus.md in this workspace.
+
+The file is large — do not dump the entire file into the chat with read.
+If a tool result shows [rlm_escalate], follow it: use the repl tool with load_file('corpus.md'),
+search in Python for the token matching RLM-ESC-…, then FINAL with that token.
+
+Your final answer must include the exact secret token string.

@@ -31,10 +31,12 @@ impl AgentMode {
         match self {
             Self::Agent => true,
             Self::Ask => false,
-            Self::Plan => matches!(
-                name,
-                "read" | "grep" | "ls" | "find" | "webfetch" | "websearch"
-            ),
+            Self::Plan => {
+                matches!(
+                    name,
+                    "read" | "grep" | "ls" | "find" | "webfetch" | "websearch"
+                ) || name.contains("__read") // common MCP read-only naming
+            }
         }
     }
 
