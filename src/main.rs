@@ -53,6 +53,11 @@ fn apply_config_defaults(cli: &mut Cli, cfg: &Config) {
             cli.rlm_depth = d;
         }
     }
+    if cli.rlm_escalate_chars == 0 {
+        if let Some(n) = cfg.rlm_escalate_chars {
+            cli.rlm_escalate_chars = n;
+        }
+    }
     if cli.thinking_budget.is_none() {
         cli.thinking_budget = cfg.thinking_budget;
     }
@@ -183,6 +188,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Reload in case the wizard wrote new values (and re-apply).
     cfg = Config::load();
     apply_config_defaults(&mut cli, &cfg);
+    let escalate = if cli.rlm_escalate_chars > 0 {
+        cli.rlm_escalate_chars
+    } else {
+        rs_agent::agent::rlm_escalate::DEFAULT_ESCALATE_CHARS
+    };
+    rs_agent::agent::set_escalate_chars(escalate);
 
     let provider_name = cli
         .provider
@@ -319,6 +330,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_max_iterations(cli.max_iterations)
         .with_rlm_depth(0, cli.rlm_depth);
         rs_agent::tools::register_default_tools_with_rlm(&mut agent, cli.rlm_depth);
+        {
+            let mcp_cfg = rs_agent::config::Config::load().mcp;
+            if !mcp_cfg.servers.is_empty() {
+                let lines = rs_agent::mcp::attach_mcp_from_config(&mut agent, &mcp_cfg).await;
+                for line in &lines {
+                    eprintln!("{line}");
+                }
+            }
+        }
 
         let json_mode = cli.mode.eq_ignore_ascii_case("json");
         let mut has_error = false;

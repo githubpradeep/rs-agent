@@ -1,0 +1,3 @@
+Use the webfetch tool to fetch https://example.com (format markdown or text).
+Write a file named PAGE.txt that contains the word Example (case-sensitive) from that page.
+Do not invent the page — it must come from webfetch.

@@ -71,7 +71,7 @@ impl AgentTool for ReplTool {
     }
 
     fn description(&self) -> &str {
-        "Execute Python in a persistent RLM REPL. Large context lives in the `context` variable \
+        "Execute Python in a persistent Deep Context REPL. Large context lives in the `context` variable \
          (set via optional context arg or load_file/load_dir). Use llm_query(prompt) for leaf LM \
          calls and agent_query(task) for recursive coding sub-agents. Call FINAL(value) when done. \
          Stdout is truncated; prefer variables and sub-calls over dumping huge strings."

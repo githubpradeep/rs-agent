@@ -1,11 +1,20 @@
 use crate::agent::control::{AbortFlag, SteerQueue};
 use crate::agent::registry::ToolRegistry;
 use crate::agent::state::AgentState;
+use crate::agent::compact_pins::{
+    append_pins_to_summary, collect_pins_from_messages, CompactPins,
+};
+use crate::agent::repair::{
+    is_weak_model, make_arg_parse_error_value, prepare_tool_args, resolve_tool,
+    tool_call_fingerprint, weak_model_system_note,
+};
+use crate::agent::rlm_escalate;
 use crate::agent::tool::{ToolExecutionMode, ToolExecuteResult};
 use crate::ai::provider::Provider;
 use crate::ai::token_count;
 use crate::ai::types::*;
 use crate::permission::{PendingPermission, PermissionReply};
+use crate::hooks::HookRegistry;
 use crate::rlm::tree::CallTree;
 use crossbeam_channel as channel;
 use futures::StreamExt;
@@ -22,17 +31,36 @@ pub enum AgentEvent {
     ToolResult { id: String, name: String, result: ToolExecuteResult },
     /// Streaming REPL stdout/stderr lines while `repl` runs.
     ReplOutput { stream: String, text: String },
+    /// Progressive tool output (e.g. bash stdout) while a tool is running.
+    ToolOutput {
+        name: String,
+        stream: String,
+        text: String,
+    },
     TurnEnd { stop_reason: Option<StopReason> },
     Error { message: String },
     Status { message: String },
     Done,
     Aborted,
     ContextWarning { fraction: f64, used: usize, limit: usize },
-    TokenUpdate { used: usize, limit: usize },
+    TokenUpdate {
+        used: usize,
+        limit: usize,
+        input_tokens: usize,
+        output_tokens: usize,
+    },
     Compacting,
     Compacted { summary: String },
     TreeUpdate { tree: CallTree },
     TitleUpdate { title: String },
+    /// Session id/title changed (`/new`, `/fork`).
+    SessionMeta { id: String, title: Option<String> },
+    /// Replace the visible transcript (e.g. after fork-at-N).
+    ReloadTranscript { messages: Vec<crate::ai::types::Message> },
+    /// API-message timeline for `/timeline` / fork-at-N.
+    TimelineSnapshot { entries: Vec<(usize, String)> },
+    /// LSP diagnostics summary for the status bar.
+    LspUpdate { summary: String },
 }
 
 /// Truncates a tool result to `max` chars by keeping the head and tail and
@@ -76,10 +104,20 @@ pub struct AgentLoop {
     max_rlm_depth: u32,
     /// Optional sink so tools (e.g. REPL) can emit live events mid-execution.
     event_sink: Option<channel::Sender<AgentEvent>>,
+    /// Force sequential tool execution (also auto-on for weak models).
+    force_sequential: bool,
+    /// Recent tool fingerprints for doom-loop detection.
+    recent_tool_fps: std::sync::Mutex<std::collections::VecDeque<String>>,
+    /// Inject one-shot RLM escalate system note on the next model turn.
+    rlm_escalate_hint_pending: std::sync::atomic::AtomicBool,
+    rlm_escalate_hint_sent: std::sync::atomic::AtomicBool,
+    /// Optional disk-loaded hooks (before_tool / after_tool / on_message).
+    hooks: HookRegistry,
 }
 
 impl AgentLoop {
     pub fn new(provider: Arc<dyn Provider>, state: AgentState) -> Self {
+        let force_sequential = is_weak_model(&state.model);
         Self {
             provider,
             tools: ToolRegistry::new(),
@@ -95,12 +133,36 @@ impl AgentLoop {
             rlm_depth: 0,
             max_rlm_depth: 2,
             event_sink: None,
+            force_sequential,
+            recent_tool_fps: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(4)),
+            rlm_escalate_hint_pending: std::sync::atomic::AtomicBool::new(false),
+            rlm_escalate_hint_sent: std::sync::atomic::AtomicBool::new(false),
+            hooks: HookRegistry::load(),
         }
+    }
+
+    pub fn with_hooks(mut self, hooks: HookRegistry) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
+    pub fn hooks(&self) -> &HookRegistry {
+        &self.hooks
     }
 
     pub fn with_max_iterations(mut self, max: usize) -> Self {
         self.max_iterations = max;
         self
+    }
+
+    /// Force one-at-a-time tools (recommended for free/flash/mini models).
+    pub fn with_force_sequential(mut self, force: bool) -> Self {
+        self.force_sequential = force;
+        self
+    }
+
+    fn should_force_sequential(&self) -> bool {
+        self.force_sequential || is_weak_model(&self.state.model)
     }
 
     pub fn with_abort(mut self, abort: AbortFlag) -> Self {
@@ -221,13 +283,19 @@ impl AgentLoop {
             // no need to clear.
         }
         self.tools.unregister("repl");
+        self.tools.unregister("task");
         crate::tools::register_rlm_tools(self, self.rlm_depth, max_depth);
     }
 
     pub fn clear_messages(&mut self) {
         self.state.messages.clear();
+        self.state.clear_skill_tools();
         self.compacted_up_to = 0;
         self.call_tree = CallTree::new();
+        self.rlm_escalate_hint_pending
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.rlm_escalate_hint_sent
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub async fn compact_now(
@@ -284,6 +352,7 @@ impl AgentLoop {
         callback: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<(), String> {
         self.abort.clear();
+        self.hooks.on_message(user_message);
         let user_msg = Message {
             role: Role::User,
             content: vec![Content {
@@ -411,7 +480,12 @@ impl AgentLoop {
             };
 
             let used = self.state.estimated_context_tokens(&tool_defs_json);
-            callback(AgentEvent::TokenUpdate { used, limit });
+            callback(AgentEvent::TokenUpdate {
+                used,
+                limit,
+                input_tokens: self.state.total_input_tokens,
+                output_tokens: self.state.total_output_tokens,
+            });
 
             let tool_calls: Vec<Content> = assistant_msg
                 .content
@@ -448,7 +522,7 @@ impl AgentLoop {
                 t.execution_mode() == ToolExecutionMode::Sequential
             });
 
-            if has_sequential {
+            if has_sequential || self.should_force_sequential() {
                 self.execute_tools_sequential(&tool_calls, callback).await?;
             } else {
                 self.execute_tools_parallel(&tool_calls, callback).await?;
@@ -495,11 +569,33 @@ impl AgentLoop {
             }
             system.push_str(note);
         }
+        if self.should_force_sequential() {
+            if !system.is_empty() {
+                system.push_str("\n\n");
+            }
+            system.push_str(weak_model_system_note());
+        }
+        if self
+            .rlm_escalate_hint_pending
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && !self
+                .rlm_escalate_hint_sent
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if !system.is_empty() {
+                system.push_str("\n\n");
+            }
+            system.push_str(rlm_escalate::system_note());
+            self.rlm_escalate_hint_sent
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.rlm_escalate_hint_pending
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
         let tools: Vec<_> = self
             .tools
             .tool_defs()
             .into_iter()
-            .filter(|t| self.state.mode.allows_tool(&t.name))
+            .filter(|t| self.state.allows_tool(&t.name))
             .collect();
 
         let request = ChatRequest {
@@ -642,9 +738,13 @@ impl AgentLoop {
                         if let Some(b) = block {
                             if b.content_type == ContentType::ToolUse {
                                 if let Some(raw) = tool_arg_buf.get(i) {
-                                    b.input = Some(serde_json::from_str(raw).unwrap_or(
-                                        serde_json::Value::Object(serde_json::Map::new()),
-                                    ));
+                                    b.input = Some(match serde_json::from_str(raw) {
+                                        Ok(v) => v,
+                                        Err(e) => make_arg_parse_error_value(
+                                            &e.to_string(),
+                                            raw,
+                                        ),
+                                    });
                                 }
                             }
                         }
@@ -697,8 +797,7 @@ impl AgentLoop {
                 name: name.to_string(),
                 result: result.clone(),
             });
-            let stored_content = truncate_tool_output(&result.content, MAX_TOOL_OUTPUT_CHARS);
-            self.state.add_tool_result(id.to_string(), name.to_string(), stored_content, result.is_error);
+            self.store_tool_result(id, name, &result.content, result.is_error);
 
             if result.terminate {
                 break;
@@ -735,8 +834,7 @@ impl AgentLoop {
                 name: job.name.clone(),
                 result: result.clone(),
             });
-            let stored_content = truncate_tool_output(&result.content, MAX_TOOL_OUTPUT_CHARS);
-            self.state.add_tool_result(job.id.clone(), job.name.clone(), stored_content, result.is_error);
+            self.store_tool_result(&job.id, &job.name, &result.content, result.is_error);
         }
 
         for result in &results {
@@ -746,6 +844,20 @@ impl AgentLoop {
         }
 
         Ok(())
+    }
+
+    fn store_tool_result(&mut self, id: &str, name: &str, content: &str, is_error: bool) {
+        let original_len = content.chars().count();
+        let mut stored = truncate_tool_output(content, MAX_TOOL_OUTPUT_CHARS);
+        if stored.chars().count() < original_len {
+            stored = rlm_escalate::append_truncate_escalate_hint(name, &stored, original_len);
+        }
+        if rlm_escalate::content_has_escalate(&stored) {
+            self.rlm_escalate_hint_pending
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.state
+            .add_tool_result(id.to_string(), name.to_string(), stored, is_error);
     }
 
     async fn compact(
@@ -900,6 +1012,15 @@ impl AgentLoop {
             .unwrap_or("")
             .to_string();
 
+        // Pin recent file paths + failed edits so they survive later compaction.
+        let mut pins = CompactPins::default();
+        if let Some(prev) = previous_summary {
+            pins.merge(CompactPins::from_summary_text(prev));
+        }
+        pins.merge(collect_pins_from_messages(&to_summarize));
+        pins.merge(collect_pins_from_messages(&keep_msgs));
+        let summary = append_pins_to_summary(&summary, &pins);
+
         let summary_msg = Message {
             role: Role::System,
             content: vec![Content {
@@ -927,51 +1048,96 @@ impl AgentLoop {
         name: &str,
         input: &serde_json::Value,
     ) -> ToolExecuteResult {
-        if !self.state.mode.allows_tool(name) {
+        let tool = match resolve_tool(&self.tools, name) {
+            Ok(t) => t,
+            Err(msg) => return ToolExecuteResult::error(msg),
+        };
+        let resolved_name = tool.name().to_string();
+
+        if !self.state.allows_tool(&resolved_name) {
+            if !self.state.mode.allows_tool(&resolved_name) {
+                return ToolExecuteResult::error(format!(
+                    "Tool '{}' blocked in {} mode. Switch with /mode agent (or plan/ask).",
+                    resolved_name,
+                    self.state.mode.as_str()
+                ));
+            }
             return ToolExecuteResult::error(format!(
-                "Tool '{}' blocked in {} mode. Switch with /mode agent (or plan/ask).",
-                name,
-                self.state.mode.as_str()
+                "Tool '{}' blocked by active skill tool allow-list [{}]. Load a different skill or clear with /new.",
+                resolved_name,
+                self.state.skill_tools.join(", ")
             ));
         }
-        match self.tools.get(name) {
-            Some(tool) => {
-                if let Some(ref tx) = self.permission_tx {
-                    if tool.requires_permission() {
-                        let danger_reason = if name == "bash" {
-                            input
-                                .get("command")
-                                .and_then(|v| v.as_str())
-                                .and_then(crate::tools::bash::is_dangerous_command)
-                                .map(|s| s.to_string())
-                        } else {
-                            None
-                        };
-                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                        let _ = tx.send(PendingPermission {
-                            request: crate::permission::PermissionRequest {
-                                tool_name: name.to_string(),
-                                tool_input: input.to_string(),
-                                danger_reason,
-                            },
-                            reply_tx,
-                        });
-                        match reply_rx.await {
-                            Ok(PermissionReply::AllowOnce) | Ok(PermissionReply::AllowAlways) => {}
-                            Ok(PermissionReply::Deny) => {
-                                return ToolExecuteResult::error("Permission denied by user");
-                            }
-                            Err(_) => {
-                                return ToolExecuteResult::error("Permission prompt cancelled");
-                            }
-                        }
+
+        let args = match prepare_tool_args(tool.as_ref(), input.clone()) {
+            Ok(a) => a,
+            Err(msg) => return ToolExecuteResult::error(msg),
+        };
+
+        if let Err(msg) = self.hooks.before_tool(&resolved_name, &args.to_string()) {
+            return ToolExecuteResult::error(msg);
+        }
+
+        let fp = tool_call_fingerprint(&resolved_name, &args);
+        if let Ok(mut recent) = self.recent_tool_fps.lock() {
+            // Block after 3 identical calls in a row (opencode-style last-3 guard).
+            let same_streak = recent.iter().rev().take(3).filter(|p| *p == &fp).count();
+            if same_streak >= 3 {
+                return ToolExecuteResult::error(format!(
+                    "Repeated identical `{resolved_name}` call detected (doom loop).\n\
+                     Change your approach: different arguments, another tool, or ask the user.\n\
+                     Do not retry the exact same call again."
+                ));
+            }
+            recent.push_back(fp);
+            while recent.len() > 6 {
+                recent.pop_front();
+            }
+        }
+
+        if let Some(ref tx) = self.permission_tx {
+            if tool.requires_permission() {
+                let danger_reason = if resolved_name == "bash" {
+                    args.get("command")
+                        .and_then(|v| v.as_str())
+                        .and_then(crate::tools::bash::is_dangerous_command)
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                };
+                let diff_preview = if resolved_name == "edit" {
+                    crate::tools::edit::preview_edit_diff(&args)
+                } else if resolved_name == "apply_patch" {
+                    crate::tools::apply_patch::preview_apply_patch(&args)
+                } else {
+                    None
+                };
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                let _ = tx.send(PendingPermission {
+                    request: crate::permission::PermissionRequest {
+                        tool_name: resolved_name.clone(),
+                        tool_input: args.to_string(),
+                        danger_reason,
+                        diff_preview,
+                    },
+                    reply_tx,
+                });
+                match reply_rx.await {
+                    Ok(PermissionReply::AllowOnce) | Ok(PermissionReply::AllowAlways) => {}
+                    Ok(PermissionReply::Deny) => {
+                        return ToolExecuteResult::error("Permission denied by user");
+                    }
+                    Err(_) => {
+                        return ToolExecuteResult::error("Permission prompt cancelled");
                     }
                 }
-                tracing::info!(tool = name, "executing tool");
-                tool.execute(tool_call_id, input.clone()).await
             }
-            None => ToolExecuteResult::error(format!("Unknown tool: {}", name)),
         }
+        tracing::info!(tool = %resolved_name, requested = %name, "executing tool");
+        let result = tool.execute(tool_call_id, args).await;
+        self.hooks
+            .after_tool(&resolved_name, result.is_error, &result.content);
+        result
     }
 }
 

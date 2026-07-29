@@ -1,7 +1,7 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "rs-agent", version, about = "RLM-style recursive coding agent")]
+#[command(name = "rs-agent", version, about = "Everyday coding agent with Deep Context")]
 pub struct Cli {
     /// Provider: anthropic (recommended), openai, opencode, opencode-cli (experimental), bedrock.
     /// Omit to use the last selection from `~/.rs-agent/config.toml` (default: anthropic).
@@ -54,8 +54,8 @@ pub struct Cli {
     #[arg(long, default_value_t = 100)]
     pub max_iterations: usize,
 
-    /// Lighter YOLO mode: auto-approve read-only tools (read/grep/ls/find/webfetch/websearch)
-    /// without prompting; other tools still require permission.
+    /// Auto-approve read-only tools and file edits (write/edit); still prompt for
+    /// bash/repl and non-readonly MCP tools. Distinct from `-a`/`--approve` (full YOLO).
     #[arg(long, default_value = "false")]
     pub auto_mode: bool,
 
@@ -63,9 +63,13 @@ pub struct Cli {
     #[arg(long, default_value = "text")]
     pub mode: String,
 
-    /// Max RLM recursion depth (root → child → leaf). Default 2.
+    /// Max Deep Context recursion depth (root → child → leaf). Default 2.
     #[arg(long, default_value_t = 2)]
     pub rlm_depth: u32,
+
+    /// Char threshold for auto Deep Context escalate hints on huge reads (0 = default 10000).
+    #[arg(long, default_value_t = 0)]
+    pub rlm_escalate_chars: usize,
 
     /// Extended thinking budget in tokens (Anthropic). 0 disables. Default: 10000 for anthropic, off otherwise.
     #[arg(long)]

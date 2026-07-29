@@ -1,25 +1,27 @@
-# Demo kit — RLM long-context (the USP)
+# Demo kit — everyday agent + RLM edge
 
-Goal: in ~90 seconds, a stranger sees **why rs-agent ≠ pi/OpenCode** —
-big text stays in a Python REPL; the agent slices it and recurses; the parent
+Goal: in ~90 seconds, show that rs-agent is a **daily coding agent** that also wins when
+context is huge — big text stays in a Python REPL; the agent slices and recurses; the parent
 only sees a summary / `FINAL` result.
 
-Use a **reliable paid model** for demos (Anthropic Sonnet or similar). Free /
+Use a **reliable paid model** for demos (Anthropic Sonnet / Bedrock Opus or similar). Free /
 tiny models often dump broken tool XML and kill the vibe.
 
 ---
 
 ## 60-second talk track
 
-1. **Problem:** “Coding agents stuff docs into the context window. Past a few
-   hundred KB they truncate, hallucinate, or burn tokens.”
-2. **Idea:** “RLM — recursive language models. Context lives *outside* the
-   model in a REPL. The agent peeks with Python and calls `llm_query` on
-   slices. Parents only see summaries.”
-3. **Show:** run the script (or TUI). Point at: `repl` → load/slice →
-   `llm_query` → `FINAL` → answer contains `RLM-TREE-42`. Hit `/tree` if in TUI.
-4. **Close:** “pi and OpenCode are great daily harnesses. rs-agent is for tasks
-   that don’t fit in one window.”
+1. **Open:** “rs-agent is my everyday coding agent — edit, bash, search, sessions — same job as
+   other terminal agents.”
+2. **Twist:** “Most agents stuff big docs into the context window. Past a few hundred KB they
+   truncate, hallucinate, or burn tokens.”
+3. **Idea:** “RLM — recursive language models. Context lives *outside* the model in a REPL.
+   The agent peeks with Python and calls `llm_query` on slices. Parents only see summaries.
+   That’s why it’s better for hard context without giving up daily coding.”
+4. **Show:** run the script (or TUI). Point at: `repl` → load/slice → `llm_query` → `FINAL` →
+   answer contains `RLM-TREE-42`. Hit `/tree` if in TUI.
+5. **Close:** “Same agent for everyday work. RLM kicks in when the window isn’t enough —
+   and the harness auto-escalates on huge reads (`[rlm_escalate]` → use `repl`).”
 
 ---
 
@@ -94,13 +96,14 @@ During the run:
 
 ## C. Contrast slide (optional, strong)
 
-Same corpus, two narratives:
+Same corpus, two narratives — this is why everyday rs-agent is *better*, not niche:
 
-| Naive agent | rs-agent RLM |
-|-------------|--------------|
-| `read` entire file into messages | `repl` + `context` variable |
-| Hits context limits / truncates | Peeks `context[:200]`, searches in Python |
-| One flat transcript | Tree of `llm_query` / `agent_query` |
+| Typical agent | rs-agent |
+|---------------|----------|
+| Everyday edit/bash/search | Same (first-class) |
+| Big file → stuff into context | Big file → `repl` + `context` |
+| Hits limits / truncates | Peeks `context[:200]`, searches in Python |
+| One flat transcript | Tree of `llm_query` / `agent_query` when needed |
 
 You do **not** need to run a competitor live — saying the contrast is enough
 if time is short.
@@ -124,7 +127,7 @@ if time is short.
 | Model dumps `<tool_call>` as text | Switch off free/tiny models; use Anthropic/OpenAI |
 | `python3` missing | Install Python 3; restart |
 | Permission prompt freezes the room | Restart with `-a` |
-| Agent `read`s the whole file | Re-prompt: “repl only; do not paste file into chat” |
+| Agent `read`s the whole file | Harness should emit `[rlm_escalate]`; if not, re-prompt “repl only” |
 | Empty /tree | Run `/tree` after the turn; or show repl tool blocks |
 
 Backup clip: pre-record `./scripts/demo-rlm.sh` so a live fail isn’t fatal.
@@ -135,5 +138,18 @@ Backup clip: pre-record `./scripts/demo-rlm.sh` so a live fail isn’t fatal.
 
 1. Short video / asciinema + link to repo
 2. One command from README (`install.sh` or `cargo run`)
-3. This line: *RLM coding harness — big context in a REPL, recursive tree, not a flat dump*
+3. This line: *Everyday coding agent — better when context doesn’t fit (RLM)*
 4. Paper: https://arxiv.org/abs/2512.24601
+
+
+---
+
+## Auto-escalate (Wave C)
+
+When a `read` (or truncated tool dump) exceeds ~10K chars (configurable:
+`rlm_escalate_chars` / `--rlm-escalate-chars`), the harness returns a short preview
+plus an `[rlm_escalate]` footer that tells the model to use `repl` + `load_file`
+instead of stuffing chat. The next model turn also gets a one-shot system note.
+
+Demo this by asking the agent to open a large file without mentioning RLM — you should
+see the escalate marker, then a `repl` turn.

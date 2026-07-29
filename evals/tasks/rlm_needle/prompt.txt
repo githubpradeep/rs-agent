@@ -1,0 +1,8 @@
+Use the repl tool only — do NOT use read to dump the whole corpus into chat.
+
+1) load_file('corpus.md') into the REPL context variable
+2) Print len(context) and context[:120] only
+3) Find the secret token matching RLM-EVAL-… by searching context in Python (do not guess)
+4) llm_query a one-sentence summary of only the "## Cargo" section (slice that section; do not send the pad)
+5) FINAL with the token and the short summary
+6) Your final answer must include the exact secret token string

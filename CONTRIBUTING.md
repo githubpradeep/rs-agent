@@ -1,15 +1,15 @@
 # Contributing to rs-agent
 
-Thanks for taking a look. rs-agent is an RLM-style recursive coding agent written in Rust — a
-Rust CLI/TUI, a unified LLM provider layer, and an RLM core (persistent Python REPL +
-`llm_query`/`agent_query`) that keeps large context out of the model window.
+Thanks for taking a look. rs-agent is an everyday coding agent in Rust (CLI/TUI, tools,
+providers, skills) with a Deep Context core (persistent Python REPL + `llm_query` / `agent_query`)
+so large context stays out of the model window when tasks get hard.
 
 ## Getting set up
 
 Requirements:
 
 - Rust (stable toolchain — see `rustup show` / install via [rustup.rs](https://rustup.rs))
-- `python3` on `PATH` (used by the RLM `repl` tool)
+- `python3` on `PATH` (used by the Deep Context `repl` tool)
 - An API key for at least one provider (Anthropic recommended — see the README)
 
 Clone and build:

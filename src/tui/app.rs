@@ -7,7 +7,11 @@ use crate::context::{
     build_commands_section, build_context_section, discover_agent_commands,
     discover_context_files,
 };
-use crate::permission::{PendingPermission, PermissionReply, TrustStore};
+use crate::permission::{
+    extract_tool_path, path_allow_prefix, PathAllowStore, PendingPermission, PermissionReply,
+    TrustStore,
+};
+use crate::tools::question::{PendingQuestion, QuestionReply};
 use crate::session::{self, SessionData, SessionStore};
 use crate::skills::{
     discover_skills, discover_templates, find_skill, find_template, format_skill_injection,
@@ -61,6 +65,8 @@ enum InputMode {
     Waiting,
     /// Capturing an API key for `pending_api_key_provider`.
     ApiKey,
+    /// Answering a `question` tool prompt.
+    Question,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -80,6 +86,13 @@ enum AppCommand {
     Abort,
     Compact,
     NewSession,
+    ForkSession {
+        label: Option<String>,
+        /// Truncate to first N API messages before forking (timeline).
+        at: Option<usize>,
+    },
+    /// Refresh `/timeline` entries from the live agent transcript.
+    RequestTimeline,
     SetModel { model: String },
     /// Mid-session provider+model swap (pi parity).
     SetProvider {
@@ -87,6 +100,7 @@ enum AppCommand {
         model: String,
     },
     SetMode { mode: AgentMode },
+    SetSkillTools { tools: Vec<String> },
     SetTitle { title: String },
     SetSystemPrompt { prompt: String },
     Init { messages: Vec<Message> },
@@ -120,12 +134,17 @@ pub struct App {
     pending_api_key_provider: Option<String>,
     pending_permission: Option<PendingPermission>,
     permission_rx: channel::Receiver<PendingPermission>,
+    pending_question: Option<PendingQuestion>,
+    question_rx: channel::Receiver<PendingQuestion>,
     trust_store: TrustStore,
+    path_allows: PathAllowStore,
     #[allow(dead_code)]
     approved: bool,
     auto_mode: bool,
     token_used: usize,
     token_limit: usize,
+    session_input_tokens: usize,
+    session_output_tokens: usize,
     near_limit: bool,
     session_id: String,
     session_title: Option<String>,
@@ -156,6 +175,21 @@ pub struct App {
     /// Cycle list of `provider/model` display strings (pi Ctrl+P).
     model_cycle: Vec<String>,
     model_cycle_index: usize,
+    /// When false, skip mouse capture so the terminal can do native text selection.
+    mouse_enabled: bool,
+    show_timeline_panel: bool,
+    timeline_selection: usize,
+    /// `(api_index, summary)` for the timeline side panel.
+    timeline_entries: Vec<(usize, String)>,
+    pending_kitty_images: Vec<String>,
+    lsp_summary: String,
+    lsp_cmd_tx: Option<channel::Sender<LspCmd>>,
+}
+
+enum LspCmd {
+    Start,
+    DidSave { path: String, text: String },
+    Stop,
 }
 
 impl App {
@@ -164,11 +198,83 @@ impl App {
         let theme_name = ThemeName::parse(cfg.theme.as_deref().unwrap_or("dark"));
         let palette = Palette::for_theme(theme_name);
         let keys = KeyMap::new(merge_keybindings(&cfg.keybindings));
+        let mouse_enabled = !cfg.disable_mouse.unwrap_or(false);
         let provider_for_app = provider.clone();
 
         let (command_tx, command_rx) = channel::unbounded::<AppCommand>();
         let (event_tx, event_rx) = channel::unbounded::<(usize, AgentEvent)>();
         let (permission_tx, permission_rx) = channel::unbounded::<PendingPermission>();
+        let (question_tx, question_rx) = channel::unbounded::<PendingQuestion>();
+        crate::tools::question::set_question_channel(question_tx);
+
+        let (lsp_cmd_tx, lsp_cmd_rx) = channel::unbounded::<LspCmd>();
+        let event_tx_lsp = event_tx.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(_) => return,
+            };
+            rt.block_on(async move {
+                let mut client: Option<crate::lsp::LspClient> = None;
+                let mut _reader: Option<tokio::task::JoinHandle<()>> = None;
+                loop {
+                    match lsp_cmd_rx.recv_timeout(Duration::from_millis(400)) {
+                        Ok(LspCmd::Start) => {
+                            let root = std::env::current_dir()
+                                .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                            match crate::lsp::LspClient::start_rust_analyzer(root).await {
+                                Ok((c, handle)) => {
+                                    let summary = c.snapshot().summary_line();
+                                    client = Some(c);
+                                    _reader = Some(handle);
+                                    let msg = if summary.is_empty() {
+                                        " LSP…".into()
+                                    } else {
+                                        summary
+                                    };
+                                    let _ =
+                                        event_tx_lsp.send((0, AgentEvent::LspUpdate { summary: msg }));
+                                }
+                                Err(e) => {
+                                    let _ = event_tx_lsp.send((
+                                        0,
+                                        AgentEvent::Status {
+                                            message: format!("lsp start failed: {e}"),
+                                        },
+                                    ));
+                                }
+                            }
+                        }
+                        Ok(LspCmd::DidSave { path, text }) => {
+                            if let Some(ref c) = client {
+                                let p = std::path::Path::new(&path);
+                                if let Some(lang) = crate::lsp::language_id_for(p) {
+                                    let _ = c.did_open(p, &text, lang).await;
+                                    let _ = c.did_save(p, Some(&text)).await;
+                                }
+                            }
+                        }
+                        Ok(LspCmd::Stop) => {
+                            client = None;
+                            _reader = None;
+                            let _ = event_tx_lsp.send((
+                                0,
+                                AgentEvent::LspUpdate {
+                                    summary: String::new(),
+                                },
+                            ));
+                        }
+                        Err(channel::RecvTimeoutError::Timeout) => {
+                            if let Some(ref c) = client {
+                                let summary = c.snapshot().summary_line();
+                                let _ = event_tx_lsp.send((0, AgentEvent::LspUpdate { summary }));
+                            }
+                        }
+                        Err(channel::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            });
+        });
 
         let abort_flag = crate::agent::AbortFlag::new();
         let steer_queue = crate::agent::SteerQueue::new();
@@ -187,9 +293,13 @@ impl App {
         });
         let resume_msgs = resume.as_ref().map(|s| s.messages.clone()).unwrap_or_default();
         let title = resume.as_ref().and_then(|s| s.title.clone());
+        let parent_id_resume = resume.as_ref().and_then(|s| s.parent_id.clone());
+        let branch_label_resume = resume.as_ref().and_then(|s| s.branch_label.clone());
         let session_id_for_thread = session_id.clone();
         let created_at_for_thread = created_at.clone();
         let title_for_thread = title.clone();
+        let parent_for_thread = parent_id_resume;
+        let branch_for_thread = branch_label_resume;
         let system_prompt_for_thread = system_prompt.clone();
         let max_rlm_depth = rlm_depth;
 
@@ -216,8 +326,9 @@ impl App {
                 if !approve {
                     agent_loop.set_permission_channel(permission_tx);
                 }
-                // Bridge tool-emitted events (REPL stdout) onto the TUI event channel.
+                // Bridge tool-emitted events (REPL stdout / bash stream) onto the TUI event channel.
                 let (sink_tx, sink_rx) = channel::unbounded::<AgentEvent>();
+                crate::tools::output_sink::set_tool_output_sink(sink_tx.clone());
                 let event_tx_bridge = event_tx.clone();
                 std::thread::spawn(move || {
                     while let Ok(ev) = sink_rx.recv() {
@@ -226,11 +337,23 @@ impl App {
                 });
                 agent_loop = agent_loop.with_event_sink(sink_tx);
                 crate::tools::register_default_tools_with_rlm(&mut agent_loop, max_rlm_depth);
+                {
+                    let mcp_cfg = crate::config::Config::load().mcp;
+                    if !mcp_cfg.servers.is_empty() {
+                        let lines =
+                            crate::mcp::attach_mcp_from_config(&mut agent_loop, &mcp_cfg).await;
+                        for line in lines {
+                            let _ = event_tx.send((0, AgentEvent::Status { message: line }));
+                        }
+                    }
+                }
 
                 let store = SessionStore::new();
                 let mut session_id_local = session_id_for_thread.clone();
                 let mut created_at_local = created_at_for_thread.clone();
                 let mut title_local = title_for_thread.clone();
+                let mut parent_id_local = parent_for_thread.clone();
+                let mut branch_label_local = branch_for_thread.clone();
 
                 loop {
                     let cmd = command_rx.recv().unwrap_or(AppCommand::Exit);
@@ -259,11 +382,81 @@ impl App {
                             agent_loop.clear_messages();
                             abort_for_thread.clear();
                             steer_for_thread.clear();
+                            crate::tools::todowrite::clear();
                             session_id_local = SessionStore::generate_id();
                             created_at_local = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                            title_local = None;
+                            parent_id_local = None;
+                            branch_label_local = None;
+                            let _ = event_tx.send((0, AgentEvent::SessionMeta {
+                                id: session_id_local.clone(),
+                                title: None,
+                            }));
                             let _ = event_tx.send((0, AgentEvent::Status {
                                 message: format!("new session {}", session_id_local),
                             }));
+                        }
+                        AppCommand::ForkSession { label, at } => {
+                            // Persist current tip, then fork into a new id.
+                            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                            let s = agent_loop.state();
+                            let tree_snapshot =
+                                serde_json::to_value(agent_loop.call_tree().snapshot()).ok();
+                            let mut current = SessionData {
+                                id: session_id_local.clone(),
+                                title: title_local.clone(),
+                                parent_id: parent_id_local.clone(),
+                                branch_label: branch_label_local.clone(),
+                                created_at: created_at_local.clone(),
+                                updated_at: now,
+                                model: s.model.clone(),
+                                provider: s.provider.clone(),
+                                system_prompt: s.system_prompt.clone(),
+                                messages: s.messages.clone(),
+                                total_input_tokens: s.total_input_tokens,
+                                total_output_tokens: s.total_output_tokens,
+                                call_tree: tree_snapshot,
+                                todos: Some(crate::tools::todowrite::snapshot()),
+                            };
+                            current.ensure_title();
+                            let _ = store.save(&current);
+                            match store.fork_at(&session_id_local, at, label) {
+                                Ok(forked) => {
+                                    session_id_local = forked.id.clone();
+                                    created_at_local = forked.created_at.clone();
+                                    title_local = forked.title.clone();
+                                    parent_id_local = forked.parent_id.clone();
+                                    branch_label_local = forked.branch_label.clone();
+                                    agent_loop.state_mut().messages = forked.messages.clone();
+                                    let _ = event_tx.send((0, AgentEvent::SessionMeta {
+                                        id: session_id_local.clone(),
+                                        title: title_local.clone(),
+                                    }));
+                                    let _ = event_tx.send((0, AgentEvent::ReloadTranscript {
+                                        messages: forked.messages.clone(),
+                                    }));
+                                    let _ = event_tx.send((0, AgentEvent::TimelineSnapshot {
+                                        entries: summarize_api_messages(&forked.messages),
+                                    }));
+                                    let _ = event_tx.send((0, AgentEvent::Status {
+                                        message: format!(
+                                            "forked → {} (parent {}){}",
+                                            session_id_local,
+                                            parent_id_local.as_deref().unwrap_or("?"),
+                                            at.map(|n| format!(" @{}", n)).unwrap_or_default()
+                                        ),
+                                    }));
+                                }
+                                Err(e) => {
+                                    let _ = event_tx.send((0, AgentEvent::Error {
+                                        message: format!("fork failed: {e}"),
+                                    }));
+                                }
+                            }
+                        }
+                        AppCommand::RequestTimeline => {
+                            let entries = summarize_api_messages(&agent_loop.state().messages);
+                            let _ = event_tx.send((0, AgentEvent::TimelineSnapshot { entries }));
                         }
                         AppCommand::SetModel { model } => {
                             agent_loop.set_model(model.clone());
@@ -284,6 +477,17 @@ impl App {
                                 message: format!("mode set to {}", mode.as_str()),
                             }));
                         }
+                        AppCommand::SetSkillTools { tools } => {
+                            let note = if tools.is_empty() {
+                                agent_loop.state_mut().clear_skill_tools();
+                                "skill tools cleared".to_string()
+                            } else {
+                                let joined = tools.join(", ");
+                                agent_loop.state_mut().set_skill_tools(tools);
+                                format!("skill tools: [{joined}]")
+                            };
+                            let _ = event_tx.send((0, AgentEvent::Status { message: note }));
+                        }
                         AppCommand::SetSystemPrompt { prompt } => {
                             agent_loop.state_mut().system_prompt = prompt;
                             let _ = event_tx.send((0, AgentEvent::Status {
@@ -299,6 +503,8 @@ impl App {
                             let session_data = SessionData {
                                 id: session_id_local.clone(),
                                 title: title_local.clone(),
+                                parent_id: parent_id_local.clone(),
+                                branch_label: branch_label_local.clone(),
                                 created_at: created_at_local.clone(),
                                 updated_at: now,
                                 model: s.model.clone(),
@@ -308,6 +514,7 @@ impl App {
                                 total_input_tokens: s.total_input_tokens,
                                 total_output_tokens: s.total_output_tokens,
                                 call_tree: tree_snapshot,
+                                todos: Some(crate::tools::todowrite::snapshot()),
                             };
                             let _ = store.save(&session_data);
                             let _ = event_tx.send((0, AgentEvent::Status {
@@ -346,6 +553,8 @@ impl App {
                             let mut session_data = SessionData {
                                 id: session_id_local.clone(),
                                 title: title_local.clone(),
+                                parent_id: parent_id_local.clone(),
+                                branch_label: branch_label_local.clone(),
                                 created_at: created_at_local.clone(),
                                 updated_at: now,
                                 model: s.model.clone(),
@@ -355,6 +564,7 @@ impl App {
                                 total_input_tokens: s.total_input_tokens,
                                 total_output_tokens: s.total_output_tokens,
                                 call_tree: tree_snapshot,
+                                todos: Some(crate::tools::todowrite::snapshot()),
                             };
                             session_data.ensure_title();
                             title_local = session_data.title.clone();
@@ -369,6 +579,7 @@ impl App {
         });
 
         let trust_store = TrustStore::new();
+        let path_allows = PathAllowStore::new();
 
         let provider_banner = if provider_name_for_banner.contains("opencode-cli") {
             format!("{} (experimental)", provider_name_for_banner)
@@ -378,7 +589,13 @@ impl App {
         let mut initial_msgs = vec![ChatMessage {
             role: "system".to_string(),
             text: format!(
-                "Rs Agent — RLM coding harness\nProvider: {}\nModel: {}\nSession: {}\n\nType a message to start.\ni: insert | Esc: normal | t: toggle thinking | G: bottom\nEnter while waiting: steer | Esc while waiting: abort\n/help for commands | ^C: quit",
+                "Rs Agent — everyday coding with Deep Context\n\
+                 Deep Context: load big files once, query them 100 times, never hit a limit.\n\
+                 Provider: {}\nModel: {}\nSession: {}\n\n\
+                 Type a message to start.\n\
+                 i: insert | Esc: normal | t: toggle thinking | G: bottom\n\
+                 Enter while waiting: steer | Esc while waiting: abort\n\
+                 /help for commands | ^C: quit",
                 provider_banner, model, session_id
             ),
             thinking: None,
@@ -386,10 +603,23 @@ impl App {
             tool_blocks: Vec::new(),
         }];
 
+        if let Some(warn) = crate::agent::weak_model_user_warning(&model) {
+            initial_msgs.push(ChatMessage {
+                role: "system".to_string(),
+                text: warn,
+                thinking: None,
+                show_thinking: false,
+                tool_blocks: Vec::new(),
+            });
+        }
+
         if !crate::rlm::python3_available() {
             initial_msgs.push(ChatMessage {
                 role: "system".to_string(),
-                text: format!("⚠️ {} The `repl` tool (and RLM sub-agents) will fail until it's installed.", crate::rlm::PYTHON3_NOT_FOUND),
+                text: format!(
+                    "⚠️ {} The `repl` tool (Deep Context) will fail until it's installed.",
+                    crate::rlm::PYTHON3_NOT_FOUND
+                ),
                 thinking: None,
                 show_thinking: false,
                 tool_blocks: Vec::new(),
@@ -397,6 +627,11 @@ impl App {
         }
 
         if let Some(ref resume_data) = resume {
+            if let Some(ref todos) = resume_data.todos {
+                crate::tools::todowrite::restore(todos.clone());
+            } else {
+                crate::tools::todowrite::clear();
+            }
             for msg in &resume_data.messages {
                 match &msg.role {
                     crate::ai::types::Role::User => {
@@ -444,6 +679,8 @@ impl App {
                     _ => {}
                 }
             }
+        } else {
+            crate::tools::todowrite::clear();
         }
 
         Self {
@@ -472,11 +709,22 @@ impl App {
             pending_api_key_provider: None,
             pending_permission: None,
             permission_rx,
+            pending_question: None,
+            question_rx,
             trust_store,
+            path_allows,
             approved: approve,
             auto_mode,
             token_used: 0,
             token_limit: crate::ai::token_count::get_context_limit(&model),
+            session_input_tokens: resume
+                .as_ref()
+                .map(|s| s.total_input_tokens)
+                .unwrap_or(0),
+            session_output_tokens: resume
+                .as_ref()
+                .map(|s| s.total_output_tokens)
+                .unwrap_or(0),
             near_limit: false,
             session_id,
             session_title: title,
@@ -516,6 +764,19 @@ impl App {
                 cycle
             },
             model_cycle_index: 0,
+            mouse_enabled,
+            show_timeline_panel: false,
+            timeline_selection: 0,
+            timeline_entries: {
+                if let Some(ref resume_data) = resume {
+                    summarize_api_messages(&resume_data.messages)
+                } else {
+                    Vec::new()
+                }
+            },
+            pending_kitty_images: Vec::new(),
+            lsp_summary: String::new(),
+            lsp_cmd_tx: Some(lsp_cmd_tx),
         }
     }
 
@@ -524,15 +785,14 @@ impl App {
         let mut stdout = io::stdout();
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(&mut stdout))?;
-        crossterm::execute!(
-            io::stdout(),
-            EnterAlternateScreen,
-            crossterm::event::EnableMouseCapture,
-            EnableBracketedPaste
-        )?;
+        crossterm::execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+        if self.mouse_enabled {
+            crossterm::execute!(io::stdout(), crossterm::event::EnableMouseCapture)?;
+        }
 
         loop {
             terminal.draw(|f| self.render(f))?;
+            self.flush_pending_kitty_images();
 
             if event::poll(Duration::from_millis(10))? {
                 self.handle_event(event::read()?)?;
@@ -549,11 +809,26 @@ impl App {
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_default();
                 let is_trusted = self.approved || self.trust_store.is_trusted(&cwd);
-                if is_trusted || self.auto_allow(&pending.request.tool_name) {
+                let path_ok = {
+                    let target = extract_tool_path(&pending.request.tool_input);
+                    self.path_allows.allows(
+                        &cwd,
+                        &pending.request.tool_name,
+                        target.as_deref(),
+                    )
+                };
+                if is_trusted || path_ok || self.auto_allow(&pending.request.tool_name) {
                     let _ = pending.reply_tx.send(PermissionReply::AllowOnce);
                 } else {
                     self.pending_permission = Some(pending);
                 }
+            }
+
+            if let Ok(pending) = self.question_rx.try_recv() {
+                self.input.clear();
+                self.input_mode = InputMode::Question;
+                self.status = "awaiting answer...".to_string();
+                self.pending_question = Some(pending);
             }
 
             if self.should_exit {
@@ -563,12 +838,10 @@ impl App {
 
         let _ = self.command_tx.send(AppCommand::Exit);
         terminal::disable_raw_mode()?;
-        crossterm::execute!(
-            io::stdout(),
-            LeaveAlternateScreen,
-            crossterm::event::DisableMouseCapture,
-            DisableBracketedPaste
-        )?;
+        crossterm::execute!(io::stdout(), LeaveAlternateScreen, DisableBracketedPaste)?;
+        if self.mouse_enabled {
+            crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture)?;
+        }
         Ok(())
     }
 
@@ -618,9 +891,14 @@ impl App {
             AgentEvent::ToolUseStart { id: _, name } => {
                 self.status = format!("using {}...", name);
                 self.follow_bottom = true;
-                if name == "repl" {
-                    self.repl_panel.clear();
+                if name == "repl" || name == "bash" || name == "task" {
+                    if name == "repl" {
+                        self.repl_panel.clear();
+                    }
                     self.show_repl_panel = true;
+                    if name == "repl" || name == "task" {
+                        self.show_tree_panel = true;
+                    }
                 }
                 self.tool_in_progress = Some((name, Instant::now()));
             }
@@ -632,7 +910,32 @@ impl App {
                         full = rest.to_string();
                     }
                 }
+                for img in super::kitty::find_image_paths(&full) {
+                    if !self.pending_kitty_images.iter().any(|p| p == &img) {
+                        self.pending_kitty_images.push(img);
+                    }
+                }
+                if matches!(name.as_str(), "write" | "edit" | "apply_patch") {
+                    if let Some(path) = extract_saved_file_path(&full) {
+                        if let Ok(text) = std::fs::read_to_string(&path) {
+                            if let Some(ref tx) = self.lsp_cmd_tx {
+                                let _ = tx.send(LspCmd::DidSave { path, text });
+                            }
+                        }
+                    }
+                }
                 let preview: String = full.chars().take(100).collect();
+                // Tools belong on the assistant turn. If the model jumped
+                // straight to a tool with no prior text/thinking, open one.
+                if self.messages.last().map(|m| m.role.as_str()) != Some("assistant") {
+                    self.messages.push(ChatMessage {
+                        role: "assistant".to_string(),
+                        text: String::new(),
+                        thinking: None,
+                        show_thinking: false,
+                        tool_blocks: Vec::new(),
+                    });
+                }
                 if let Some(last) = self.messages.last_mut() {
                     last.tool_blocks.push(ToolBlock {
                         name,
@@ -682,14 +985,43 @@ impl App {
                 }
                 self.show_repl_panel = true;
             }
+            AgentEvent::ToolOutput { name, stream, text } => {
+                let prefix = if stream == "stderr" {
+                    format!("[{name}/err] ")
+                } else {
+                    format!("[{name}] ")
+                };
+                for line in text.lines() {
+                    self.repl_panel.push_str(&prefix);
+                    self.repl_panel.push_str(line);
+                    self.repl_panel.push('\n');
+                }
+                const PANEL_CAP: usize = 8000;
+                if self.repl_panel.len() > PANEL_CAP {
+                    let excess = self.repl_panel.len() - PANEL_CAP;
+                    let cut = self.repl_panel[excess..]
+                        .find('\n')
+                        .map(|i| excess + i + 1)
+                        .unwrap_or(excess);
+                    self.repl_panel.drain(..cut);
+                }
+                self.show_repl_panel = true;
+            }
             AgentEvent::ContextWarning { fraction: _, used, limit } => {
                 self.token_used = used;
                 self.token_limit = limit;
                 self.near_limit = true;
             }
-            AgentEvent::TokenUpdate { used, limit } => {
+            AgentEvent::TokenUpdate {
+                used,
+                limit,
+                input_tokens,
+                output_tokens,
+            } => {
                 self.token_used = used;
                 self.token_limit = limit;
+                self.session_input_tokens = input_tokens;
+                self.session_output_tokens = output_tokens;
             }
             AgentEvent::Compacting => {
                 self.status = "compacting...".to_string();
@@ -714,7 +1046,44 @@ impl App {
                 self.tree_panel_text = tree.render();
             }
             AgentEvent::TitleUpdate { title } => {
-                self.session_title = Some(title);
+                if title.is_empty() {
+                    self.session_title = None;
+                } else {
+                    self.session_title = Some(title);
+                }
+            }
+            AgentEvent::SessionMeta { id, title } => {
+                self.session_id = id;
+                self.session_title = title.filter(|t| !t.is_empty());
+                self.session_input_tokens = 0;
+                self.session_output_tokens = 0;
+            }
+            AgentEvent::ReloadTranscript { messages } => {
+                let opener = self
+                    .messages
+                    .first()
+                    .filter(|m| m.role == "system")
+                    .cloned();
+                let mut rebuilt = Vec::new();
+                if let Some(sys) = opener {
+                    rebuilt.push(sys);
+                }
+                rebuilt.extend(api_messages_to_chat(&messages));
+                self.messages = rebuilt;
+                self.timeline_entries = summarize_api_messages(&messages);
+                if self.timeline_selection >= self.timeline_entries.len() {
+                    self.timeline_selection = self.timeline_entries.len().saturating_sub(1);
+                }
+                self.follow_bottom = true;
+            }
+            AgentEvent::TimelineSnapshot { entries } => {
+                self.timeline_entries = entries;
+                if self.timeline_selection >= self.timeline_entries.len() {
+                    self.timeline_selection = self.timeline_entries.len().saturating_sub(1);
+                }
+            }
+            AgentEvent::LspUpdate { summary } => {
+                self.lsp_summary = summary;
             }
         }
     }
@@ -766,13 +1135,14 @@ impl App {
                 }
             }
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if self.pending_permission.is_some() {
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.should_exit = true;
+                } else if self.pending_permission.is_some() {
                     self.handle_permission_key(key);
+                } else if self.pending_question.is_some() {
+                    self.handle_question_key(key);
                 } else {
                     match key.code {
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            self.should_exit = true;
-                        }
                         KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             self.cycle_model();
                         }
@@ -781,6 +1151,7 @@ impl App {
                             InputMode::Normal => self.handle_normal_key(key),
                             InputMode::Insert => self.handle_insert_key(key),
                             InputMode::ApiKey => self.handle_api_key_input(key),
+                            InputMode::Question => self.handle_question_key(key),
                         },
                     }
                 }
@@ -793,7 +1164,10 @@ impl App {
                     self.update_picker_results();
                 } else {
                     match self.input_mode {
-                        InputMode::Insert | InputMode::Waiting | InputMode::ApiKey => {
+                        InputMode::Insert
+                        | InputMode::Waiting
+                        | InputMode::ApiKey
+                        | InputMode::Question => {
                             self.input
                                 .push_str(text.replace(['\n', '\r'], "").as_str());
                         }
@@ -863,10 +1237,11 @@ impl App {
                      /help /keys /clear /context [on|off] /commands /tree\n\
                      /skills  /skill <name>  /prompt|/p <name> [args]  /reload\n\
                      /mode plan|ask|agent  /model [provider/model]  /provider|/login [name]\n\
-                     /theme [dark|light|forest]  /compact  /new  /sessions  /export\n\
+                     /theme [dark|light|forest]  /compact  /new  /fork [@N] [label]  /timeline  /sessions\n\
+                     /export [md|json|html]  /image [path]  /lsp [start|stop|status]  /skill-pack export|import\n\
                      /trust list|reset  /rename <title>  /history [query|n]\n\n\
                      Keys: {}\n\
-                     Ctrl+P cycle model · Tab-complete /skill|/prompt · @ file · # dir",
+                     Ctrl+P cycle model · Tab-complete /skill|/prompt|/model|/theme|/mode|/provider · @ file · # dir",
                     self.keys.hint_line(),
                 ));
             }
@@ -883,9 +1258,9 @@ impl App {
                      {bottom}          jump to bottom\n\
                      @          file picker\n\
                      #          directory picker (attach dir summary)\n\
-                     Tab        complete /skill or /prompt names\n\
+                     Tab        complete /skill /prompt /model /theme /mode /provider\n\
                      ^P         cycle provider/model (ready providers)\n\
-                     {once}/{deny}/{always}      allow once / deny / trust always (permission prompt)\n\
+                     {once}/{deny}/{always}/{path}  once / deny / trust project / allow path\n\
                      ^C         quit\n\n\
                      Remap single-key actions in ~/.rs-agent/config.toml under [keybindings].\n\
                      /model = model picker · /provider|/login = connect provider (paste key).",
@@ -897,6 +1272,7 @@ impl App {
                     once = self.keys.binding("perm_once"),
                     deny = self.keys.binding("perm_deny"),
                     always = self.keys.binding("perm_always"),
+                    path = self.keys.binding("perm_path"),
                 ));
             }
             "/theme" => {
@@ -1061,7 +1437,18 @@ impl App {
                     match find_skill(&skills, arg) {
                         Some(skill) => {
                             let injection = format_skill_injection(skill);
-                            self.push_system(format!("Loaded skill `{}`", skill.name));
+                            let tools_note = if skill.tools.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" (tools: {})", skill.tools.join(", "))
+                            };
+                            let _ = self.command_tx.send(AppCommand::SetSkillTools {
+                                tools: skill.tools.clone(),
+                            });
+                            self.push_system(format!(
+                                "Loaded skill `{}`{}",
+                                skill.name, tools_note
+                            ));
                             self.submit_user_text(format!(
                                 "{}\n\nApply this skill to the current task. If no task was given yet, briefly confirm you loaded it and wait for instructions.",
                                 injection
@@ -1138,44 +1525,86 @@ impl App {
                         let mut out = String::from("Sessions (newest first):\n");
                         for s in summaries.iter().take(20) {
                             let title = s.title.clone().unwrap_or_else(|| "(untitled)".to_string());
+                            let fork = match (&s.parent_id, &s.branch_label) {
+                                (Some(p), Some(l)) => format!(" ↩{} [{}]", p, l),
+                                (Some(p), None) => format!(" ↩{}", p),
+                                _ => String::new(),
+                            };
                             out.push_str(&format!(
-                                "  {}  {} msgs  {}  — {}\n",
-                                s.id, s.message_count, s.model, title
+                                "  {}  {} msgs  {}  — {}{}\n",
+                                s.id, s.message_count, s.model, title, fork
                             ));
                         }
-                        out.push_str("Resume: rs-agent -r <id>");
+                        out.push_str("Resume: rs-agent -r <id> · Fork: /fork [label]");
                         self.push_system(out);
                     }
                 }
                 Err(e) => self.push_system(format!("Failed to list sessions: {}", e)),
             },
             "/export" => {
+                let fmt = if arg.is_empty() {
+                    "md"
+                } else {
+                    match arg.trim().to_lowercase().as_str() {
+                        "md" | "markdown" => "md",
+                        "json" => "json",
+                        "html" | "htm" => "html",
+                        other => {
+                            self.push_system(format!(
+                                "Unknown export format `{other}`. Use /export [md|json|html]"
+                            ));
+                            return true;
+                        }
+                    }
+                };
                 let home = std::env::var("HOME")
                     .or_else(|_| std::env::var("USERPROFILE"))
                     .unwrap_or_else(|_| ".".to_string());
                 let dir = std::path::Path::new(&home).join(".rs-agent").join("exports");
                 let _ = std::fs::create_dir_all(&dir);
                 let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
-                let path = dir.join(format!("export_{}.md", ts));
-                let md = match SessionStore::new().load(&self.session_id) {
-                    Ok(data) => session::export_markdown(&data),
+                let path = dir.join(format!("export_{}.{}", ts, fmt));
+                let content = match SessionStore::new().load(&self.session_id) {
+                    Ok(data) => match fmt {
+                        "json" => match session::export_json(&data) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                self.push_system(format!("JSON export failed: {e}"));
+                                return true;
+                            }
+                        },
+                        "html" => session::export_html(&data),
+                        _ => session::export_markdown(&data),
+                    },
                     Err(_) => {
-                        // Session not on disk yet (no turn saved this run) — fall
-                        // back to exporting the in-memory chat transcript.
+                        // Session not on disk yet — fall back to in-memory chat.
                         let mut md = format!("# rs-agent export {}\n\n", self.session_id);
                         for m in &self.messages {
                             md.push_str(&format!("## {}\n\n{}\n\n", m.role, m.text));
                             if let Some(ref th) = m.thinking {
                                 if !th.is_empty() {
-                                    md.push_str(&format!("<details><summary>thinking</summary>\n\n{}\n\n</details>\n\n", th));
+                                    md.push_str(&format!(
+                                        "<details><summary>thinking</summary>\n\n{}\n\n</details>\n\n",
+                                        th
+                                    ));
                                 }
                             }
                         }
-                        md
+                        if fmt == "json" {
+                            serde_json::json!({"id": self.session_id, "fallback": true, "markdown": md})
+                                .to_string()
+                        } else if fmt == "html" {
+                            format!(
+                                "<!DOCTYPE html><html><body><pre>{}</pre></body></html>",
+                                md.replace('<', "&lt;")
+                            )
+                        } else {
+                            md
+                        }
                     }
                 };
-                match std::fs::write(&path, md) {
-                    Ok(()) => self.push_system(format!("Exported to {}", path.display())),
+                match std::fs::write(&path, content) {
+                    Ok(()) => self.push_system(format!("Exported ({fmt}) to {}", path.display())),
                     Err(e) => self.push_system(format!("Export failed: {}", e)),
                 }
             }
@@ -1185,10 +1614,15 @@ impl App {
                 match sub {
                     "list" | "" => {
                         let paths = self.trust_store.list();
+                        let cwd = std::env::current_dir()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        let path_rules = self.path_allows.list_for_project(&cwd);
+                        let mut out = String::new();
                         if paths.is_empty() {
-                            self.push_system("No trusted projects.");
+                            out.push_str("No trusted projects.\n");
                         } else {
-                            let mut out = String::from("Trust store:\n");
+                            out.push_str("Trusted projects:\n");
                             for (p, trusted) in paths {
                                 out.push_str(&format!(
                                     "  {} {}\n",
@@ -1196,12 +1630,25 @@ impl App {
                                     p
                                 ));
                             }
-                            self.push_system(out);
                         }
+                        if path_rules.is_empty() {
+                            out.push_str("No path-scoped allows for this project.");
+                        } else {
+                            out.push_str("Path allows (this project):\n");
+                            for r in path_rules {
+                                out.push_str(&format!("  {} → {}\n", r.tool, r.path_prefix));
+                            }
+                        }
+                        self.push_system(out);
                     }
                     "reset" | "clear" => {
+                        let cwd = std::env::current_dir()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_default();
                         self.trust_store.clear();
-                        self.push_system("Trust store cleared.");
+                        self.path_allows.clear_all();
+                        let _ = cwd;
+                        self.push_system("Trust store and path allows cleared.");
                     }
                     _ => self.push_system("Usage: /trust list|reset"),
                 }
@@ -1212,8 +1659,101 @@ impl App {
             }
             "/new" => {
                 let _ = self.command_tx.send(AppCommand::NewSession);
-                self.session_id = SessionStore::generate_id();
-                self.push_system(format!("New session: {}", self.session_id));
+                self.push_system("Starting new session…");
+            }
+            "/fork" => {
+                let (at, label) = parse_fork_args(arg);
+                let _ = self.command_tx.send(AppCommand::ForkSession { label, at });
+                self.push_system(match at {
+                    Some(n) => format!("Forking session at API message @{n}…"),
+                    None => "Forking session…".into(),
+                });
+            }
+            "/timeline" => {
+                self.show_timeline_panel = !self.show_timeline_panel;
+                if self.show_timeline_panel {
+                    let _ = self.command_tx.send(AppCommand::RequestTimeline);
+                    self.push_system(
+                        "Timeline panel: j/k or ↑/↓ select · Enter fork at @N · Esc closes · /fork @N [label]",
+                    );
+                } else {
+                    self.push_system("Timeline panel hidden.");
+                }
+            }
+            "/image" => {
+                if arg.is_empty() {
+                    self.push_system(
+                        "Usage: /image <path.png|jpg|…>\n\
+                         Queues a Kitty graphics render after the next draw (Kitty/WezTerm/Ghostty, or RS_AGENT_KITTY=1).",
+                    );
+                } else if super::kitty::is_image_path(arg) && std::path::Path::new(arg).is_file() {
+                    self.pending_kitty_images.push(arg.to_string());
+                    self.push_system(format!("Queued image: {arg}"));
+                } else {
+                    self.push_system(format!("Not a readable image file: {arg}"));
+                }
+            }
+            "/lsp" => {
+                let sub = arg.split_whitespace().next().unwrap_or("status");
+                match sub {
+                    "start" => {
+                        if let Some(ref tx) = self.lsp_cmd_tx {
+                            let _ = tx.send(LspCmd::Start);
+                            self.push_system(
+                                "Starting LSP (rust-analyzer, or RS_AGENT_LSP). Status appears in the footer.",
+                            );
+                        }
+                    }
+                    "stop" => {
+                        if let Some(ref tx) = self.lsp_cmd_tx {
+                            let _ = tx.send(LspCmd::Stop);
+                        }
+                        self.lsp_summary.clear();
+                        self.push_system("LSP stopped.");
+                    }
+                    "status" | "" => {
+                        if self.lsp_summary.is_empty() {
+                            self.push_system("LSP idle. Use `/lsp start` (requires rust-analyzer on PATH).");
+                        } else {
+                            self.push_system(format!("LSP:{}", self.lsp_summary.trim()));
+                        }
+                    }
+                    _ => self.push_system("Usage: /lsp start|stop|status"),
+                }
+            }
+            "/skill-pack" => {
+                let mut parts = arg.split_whitespace();
+                let sub = parts.next().unwrap_or("");
+                match sub {
+                    "export" => {
+                        let names: Vec<String> = parts.map(|s| s.to_string()).collect();
+                        let out = std::path::PathBuf::from(if names.is_empty() {
+                            "skills-pack.zip".into()
+                        } else {
+                            format!("{}-skills.zip", names[0])
+                        });
+                        match crate::skills::export_pack(&names, &out) {
+                            Ok(msg) => self.push_system(msg),
+                            Err(e) => self.push_system(format!("skill-pack export failed: {e}")),
+                        }
+                    }
+                    "import" => {
+                        let path = parts.next().unwrap_or("");
+                        if path.is_empty() {
+                            self.push_system("Usage: /skill-pack import <pack.zip>");
+                        } else {
+                            match crate::skills::import_pack(std::path::Path::new(path)) {
+                                Ok(msg) => {
+                                    self.push_system(format!("{msg}\nRun /reload to pick up new skills."));
+                                }
+                                Err(e) => self.push_system(format!("skill-pack import failed: {e}")),
+                            }
+                        }
+                    }
+                    _ => self.push_system(
+                        "Usage:\n  /skill-pack export [skill names…]\n  /skill-pack import <pack.zip>",
+                    ),
+                }
             }
             "/model" => {
                 if arg.is_empty() {
@@ -1337,6 +1877,35 @@ impl App {
         if self.key_matches("toggle_tree", key) {
             self.show_tree_panel = !self.show_tree_panel;
             return;
+        }
+        if self.show_timeline_panel {
+            match key.code {
+                KeyCode::Esc => {
+                    self.show_timeline_panel = false;
+                    return;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.timeline_selection = self.timeline_selection.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let max = self.timeline_entries.len().saturating_sub(1);
+                    self.timeline_selection = self.timeline_selection.saturating_add(1).min(max);
+                    return;
+                }
+                KeyCode::Enter => {
+                    if let Some((idx, _)) = self.timeline_entries.get(self.timeline_selection) {
+                        let at = *idx;
+                        let _ = self.command_tx.send(AppCommand::ForkSession {
+                            label: None,
+                            at: Some(at),
+                        });
+                        self.push_system(format!("Forking at @{at}…"));
+                    }
+                    return;
+                }
+                _ => {}
+            }
         }
         if self.key_matches("jump_bottom", key) {
             self.follow_bottom = true;
@@ -1591,7 +2160,19 @@ impl App {
         if !self.auto_mode {
             return false;
         }
-        matches!(tool_name, "read" | "grep" | "ls" | "find" | "webfetch" | "websearch")
+        // AUTO: file tools + read-only builtins. Still prompt for bash/repl and
+        // mutating MCP tools (those keep requires_permission=true).
+        matches!(
+            tool_name,
+            "read"
+                | "grep"
+                | "ls"
+                | "find"
+                | "webfetch"
+                | "websearch"
+                | "write"
+                | "edit"
+        )
     }
 
     /// Rebuilds the system prompt from scratch (default prompt + optional
@@ -1673,13 +2254,19 @@ impl App {
             self.token_limit = crate::ai::token_count::get_context_limit(&mref.model);
             self.note_cycle_entry(&mref.display());
             Self::remember_selection(&mref.provider, &mref.model);
-            if resolved_arg != raw {
-                return Ok(format!(
+            let mut msg = if resolved_arg != raw {
+                format!(
                     "Model set to {}/{} (alias `{}`)",
                     mref.provider, mref.model, raw
-                ));
+                )
+            } else {
+                format!("Model set to {}/{}", mref.provider, mref.model)
+            };
+            if let Some(w) = crate::agent::weak_model_user_warning(&mref.model) {
+                msg.push('\n');
+                msg.push_str(&w);
             }
-            return Ok(format!("Model set to {}/{}", mref.provider, mref.model));
+            return Ok(msg);
         }
 
         if mref.provider.eq_ignore_ascii_case("opencode-cli")
@@ -1778,11 +2365,112 @@ impl App {
         self.model_picker_rx = None;
     }
 
-    /// If the input is `/skill <partial>` or `/prompt|/p <partial>` (no
-    /// trailing args yet), either completes the single matching name in
-    /// place or opens a picker over the matches. No-op otherwise.
+    /// If the input is `/skill`, `/prompt`, `/model`, `/theme`, `/mode`, or
+    /// `/provider` with a partial arg, either completes the single match or
+    /// opens a picker. No-op otherwise.
     fn try_start_completion_picker(&mut self) {
         let text = self.input.clone();
+
+        // Fixed-choice slash commands
+        let fixed: &[(&str, &[&str], PickerMode)] = &[
+            ("/theme ", &["dark", "light", "forest"], PickerMode::Prompt),
+            ("/mode ", &["plan", "ask", "agent"], PickerMode::Prompt),
+        ];
+        for (cmd, options, mode) in fixed {
+            let Some(rest) = text.strip_prefix(cmd) else {
+                continue;
+            };
+            if rest.contains(char::is_whitespace) {
+                continue;
+            }
+            let query_lower = rest.to_lowercase();
+            let names: Vec<String> = options.iter().map(|s| (*s).to_string()).collect();
+            let filtered: Vec<String> = if query_lower.is_empty() {
+                names
+            } else {
+                Self::rank_and_filter(&names, &query_lower, 20)
+            };
+            match filtered.len() {
+                0 => {}
+                1 => self.input = format!("{}{} ", cmd, filtered[0]),
+                _ => {
+                    self.picker_prefix = cmd.to_string();
+                    self.picker_query = rest.to_string();
+                    self.picker_mode = *mode;
+                    self.picker_results = filtered;
+                    self.picker_selection = 0;
+                    self.picker_active = true;
+                }
+            }
+            return;
+        }
+
+        // /model — use available model displays
+        if let Some(rest) = text.strip_prefix("/model ") {
+            if !rest.contains(char::is_whitespace) {
+                let mut names = crate::ai::registry::available_model_displays();
+                let cfg = crate::config::Config::load();
+                for alias in cfg.model_aliases.keys() {
+                    if !names.iter().any(|n| n == alias) {
+                        names.push(alias.clone());
+                    }
+                }
+                let query_lower = rest.to_lowercase();
+                let filtered: Vec<String> = if query_lower.is_empty() {
+                    names
+                } else {
+                    Self::rank_and_filter(&names, &query_lower, 50)
+                };
+                match filtered.len() {
+                    0 => {}
+                    1 => self.input = format!("/model {} ", filtered[0]),
+                    _ => {
+                        self.picker_prefix = "/model ".into();
+                        self.picker_query = rest.to_string();
+                        self.picker_models = filtered.clone();
+                        self.picker_mode = PickerMode::Model;
+                        self.picker_results = filtered;
+                        self.picker_selection = 0;
+                        self.picker_active = true;
+                    }
+                }
+                return;
+            }
+        }
+
+        // /provider|/login
+        for cmd in ["/provider ", "/login "] {
+            let Some(rest) = text.strip_prefix(cmd) else {
+                continue;
+            };
+            if rest.contains(char::is_whitespace) {
+                continue;
+            }
+            let names: Vec<String> = crate::ai::registry::provider_picker_rows()
+                .into_iter()
+                .filter_map(|row| row.split_whitespace().next().map(|s| s.to_string()))
+                .collect();
+            let query_lower = rest.to_lowercase();
+            let filtered: Vec<String> = if query_lower.is_empty() {
+                names
+            } else {
+                Self::rank_and_filter(&names, &query_lower, 40)
+            };
+            match filtered.len() {
+                0 => {}
+                1 => self.input = format!("{cmd}{} ", filtered[0]),
+                _ => {
+                    self.picker_prefix = cmd.to_string();
+                    self.picker_query = rest.to_string();
+                    self.picker_mode = PickerMode::Provider;
+                    self.picker_results = filtered;
+                    self.picker_selection = 0;
+                    self.picker_active = true;
+                }
+            }
+            return;
+        }
+
         let candidates: [(&str, bool); 3] =
             [("/skill ", true), ("/prompt ", false), ("/p ", false)];
         for (cmd, is_skill) in candidates {
@@ -2268,7 +2956,14 @@ impl App {
         idx += 1;
         let status_area = chunks[idx];
 
-        if self.show_tree_panel {
+        if self.show_timeline_panel {
+            let hchunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+                .split(chat_area);
+            self.render_messages(frame, hchunks[0]);
+            self.render_timeline_panel(frame, hchunks[1]);
+        } else if self.show_tree_panel {
             let hchunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
@@ -2289,6 +2984,9 @@ impl App {
         if self.pending_permission.is_some() {
             self.render_permission_prompt(frame, area);
         }
+        if self.pending_question.is_some() {
+            self.render_question_prompt(frame, area);
+        }
     }
 
     fn render_tree_panel(&mut self, frame: &mut Frame, area: Rect) {
@@ -2305,6 +3003,37 @@ impl App {
                 .border_style(style),
         );
         frame.render_widget(panel, area);
+    }
+
+    fn render_timeline_panel(&mut self, frame: &mut Frame, area: Rect) {
+        let style = Style::default().fg(self.palette.muted);
+        let sel = Style::default()
+            .fg(self.palette.user)
+            .add_modifier(Modifier::BOLD);
+        let items: Vec<ListItem> = if self.timeline_entries.is_empty() {
+            vec![ListItem::new(Line::from(Span::styled(
+                "(empty — send a message)",
+                style,
+            )))]
+        } else {
+            self.timeline_entries
+                .iter()
+                .enumerate()
+                .map(|(i, (idx, summary))| {
+                    let marker = if i == self.timeline_selection { "›" } else { " " };
+                    let line = format!("{marker} @{idx} {summary}");
+                    let st = if i == self.timeline_selection { sel } else { style };
+                    ListItem::new(Line::from(Span::styled(line, st)))
+                })
+                .collect()
+        };
+        let list = List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Timeline (Enter=fork) ")
+                .border_style(Style::default().fg(self.palette.tool)),
+        );
+        frame.render_widget(list, area);
     }
 
     fn render_repl_panel(&mut self, frame: &mut Frame, area: Rect) {
@@ -2376,15 +3105,8 @@ impl App {
             };
             let bold_prefix = Style::default().fg(color).add_modifier(Modifier::BOLD);
 
-            let rendered = render_markdown(&msg.text, self.theme_name.syntect_theme());
-            for (i, raw_line) in rendered.into_iter().enumerate() {
-                let mut line = raw_line;
-                if i == 0 {
-                    line.spans.insert(0, Span::styled(prefix, bold_prefix));
-                }
-                lines.extend(Self::wrap_line(&line, max_width));
-            }
-
+            // Render order: thinking → tools → response text, so the
+            // final answer sits at the bottom of the turn (tools above).
             if let Some(ref thinking) = msg.thinking {
                 if !thinking.is_empty() {
                     if msg.show_thinking {
@@ -2393,10 +3115,11 @@ impl App {
                             .add_modifier(Modifier::ITALIC | Modifier::UNDERLINED);
                         let line_idx = lines.len();
                         self.thinking_targets.push((line_idx, msg_idx));
-                        lines.push(Line::from(Span::styled(
+                        let header = Line::from(Span::styled(
                             "🧠 thinking (click to hide)",
                             think_style,
-                        )));
+                        ));
+                        lines.extend(Self::wrap_line(&header, max_width));
                         let body_style = Style::default().fg(self.palette.muted).add_modifier(Modifier::ITALIC);
                         for raw_line in render_markdown(thinking, self.theme_name.syntect_theme()) {
                             let mut styled_spans = Vec::new();
@@ -2409,10 +3132,13 @@ impl App {
                         let clickable = Style::default().fg(self.palette.muted).add_modifier(Modifier::UNDERLINED);
                         let line_idx = lines.len();
                         self.thinking_targets.push((line_idx, msg_idx));
-                        lines.push(Line::from(vec![Span::styled(
-                            format!("💭 {}", thinking.chars().take(60).collect::<String>()),
+                        let preview_budget = max_width.saturating_sub(4).max(8);
+                        let preview: String = thinking.chars().take(preview_budget).collect();
+                        let header = Line::from(vec![Span::styled(
+                            format!("💭 {}", preview),
                             clickable,
-                        )]));
+                        )]);
+                        lines.extend(Self::wrap_line(&header, max_width));
                     }
                 }
             }
@@ -2424,10 +3150,11 @@ impl App {
                     let header_style = Style::default().fg(color).add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
                     let line_idx = lines.len();
                     self.tool_targets.push((line_idx, msg_idx, tool_idx));
-                    lines.push(Line::from(Span::styled(
+                    let header = Line::from(Span::styled(
                         format!("{} {} (click/e to collapse)", icon, block.name),
                         header_style,
-                    )));
+                    ));
+                    lines.extend(Self::wrap_line(&header, max_width));
                     let body_style = Style::default().fg(if block.is_error { self.palette.danger } else { self.palette.muted });
                     for raw_line in render_markdown(&block.full, self.theme_name.syntect_theme()) {
                         let mut styled_spans = Vec::new();
@@ -2440,11 +3167,36 @@ impl App {
                     let clickable = Style::default().fg(color).add_modifier(Modifier::UNDERLINED);
                     let line_idx = lines.len();
                     self.tool_targets.push((line_idx, msg_idx, tool_idx));
-                    lines.push(Line::from(vec![Span::styled(
-                        format!("{} {} — {}… (click/e to expand)", icon, block.name, block.preview),
+                    // Keep the collapsed summary within the chat width so it
+                    // cannot bleed into the input/status bars below.
+                    let suffix = "… (click/e to expand)";
+                    let fixed = icon.chars().count() + 1 + block.name.chars().count() + 3 + suffix.chars().count();
+                    let preview_budget = max_width.saturating_sub(fixed).max(8);
+                    let preview: String = block.preview.chars().take(preview_budget).collect();
+                    let header = Line::from(vec![Span::styled(
+                        format!("{} {} — {}{}", icon, block.name, preview, suffix),
                         clickable,
-                    )]));
+                    )]);
+                    lines.extend(Self::wrap_line(&header, max_width));
                 }
+            }
+
+            if !msg.text.is_empty() {
+                let rendered = render_markdown(&msg.text, self.theme_name.syntect_theme());
+                for (i, raw_line) in rendered.into_iter().enumerate() {
+                    let mut line = raw_line;
+                    if i == 0 {
+                        line.spans.insert(0, Span::styled(prefix, bold_prefix));
+                    }
+                    lines.extend(Self::wrap_line(&line, max_width));
+                }
+            } else if msg.role != "assistant"
+                || (msg.thinking.as_ref().map(|t| t.is_empty()).unwrap_or(true)
+                    && msg.tool_blocks.is_empty())
+            {
+                // Preserve empty non-assistant rows / placeholder assistant rows
+                // that have neither thinking nor tools yet.
+                lines.push(Line::from(Span::styled(prefix, bold_prefix)));
             }
 
             lines.push(Line::from(""));
@@ -2475,11 +3227,14 @@ impl App {
             InputMode::Insert => " INSERT ",
             InputMode::Waiting => " WAITING ",
             InputMode::ApiKey => " API KEY ",
+            InputMode::Question => " QUESTION ",
         };
 
         let border_style = match self.input_mode {
             InputMode::Insert => Style::default().fg(self.palette.user),
-            InputMode::Waiting | InputMode::ApiKey => Style::default().fg(self.palette.warn),
+            InputMode::Waiting | InputMode::ApiKey | InputMode::Question => {
+                Style::default().fg(self.palette.warn)
+            }
             _ => Style::default().fg(self.palette.border),
         };
 
@@ -2503,7 +3258,9 @@ impl App {
 
         let input = Paragraph::new(display_text.as_str())
             .style(match self.input_mode {
-                InputMode::Waiting | InputMode::ApiKey => Style::default().fg(self.palette.warn),
+                InputMode::Waiting | InputMode::ApiKey | InputMode::Question => {
+                    Style::default().fg(self.palette.warn)
+                }
                 _ => Style::default().fg(self.palette.text),
             })
             .block(
@@ -2518,7 +3275,7 @@ impl App {
 
         if matches!(
             self.input_mode,
-            InputMode::Insert | InputMode::Waiting | InputMode::ApiKey
+            InputMode::Insert | InputMode::Waiting | InputMode::ApiKey | InputMode::Question
         ) {
             let cursor_len = if self.picker_active {
                 match self.picker_mode {
@@ -2559,15 +3316,34 @@ impl App {
         } else {
             String::new()
         };
+        let cost_str = crate::ai::token_count::format_cost_usd(
+            &self.model_name,
+            self.session_input_tokens,
+            self.session_output_tokens,
+        );
 
         let mut hints = String::from(" ^C quit");
         if self.input_mode == InputMode::Waiting {
             hints.push_str(" · Esc abort · Enter steer");
+        } else if self.input_mode == InputMode::Question {
+            hints.push_str(" · Enter answer · Esc cancel");
         }
-        let yolo = if self.approved || self.auto_mode {
+        let yolo = if self.approved {
             " YOLO"
+        } else if self.auto_mode {
+            " AUTO"
         } else {
             ""
+        };
+        let deep = if self.tree_breadcrumb != "idle" {
+            " [D]"
+        } else {
+            ""
+        };
+        let lsp = if self.lsp_summary.is_empty() {
+            String::new()
+        } else {
+            self.lsp_summary.clone()
         };
         let title_str = self
             .session_title
@@ -2575,12 +3351,14 @@ impl App {
             .map(|t| format!(" \"{}\"", t.chars().take(40).collect::<String>()))
             .unwrap_or_default();
         let meta = format!(
-            " {}/{} · {} · d{}{} [{}]{} | {}",
+            " {}/{} · {} · d{}{}{}{} [{}]{} | {}",
             self.provider_name,
             self.model_name,
             self.agent_mode.as_str(),
             self.rlm_depth,
             yolo,
+            deep,
+            lsp,
             self.session_id,
             title_str,
             self.tree_breadcrumb
@@ -2597,10 +3375,36 @@ impl App {
             })
             .unwrap_or_default();
 
+        // Prefer truncating the middle meta (provider/session/title) so hints
+        // and the live status/tokens stay visible within `area.width`.
+        let max_w = area.width as usize;
+        let sep = " | ";
+        let right = format!("{}{}{}{}", self.status, spinner, token_str, cost_str);
+        let right_w = right.chars().count();
+        let hints_w = hints.chars().count();
+        let budget_for_meta = max_w
+            .saturating_sub(hints_w)
+            .saturating_sub(sep.chars().count())
+            .saturating_sub(right_w);
+        let meta_display = if budget_for_meta == 0 {
+            String::new()
+        } else if meta.chars().count() > budget_for_meta {
+            let keep = budget_for_meta.saturating_sub(1);
+            let truncated: String = meta.chars().take(keep).collect();
+            format!("{truncated}…")
+        } else {
+            meta
+        };
+        let sep_display = if meta_display.is_empty() {
+            String::new()
+        } else {
+            sep.to_string()
+        };
+
         let status = Line::from(vec![
             Span::styled(hints, Style::default().fg(self.palette.muted)),
-            Span::styled(meta, Style::default().fg(self.palette.accent)),
-            Span::styled(" | ", Style::default().fg(self.palette.muted)),
+            Span::styled(meta_display, Style::default().fg(self.palette.accent)),
+            Span::styled(sep_display, Style::default().fg(self.palette.muted)),
             Span::styled(&self.status, Style::default().fg(status_color)),
             Span::styled(
                 spinner,
@@ -2614,6 +3418,7 @@ impl App {
                     self.palette.muted
                 }),
             ),
+            Span::styled(cost_str, Style::default().fg(self.palette.muted)),
         ]);
         frame.render_widget(Paragraph::new(status), area);
     }
@@ -2624,6 +3429,22 @@ impl App {
                 let tool = pending.request.tool_name.clone();
                 let _ = pending.reply_tx.send(PermissionReply::AllowOnce);
                 self.status = format!("allowed {} (once)", tool);
+            } else if self.key_matches("perm_path", key) {
+                let tool = pending.request.tool_name.clone();
+                let cwd = std::env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if let Some(file) = extract_tool_path(&pending.request.tool_input) {
+                    let prefix = path_allow_prefix(&file);
+                    self.path_allows.add_rule(&cwd, &tool, &prefix);
+                    let _ = pending.reply_tx.send(PermissionReply::AllowOnce);
+                    self.status = format!("allowed {} under {} (path)", tool, prefix);
+                } else {
+                    self.status =
+                        "no file path in tool args — use once/always, or pick a write/edit call"
+                            .into();
+                    self.pending_permission = Some(pending);
+                }
             } else if self.key_matches("perm_always", key) {
                 let tool = pending.request.tool_name.clone();
                 let cwd = std::env::current_dir()
@@ -2776,16 +3597,48 @@ impl App {
                 Style::default().fg(self.palette.text),
             )));
         }
+
+        if let Some(diff) = pending.request.diff_preview.as_deref() {
+            text.push(Line::from(""));
+            text.push(Line::from(Span::styled(
+                " Diff preview:",
+                Style::default()
+                    .fg(self.palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for line in diff.lines().take(24) {
+                let color = if line.starts_with('+') && !line.starts_with("+++") {
+                    self.palette.ok
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    self.palette.danger
+                } else {
+                    self.palette.muted
+                };
+                text.push(Line::from(Span::styled(
+                    format!(" {}", line),
+                    Style::default().fg(color),
+                )));
+            }
+        }
+
         text.push(Line::from(""));
         text.push(Line::from(Span::styled(
             format!(
-                " [{}] once   [{}] always (trust project)   [{}] deny ",
+                " [{}] once   [{}] path allow   [{}] always (project)   [{}] deny ",
                 self.keys.binding("perm_once"),
+                self.keys.binding("perm_path"),
                 self.keys.binding("perm_always"),
                 self.keys.binding("perm_deny"),
             ),
             Style::default().fg(self.palette.muted),
         )));
+        if let Some(path) = extract_tool_path(&pending.request.tool_input) {
+            let prefix = path_allow_prefix(&path);
+            text.push(Line::from(Span::styled(
+                format!(" path allow → {} under {}", pending.request.tool_name, prefix),
+                Style::default().fg(self.palette.muted),
+            )));
+        }
 
         let prompt_height = (text.len() as u16 + 2).min(area.height.saturating_sub(4).max(3));
         let prompt_y = area.height.saturating_sub(4 + prompt_height + 2);
@@ -2806,6 +3659,263 @@ impl App {
 
         frame.render_widget(paragraph, prompt_area);
     }
+
+    fn handle_question_key(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                if let Some(pending) = self.pending_question.take() {
+                    let _ = pending.reply_tx.send(QuestionReply::Cancelled);
+                }
+                self.input.clear();
+                self.input_mode = InputMode::Waiting;
+                self.status = "question cancelled".to_string();
+            }
+            KeyCode::Enter => {
+                let answer = self.input.trim().to_string();
+                if let Some(pending) = self.pending_question.take() {
+                    let resolved = if answer.is_empty() {
+                        QuestionReply::Cancelled
+                    } else if let Ok(n) = answer.parse::<usize>() {
+                        if n >= 1 && n <= pending.request.options.len() {
+                            QuestionReply::Answer(pending.request.options[n - 1].clone())
+                        } else {
+                            QuestionReply::Answer(answer)
+                        }
+                    } else {
+                        QuestionReply::Answer(answer)
+                    };
+                    let _ = pending.reply_tx.send(resolved);
+                }
+                self.input.clear();
+                self.input_mode = InputMode::Waiting;
+                self.status = "answered".to_string();
+            }
+            KeyCode::Char(c) => self.input.push(c),
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            _ => {}
+        }
+    }
+
+    fn render_question_prompt(&mut self, frame: &mut Frame, area: Rect) {
+        let pending = match self.pending_question.as_ref() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let mut text = vec![
+            Line::from(Span::styled(
+                " Question ",
+                Style::default()
+                    .fg(self.palette.warn)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!(" {}", pending.request.question),
+                Style::default().fg(self.palette.text),
+            )),
+        ];
+        if !pending.request.options.is_empty() {
+            text.push(Line::from(""));
+            for (i, opt) in pending.request.options.iter().enumerate() {
+                text.push(Line::from(Span::styled(
+                    format!("  {}) {}", i + 1, opt),
+                    Style::default().fg(self.palette.accent),
+                )));
+            }
+        }
+        text.push(Line::from(""));
+        text.push(Line::from(Span::styled(
+            " Type answer (or option number) · Enter submit · Esc cancel",
+            Style::default().fg(self.palette.muted),
+        )));
+
+        let prompt_height = (text.len() as u16 + 2).min(area.height.saturating_sub(4).max(3));
+        let prompt_y = area.height.saturating_sub(4 + prompt_height + 2);
+        let prompt_area = Rect {
+            x: area.x + 2,
+            y: area.y + prompt_y,
+            width: area.width.saturating_sub(4).min(90),
+            height: prompt_height,
+        };
+
+        let paragraph = Paragraph::new(text).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Ask user ")
+                .border_style(Style::default().fg(self.palette.warn)),
+        );
+        frame.render_widget(paragraph, prompt_area);
+    }
+
+    fn flush_pending_kitty_images(&mut self) {
+        if self.pending_kitty_images.is_empty() {
+            return;
+        }
+        if !super::kitty::kitty_graphics_likely() {
+            // Drop quietly unless user forced via env; avoid flooding non-Kitty terms.
+            if std::env::var("RS_AGENT_KITTY").is_err() {
+                self.pending_kitty_images.clear();
+                return;
+            }
+        }
+        let paths: Vec<String> = self.pending_kitty_images.drain(..).collect();
+        let mut out = io::stdout();
+        for path in paths {
+            let _ = super::kitty::write_kitty_image(&mut out, &path, 80);
+        }
+    }
+}
+
+fn summarize_api_messages(messages: &[Message]) -> Vec<(usize, String)> {
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let role = match m.role {
+                crate::ai::types::Role::System => "system",
+                crate::ai::types::Role::User => "user",
+                crate::ai::types::Role::Assistant => "assistant",
+                crate::ai::types::Role::Tool => "tool",
+            };
+            let preview = m
+                .content
+                .first()
+                .and_then(|c| {
+                    c.text
+                        .as_deref()
+                        .or(c.name.as_deref())
+                        .or(c.thinking.as_deref())
+                })
+                .unwrap_or("");
+            let preview: String = preview.chars().take(48).collect();
+            let preview = preview.replace('\n', " ");
+            (i, format!("{role}: {preview}"))
+        })
+        .collect()
+}
+
+fn api_messages_to_chat(messages: &[Message]) -> Vec<ChatMessage> {
+    let mut out = Vec::new();
+    for msg in messages {
+        match &msg.role {
+            crate::ai::types::Role::User => {
+                let text = msg
+                    .content
+                    .first()
+                    .and_then(|c| c.text.as_deref())
+                    .unwrap_or("");
+                if !text.is_empty() {
+                    out.push(ChatMessage {
+                        role: "user".into(),
+                        text: text.to_string(),
+                        thinking: None,
+                        show_thinking: false,
+                        tool_blocks: Vec::new(),
+                    });
+                }
+            }
+            crate::ai::types::Role::Assistant => {
+                let mut text = String::new();
+                let mut thinking: Option<String> = None;
+                for c in &msg.content {
+                    match c.content_type {
+                        crate::ai::types::ContentType::Text => {
+                            if let Some(ref t) = c.text {
+                                text.push_str(t);
+                            }
+                        }
+                        crate::ai::types::ContentType::ToolUse => {
+                            let name = c.name.as_deref().unwrap_or("tool");
+                            let input = c.input.as_ref().map(|v| v.to_string()).unwrap_or_default();
+                            let preview: String = input.chars().take(120).collect();
+                            text.push_str(&format!("\n🛠 {} {}\n", name, preview));
+                        }
+                        crate::ai::types::ContentType::Thinking => {
+                            if let Some(ref t) = c.thinking {
+                                thinking = Some(t.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if !text.is_empty() || thinking.as_ref().is_some_and(|t| !t.is_empty()) {
+                    out.push(ChatMessage {
+                        role: "assistant".into(),
+                        text,
+                        thinking: thinking.clone(),
+                        show_thinking: thinking.as_ref().map(|t| !t.is_empty()).unwrap_or(false),
+                        tool_blocks: Vec::new(),
+                    });
+                }
+            }
+            crate::ai::types::Role::Tool => {
+                let name = msg
+                    .content
+                    .first()
+                    .and_then(|c| c.name.as_deref())
+                    .unwrap_or("tool");
+                let result = msg
+                    .content
+                    .first()
+                    .and_then(|c| c.text.as_deref())
+                    .unwrap_or("");
+                let preview: String = result.chars().take(200).collect();
+                if !preview.is_empty() {
+                    out.push(ChatMessage {
+                        role: "tool".into(),
+                        text: format!("✅ [{name}] {preview}"),
+                        thinking: None,
+                        show_thinking: false,
+                        tool_blocks: Vec::new(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Parse `/fork [@N] [label…]` → (at, label).
+fn parse_fork_args(arg: &str) -> (Option<usize>, Option<String>) {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return (None, None);
+    }
+    let mut parts = arg.split_whitespace();
+    let first = parts.next().unwrap_or("");
+    if let Some(rest) = first.strip_prefix('@') {
+        if let Ok(n) = rest.parse::<usize>() {
+            let label = {
+                let joined: String = parts.collect::<Vec<_>>().join(" ");
+                if joined.is_empty() {
+                    None
+                } else {
+                    Some(joined)
+                }
+            };
+            return (Some(n), label);
+        }
+    }
+    (None, Some(arg.to_string()))
+}
+
+fn extract_saved_file_path(tool_result: &str) -> Option<String> {
+    for token in tool_result.split_whitespace() {
+        let cleaned = token.trim_matches(|c: char| {
+            matches!(c, '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}')
+        });
+        if cleaned.contains('/') || cleaned.contains('.') {
+            let p = std::path::Path::new(cleaned);
+            if p.is_file() {
+                return Some(cleaned.to_string());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -2839,5 +3949,16 @@ mod fuzzy_tests {
         ];
         let hit = App::rank_and_filter(&items, "claude", 10);
         assert_eq!(hit[0], "claude-sonnet-4");
+    }
+
+    #[test]
+    fn parse_fork_at_and_label() {
+        assert_eq!(super::parse_fork_args(""), (None, None));
+        assert_eq!(super::parse_fork_args("hotfix"), (None, Some("hotfix".into())));
+        assert_eq!(super::parse_fork_args("@3"), (Some(3), None));
+        assert_eq!(
+            super::parse_fork_args("@3 try again"),
+            (Some(3), Some("try again".into()))
+        );
     }
 }

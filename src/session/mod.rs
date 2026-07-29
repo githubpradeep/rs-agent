@@ -1,4 +1,4 @@
-use crate::ai::types::{Message, Role};
+use crate::ai::types::{ContentType, Message, Role};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -11,6 +11,12 @@ pub struct SessionData {
     pub id: String,
     #[serde(default)]
     pub title: Option<String>,
+    /// Parent session id when this session was created via `/fork`.
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    /// Optional short label for a forked branch.
+    #[serde(default)]
+    pub branch_label: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub model: String,
@@ -19,11 +25,14 @@ pub struct SessionData {
     pub messages: Vec<Message>,
     pub total_input_tokens: usize,
     pub total_output_tokens: usize,
-    /// Snapshot of the RLM call tree (`CallTreeInner`, serialized) at the
+    /// Snapshot of the Deep Context call tree (`CallTreeInner`, serialized) at the
     /// end of the last turn, if any. Lets `/tree` show a last-known summary
     /// after resuming a session, even before a new turn has run.
     #[serde(default)]
     pub call_tree: Option<serde_json::Value>,
+    /// In-session todo list from the `todowrite` tool.
+    #[serde(default)]
+    pub todos: Option<Vec<crate::tools::todowrite::TodoItem>>,
 }
 
 impl SessionData {
@@ -75,6 +84,10 @@ pub struct SessionSummary {
     pub model: String,
     pub updated_at: String,
     pub message_count: usize,
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub branch_label: Option<String>,
 }
 
 /// Render a session transcript as a Markdown document (for export/sharing).
@@ -99,23 +112,162 @@ pub fn export_markdown(data: &SessionData) -> String {
             Role::Assistant => "Assistant",
             Role::Tool => "Tool",
         };
-        let texts: Vec<String> = msg
-            .content
-            .iter()
-            .filter_map(|c| c.text.clone())
-            .filter(|t| !t.trim().is_empty())
-            .collect();
-        if texts.is_empty() {
+        let mut parts: Vec<String> = Vec::new();
+        for c in &msg.content {
+            match c.content_type {
+                ContentType::Text => {
+                    if let Some(ref t) = c.text {
+                        if !t.trim().is_empty() {
+                            parts.push(t.clone());
+                        }
+                    }
+                }
+                ContentType::Thinking => {
+                    if let Some(ref t) = c.thinking {
+                        if !t.trim().is_empty() {
+                            parts.push(format!("<details><summary>thinking</summary>\n\n{}\n\n</details>", t));
+                        }
+                    }
+                }
+                ContentType::ToolUse => {
+                    let name = c.name.as_deref().unwrap_or("tool");
+                    let input = c
+                        .input
+                        .as_ref()
+                        .map(|v| serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()))
+                        .unwrap_or_default();
+                    parts.push(format!("**Tool call `{name}`**\n\n```json\n{input}\n```"));
+                }
+                ContentType::ToolResult => {
+                    let name = c.name.as_deref().unwrap_or("tool");
+                    let body = c.text.as_deref().unwrap_or("");
+                    let err = if c.is_error { " (error)" } else { "" };
+                    parts.push(format!("**Tool result `{name}`{err}**\n\n```\n{body}\n```"));
+                }
+                _ => {}
+            }
+        }
+        if parts.is_empty() {
             continue;
         }
         out.push_str(&format!("## {}\n\n", role));
-        for text in texts {
-            out.push_str(&text);
+        for part in parts {
+            out.push_str(&part);
             out.push_str("\n\n");
         }
     }
 
     out
+}
+
+/// Full structured JSON export (includes tool results, call tree, todos).
+pub fn export_json(data: &SessionData) -> Result<String, String> {
+    serde_json::to_string_pretty(data).map_err(|e| e.to_string())
+}
+
+/// Self-contained HTML export for sharing.
+pub fn export_html(data: &SessionData) -> String {
+    let title = html_escape(data.title.as_deref().unwrap_or(&data.id));
+    let mut body = String::new();
+    for msg in &data.messages {
+        let role = match msg.role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+        };
+        let mut inner = String::new();
+        for c in &msg.content {
+            match c.content_type {
+                ContentType::Text => {
+                    if let Some(ref t) = c.text {
+                        if !t.trim().is_empty() {
+                            inner.push_str(&format!("<pre class=\"text\">{}</pre>", html_escape(t)));
+                        }
+                    }
+                }
+                ContentType::Thinking => {
+                    if let Some(ref t) = c.thinking {
+                        if !t.trim().is_empty() {
+                            inner.push_str(&format!(
+                                "<details><summary>thinking</summary><pre>{}</pre></details>",
+                                html_escape(t)
+                            ));
+                        }
+                    }
+                }
+                ContentType::ToolUse => {
+                    let name = html_escape(c.name.as_deref().unwrap_or("tool"));
+                    let input = c
+                        .input
+                        .as_ref()
+                        .map(|v| serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()))
+                        .unwrap_or_default();
+                    inner.push_str(&format!(
+                        "<div class=\"tool-use\"><strong>tool {}</strong><pre>{}</pre></div>",
+                        name,
+                        html_escape(&input)
+                    ));
+                }
+                ContentType::ToolResult => {
+                    let name = html_escape(c.name.as_deref().unwrap_or("tool"));
+                    let body_t = html_escape(c.text.as_deref().unwrap_or(""));
+                    let cls = if c.is_error { "tool-result error" } else { "tool-result" };
+                    inner.push_str(&format!(
+                        "<div class=\"{cls}\"><strong>result {name}</strong><pre>{body_t}</pre></div>"
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if inner.is_empty() {
+            continue;
+        }
+        body.push_str(&format!("<section class=\"msg {role}\"><h2>{role}</h2>{inner}</section>\n"));
+    }
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>{title}</title>
+<style>
+body {{ font-family: ui-sans-serif, system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; background: #0f1115; color: #e6e6e6; }}
+h1 {{ font-size: 1.4rem; }}
+.meta {{ color: #9aa; font-size: 0.9rem; }}
+section.msg {{ border: 1px solid #2a2f3a; border-radius: 8px; padding: 0.75rem 1rem; margin: 1rem 0; }}
+section.user {{ border-color: #3a5a8a; }}
+section.assistant {{ border-color: #3a7a5a; }}
+section.tool {{ border-color: #6a5a3a; }}
+h2 {{ margin: 0 0 0.5rem; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.04em; color: #9aa; }}
+pre {{ white-space: pre-wrap; word-break: break-word; background: #161a22; padding: 0.6rem; border-radius: 6px; overflow-x: auto; }}
+.tool-result.error {{ border-left: 3px solid #c44; padding-left: 0.5rem; }}
+</style>
+</head>
+<body>
+<h1>{title}</h1>
+<p class="meta">Session {id} · {provider}/{model} · {created} · {tin} in / {tout} out</p>
+{body}
+</body>
+</html>
+"#,
+        title = title,
+        id = html_escape(&data.id),
+        provider = html_escape(&data.provider),
+        model = html_escape(&data.model),
+        created = html_escape(&data.created_at),
+        tin = data.total_input_tokens,
+        tout = data.total_output_tokens,
+        body = body,
+    )
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 pub struct SessionStore {
@@ -200,6 +352,58 @@ impl SessionStore {
         fs::remove_file(&path).map_err(|e| format!("Failed to delete session '{}': {}", id, e))
     }
 
+    /// Fork a session: copy transcript into a new id with `parent_id` set.
+    pub fn fork(&self, source_id: &str, branch_label: Option<String>) -> Result<SessionData, String> {
+        self.fork_at(source_id, None, branch_label)
+    }
+
+    /// Fork a session, optionally truncating to the first `at` messages
+    /// (timeline "fork from here"). `at = None` copies the full transcript.
+    pub fn fork_at(
+        &self,
+        source_id: &str,
+        at: Option<usize>,
+        branch_label: Option<String>,
+    ) -> Result<SessionData, String> {
+        let mut data = self.load(source_id)?;
+        if let Some(n) = at {
+            if n > data.messages.len() {
+                return Err(format!(
+                    "fork_at index {n} out of range (session has {} messages)",
+                    data.messages.len()
+                ));
+            }
+            data.messages.truncate(n);
+        }
+        let parent = data.id.clone();
+        let new_id = Self::generate_id();
+        // Avoid colliding with an existing id in the same second
+        let new_id = if self.exists(&new_id) {
+            format!("{}_{}", new_id, &uuid::Uuid::new_v4().to_string()[..8])
+        } else {
+            new_id
+        };
+        data.parent_id = Some(parent.clone());
+        data.branch_label = branch_label.clone();
+        data.id = new_id;
+        let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        data.created_at = now.clone();
+        data.updated_at = now;
+        let base_title = data
+            .title
+            .clone()
+            .unwrap_or_else(|| parent.clone());
+        let fork_label = match (&branch_label, at) {
+            (Some(label), Some(n)) if !label.is_empty() => format!("{} [@{}]", label, n),
+            (Some(label), _) if !label.is_empty() => label.clone(),
+            (_, Some(n)) => format!("@{}", n),
+            _ => "fork".into(),
+        };
+        data.title = Some(format!("{} [{}]", base_title, fork_label));
+        self.save(&data)?;
+        Ok(data)
+    }
+
     /// Like [`Self::list`], but loads each session and returns lightweight
     /// summaries (title, model, last-updated, message count) instead of
     /// bare IDs. Sessions that fail to parse are skipped.
@@ -215,6 +419,8 @@ impl SessionStore {
                     model: data.model,
                     updated_at: data.updated_at,
                     message_count: data.messages.len(),
+                    parent_id: data.parent_id,
+                    branch_label: data.branch_label,
                 })
             })
             .collect();
@@ -253,6 +459,8 @@ mod tests {
         SessionData {
             id: id.to_string(),
             title: None,
+            parent_id: None,
+            branch_label: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:05:00Z".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
@@ -265,6 +473,7 @@ mod tests {
             total_input_tokens: 100,
             total_output_tokens: 50,
             call_tree: None,
+            todos: None,
         }
     }
 
@@ -432,5 +641,37 @@ mod tests {
         let store = SessionStore::for_dir(tmp.path().join("nonexistent"));
         let summaries = store.list_summaries().expect("should succeed on empty dir");
         assert!(summaries.is_empty());
+    }
+
+    #[test]
+    fn fork_copies_messages_and_sets_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::for_dir(tmp.path());
+        let mut src = sample_session("session_src");
+        src.title = Some("Original".into());
+        store.save(&src).unwrap();
+
+        let forked = store.fork("session_src", Some("experiment".into())).unwrap();
+        assert_ne!(forked.id, "session_src");
+        assert_eq!(forked.parent_id.as_deref(), Some("session_src"));
+        assert_eq!(forked.branch_label.as_deref(), Some("experiment"));
+        assert_eq!(forked.messages.len(), src.messages.len());
+        assert!(forked.title.as_deref().unwrap().contains("experiment"));
+        assert!(store.exists(&forked.id));
+    }
+
+    #[test]
+    fn fork_at_truncates_messages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::for_dir(tmp.path());
+        let src = sample_session("session_long");
+        let n = src.messages.len();
+        assert!(n >= 1);
+        store.save(&src).unwrap();
+
+        let forked = store.fork_at("session_long", Some(1), Some("at1".into())).unwrap();
+        assert_eq!(forked.messages.len(), 1.min(n));
+        assert_eq!(forked.parent_id.as_deref(), Some("session_long"));
+        assert!(forked.title.as_deref().unwrap().contains("@1"));
     }
 }

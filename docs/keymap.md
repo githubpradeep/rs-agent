@@ -104,6 +104,12 @@ Secrets do not overwrite env vars that are already set.
 | Mouse click on a `⚙ ...` / `⚠ ...` line | Toggle that tool result block open/closed |
 | Mouse scroll | Scroll chat history |
 
+Mouse capture is on by default (so the app can handle those clicks/scrolls), which
+means plain drag-to-select is taken by the TUI. **Shift+drag** still selects text in
+most terminals (Terminal.app, iTerm2, Alacritty, Kitty, …). To turn mouse capture off
+entirely and restore normal selection/scroll, set `disable_mouse = true` in
+`~/.rs-agent/config.toml` (keyboard toggles `t` / `e` and PgUp/PgDn still work).
+
 ## Collapsible tool result blocks
 
 Each tool call's result renders as its own collapsible block under the message that triggered
@@ -125,9 +131,10 @@ the tool name and elapsed seconds, e.g. `⠋ bash (2.3s)`, so long-running tools
 
 ## Live `/tree` side panel
 
-`/tree` (or the `T` key in normal mode) toggles a right-hand side panel showing the full RLM
+`/tree` (or the `T` key in normal mode) toggles a right-hand side panel showing the full Deep Context
 call tree (root → agent/llm/repl sub-calls, with `…`/`✓`/`✗`/`⊘` status markers), not just the
-one-line breadcrumb in the status bar. The panel updates live as sub-calls spawn and finish; when
+one-line breadcrumb in the status bar. The panel auto-opens when `repl` starts; status bar shows
+`[D]` while Deep Context is active. The panel updates live as sub-calls spawn and finish; when
 idle with no active run it falls back to the last saved snapshot for the session, if any.
 
 ## REPL output panel
@@ -146,7 +153,7 @@ Set a persistent default via `theme = "dark"` (or `"light"` / `"forest"`) in
 ## Configurable keybindings
 
 The single-key bindings shown throughout this doc (`insert`, `quit`, `toggle_thinking`,
-`jump_bottom`, `expand_tool`, `toggle_tree`, `perm_once`, `perm_always`, `perm_deny`) can be
+`jump_bottom`, `expand_tool`, `toggle_tree`, `perm_once`, `perm_always`, `perm_path`, `perm_deny`) can be
 remapped in `~/.rs-agent/config.toml`:
 
 ```toml
@@ -159,6 +166,7 @@ expand_tool = "e"
 toggle_tree = "T"
 perm_once = "a"
 perm_always = "t"
+perm_path = "p"
 perm_deny = "d"
 ```
 
@@ -168,7 +176,7 @@ to see the bindings actually in effect for the current session.
 ## Permission prompts
 
 When a tool needs approval (anything not auto-allowed under `-a`/`--approve` or `--auto-mode`, and
-not already covered by an already-trusted project), a prompt overlay appears showing the tool
+not already covered by an already-trusted project **or a path-scoped allow**), a prompt overlay appears showing the tool
 name, a pretty-printed (or raw, if not JSON) preview of its input truncated to a sensible size,
 and — for commands flagged as risky (e.g. destructive shell commands) — a red `DANGEROUS` warning
 with the reason:
@@ -176,15 +184,17 @@ with the reason:
 | Key | Action |
 |-----|--------|
 | `a` / `Enter` | Allow this one call only |
+| `p` | Path allow — remember this tool under the file's parent directory (`~/.rs-agent/permissions.json`) |
 | `t` | Trust this project — allow this and future calls here without prompting again |
 | `d` / `Esc` | Deny |
 
-(These letters follow the `perm_once` / `perm_always` / `perm_deny` bindings above, so they move
+(These letters follow the `perm_once` / `perm_path` / `perm_always` / `perm_deny` bindings above, so they move
 if you remap those actions.)
 
-Trust decisions are stored per-project in `~/.rs-agent/trust.json`. See the README's CLI options
-table for `-a`/`--approve` (skip all prompts) and `--auto-mode` (auto-approve read-only tools
-only) — both are shown as `YOLO` in the status bar.
+Project trust lives in `~/.rs-agent/trust.json`; path-scoped allows in `~/.rs-agent/permissions.json`.
+`/trust list` shows both. See the README's CLI options table for `-a`/`--approve` (skip all prompts)
+and `--auto-mode` (AUTO: file tools + reads; still prompts for bash/repl) — status bar shows
+`YOLO` vs `AUTO` respectively.
 
 ## Slash commands
 
@@ -208,8 +218,9 @@ Typed in insert mode, run on `Enter`.
 | `/theme [dark\|light\|forest]` | Switch (or show) the TUI color theme |
 | `/compact` | Compact/summarize the conversation to reclaim context |
 | `/new` | Start a fresh session (new session id) |
-| `/sessions` | List saved sessions |
-| `/export` | Export the current session transcript to markdown |
+| `/fork [label]` | Fork current session (same messages; new id + parent) |
+| `/sessions` | List saved sessions (shows fork parent when present) |
+| `/export [md\|json\|html]` | Export the current session transcript (markdown default; json/html for sharing) |
 | `/trust list\|reset` | Manage the per-project trust store |
 | `/rename <title>` | Rename the current session |
 | `/history [query\|n]` | Browse/search/recall input history |

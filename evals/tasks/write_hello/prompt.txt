@@ -1,0 +1,6 @@
+Create a file named hello.txt in the current directory.
+It must contain exactly this single line (no extra blank lines):
+
+hello-from-rs-agent
+
+Do not print poetry. Use the write tool. Stop when the file exists.

@@ -13,6 +13,8 @@ pub struct AgentState {
     pub total_input_tokens: usize,
     pub total_output_tokens: usize,
     pub mode: AgentMode,
+    /// Active skill tool allow-list (Skills 2.0). Empty = unrestricted.
+    pub skill_tools: Vec<String>,
 }
 
 impl AgentState {
@@ -26,6 +28,7 @@ impl AgentState {
             total_input_tokens: 0,
             total_output_tokens: 0,
             mode: AgentMode::Agent,
+            skill_tools: Vec::new(),
         }
     }
 
@@ -46,6 +49,30 @@ impl AgentState {
 
     pub fn set_mode(&mut self, mode: AgentMode) {
         self.mode = mode;
+    }
+
+    pub fn set_skill_tools(&mut self, tools: Vec<String>) {
+        self.skill_tools = tools
+            .into_iter()
+            .map(|t| t.trim().to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+    }
+
+    pub fn clear_skill_tools(&mut self) {
+        self.skill_tools.clear();
+    }
+
+    /// Mode + optional skill allow-list.
+    pub fn allows_tool(&self, name: &str) -> bool {
+        if !self.mode.allows_tool(name) {
+            return false;
+        }
+        if self.skill_tools.is_empty() {
+            return true;
+        }
+        let lower = name.to_lowercase();
+        self.skill_tools.iter().any(|t| t == &lower || lower.starts_with(&format!("{t}__")))
     }
 
     pub fn add_message(&mut self, msg: Message) {

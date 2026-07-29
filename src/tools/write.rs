@@ -44,9 +44,17 @@ impl AgentTool for WriteTool {
     }
 
     async fn execute(&self, _tool_call_id: &str, args: Value) -> ToolExecuteResult {
-        let parsed: WriteArgs = match serde_json::from_value(args) {
+        let args = crate::tools::normalize_file_tool_args(args);
+        let parsed: WriteArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolExecuteResult::error(format!("Invalid args: {}", e)),
+            Err(e) => {
+                return ToolExecuteResult::error(format!(
+                    "Invalid args: {e}. Expected file_path + content (aliases: path, contents). Got keys: {}",
+                    args.as_object()
+                        .map(|m| m.keys().cloned().collect::<Vec<_>>().join(", "))
+                        .unwrap_or_else(|| "(not an object)".into())
+                ))
+            }
         };
 
         if let Some(parent) = std::path::Path::new(&parsed.file_path).parent() {
