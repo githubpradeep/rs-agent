@@ -86,6 +86,42 @@ pub fn truncate_tool_output(s: &str, max: usize) -> String {
     format!("{}{}{}", head, marker, tail)
 }
 
+/// Snap a compaction cut so kept messages never start mid tool-call cycle.
+///
+/// Prefer the next `User` turn boundary; otherwise walk back over trailing
+/// `Tool` messages to their owning `Assistant` so OpenAI-compat providers
+/// still see `tool_calls` before `role:tool`.
+pub(crate) fn snap_compact_split(messages: &[Message], budget_split: usize) -> usize {
+    let total = messages.len();
+    if total == 0 {
+        return 0;
+    }
+    let mut split = budget_split.min(total);
+
+    for i in split..total {
+        if messages[i].role == Role::User {
+            return i;
+        }
+    }
+
+    // No user after the cut — don't leave orphan tool results at the head of
+    // the kept window.
+    while split < total && messages[split].role == Role::Tool {
+        if split > 0 {
+            let mut back = split;
+            while back > 0 && messages[back].role == Role::Tool {
+                back -= 1;
+            }
+            if messages[back].role == Role::Assistant {
+                return back;
+            }
+        }
+        // Owning assistant not found — push orphan tools into the summarize side.
+        split += 1;
+    }
+    split
+}
+
 const MAX_TOOL_OUTPUT_CHARS: usize = 100_000;
 
 pub struct AgentLoop {
@@ -379,10 +415,12 @@ impl AgentLoop {
             Err(e) if e == "aborted" => {
                 // OpenCode: unsettled tools become interrupted error results so the
                 // next turn never sends unpaired tool_use to the provider.
-                let n = self.state.settle_dangling_tools();
-                if n > 0 {
+                let (syn, drop) = self.state.repair_tool_pairing();
+                if syn > 0 || drop > 0 {
                     callback(AgentEvent::Status {
-                        message: format!("settled {n} interrupted tool call(s)"),
+                        message: format!(
+                            "repaired tool history on abort ({syn} synthesized, {drop} dropped)"
+                        ),
                     });
                 }
                 callback(AgentEvent::Aborted);
@@ -414,11 +452,13 @@ impl AgentLoop {
             });
             match self.run_loop(callback).await {
                 Ok(()) => {}
-            Err(e) if e == "aborted" => {
-                    let n = self.state.settle_dangling_tools();
-                    if n > 0 {
+                Err(e) if e == "aborted" => {
+                    let (syn, drop) = self.state.repair_tool_pairing();
+                    if syn > 0 || drop > 0 {
                         callback(AgentEvent::Status {
-                            message: format!("settled {n} interrupted tool call(s)"),
+                            message: format!(
+                                "repaired tool history on abort ({syn} synthesized, {drop} dropped)"
+                            ),
                         });
                     }
                     callback(AgentEvent::Aborted);
@@ -490,10 +530,14 @@ impl AgentLoop {
         for _ in 0..self.max_iterations {
             self.check_aborted()?;
             // Guarantee tool_use/tool_result pairing before every LLM call.
-            let settled = self.state.settle_dangling_tools();
-            if settled > 0 {
+            // Compaction / harness nudges can otherwise leave orphan `role:tool`
+            // messages that OpenCode Zen rejects with HTTP 400.
+            let (synthesized, dropped) = self.state.repair_tool_pairing();
+            if synthesized > 0 || dropped > 0 {
                 callback(AgentEvent::Status {
-                    message: format!("settled {settled} dangling tool call(s)"),
+                    message: format!(
+                        "repaired tool history ({synthesized} synthesized, {dropped} orphan(s) dropped)"
+                    ),
                 });
             }
             self.inject_steer_messages(callback);
@@ -1005,13 +1049,9 @@ impl AgentLoop {
             split = i;
         }
 
-        // Adjust split to nearest user message boundary (turn boundary)
-        for i in split..total {
-            if self.state.messages[i].role == Role::User {
-                split = i;
-                break;
-            }
-        }
+        // Adjust split to a provider-safe boundary: never keep a `tool` message
+        // without its preceding assistant `tool_calls` (OpenAI/DeepSeek 400).
+        let split = snap_compact_split(&self.state.messages, split);
 
         if split <= self.compacted_up_to {
             return Ok(());
@@ -1157,6 +1197,8 @@ impl AgentLoop {
         self.state.messages.clear();
         self.state.messages.push(summary_msg);
         self.state.messages.extend(keep_msgs);
+        // Drop any orphan tools that slipped through the split heuristic.
+        let _ = self.state.repair_tool_pairing();
         self.compacted_up_to = 1;
 
         callback(AgentEvent::Compacted { summary });
@@ -1282,6 +1324,83 @@ impl AgentLoop {
 #[cfg(test)]
 mod tool_output_truncation_tests {
     use super::truncate_tool_output;
+    use super::snap_compact_split;
+    use crate::ai::types::*;
+
+    #[test]
+    fn snap_keeps_user_boundary() {
+        let msgs = vec![
+            Message {
+                role: Role::User,
+                content: vec![Content {
+                    content_type: ContentType::Text,
+                    text: Some("a".into()),
+                    ..Default::default()
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![Content {
+                    content_type: ContentType::ToolUse,
+                    id: Some("1".into()),
+                    name: Some("bash".into()),
+                    ..Default::default()
+                }],
+            },
+            Message {
+                role: Role::Tool,
+                content: vec![Content {
+                    content_type: ContentType::ToolResult,
+                    tool_use_id: Some("1".into()),
+                    text: Some("ok".into()),
+                    ..Default::default()
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![Content {
+                    content_type: ContentType::Text,
+                    text: Some("b".into()),
+                    ..Default::default()
+                }],
+            },
+        ];
+        assert_eq!(snap_compact_split(&msgs, 2), 3);
+    }
+
+    #[test]
+    fn snap_walks_back_to_assistant_for_orphan_tools() {
+        let msgs = vec![
+            Message {
+                role: Role::User,
+                content: vec![Content {
+                    content_type: ContentType::Text,
+                    text: Some("a".into()),
+                    ..Default::default()
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![Content {
+                    content_type: ContentType::ToolUse,
+                    id: Some("1".into()),
+                    name: Some("repl".into()),
+                    ..Default::default()
+                }],
+            },
+            Message {
+                role: Role::Tool,
+                content: vec![Content {
+                    content_type: ContentType::ToolResult,
+                    tool_use_id: Some("1".into()),
+                    text: Some("ok".into()),
+                    ..Default::default()
+                }],
+            },
+        ];
+        // Budget cut on the tool result — snap back to its assistant.
+        assert_eq!(snap_compact_split(&msgs, 2), 1);
+    }
 
     #[test]
     fn leaves_short_output_untouched() {
