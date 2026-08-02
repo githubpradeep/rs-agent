@@ -1,0 +1,4 @@
+The file greet.py has trailing spaces on lines. Change the greeting to use f-string form:
+  msg = f"Hello, {name}"
+Use the edit tool (not write). Then run: python3 greet.py
+It must print: Hello, world

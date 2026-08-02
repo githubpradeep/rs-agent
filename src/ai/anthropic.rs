@@ -1,7 +1,7 @@
 use crate::ai::provider::{BoxStream, Provider};
+use crate::ai::sse::sse_delta_stream;
 use crate::ai::types::*;
 use async_trait::async_trait;
-use futures::StreamExt;
 use reqwest::Client;
 use std::time::Duration;
 
@@ -308,27 +308,10 @@ impl Provider for AnthropicProvider {
             });
         }
 
-        let stream = response.bytes_stream().flat_map(move |chunk| {
-            let result = match chunk {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    let mut deltas = Vec::new();
-                    for line in text.lines() {
-                        if let Some(delta) = parse_anthropic_stream_event(line) {
-                            deltas.push(delta);
-                        }
-                    }
-                    Ok(deltas)
-                }
-                Err(e) => Err(ProviderError::Stream(e.to_string())),
-            };
-            futures::stream::iter(match result {
-                Ok(deltas) => deltas.into_iter().map(Ok).collect::<Vec<_>>(),
-                Err(e) => vec![Err(e)],
-            })
-        });
-
-        let boxed: BoxStream = Box::pin(stream);
+        let boxed: BoxStream = Box::pin(sse_delta_stream(
+            response.bytes_stream(),
+            parse_anthropic_stream_event,
+        ));
         Ok(boxed)
     }
 

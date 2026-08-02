@@ -141,7 +141,7 @@ impl AgentTool for ReplTool {
         let node_id = self.tree.spawn(
             Some(&self.parent_node_id),
             crate::rlm::CallKind::Repl,
-            &parsed.code.chars().take(80).collect::<String>(),
+            &repl_task_label(&parsed.code),
         );
 
         let result = session
@@ -216,6 +216,28 @@ impl AgentTool for ReplTool {
             }
         }
     }
+}
+
+/// Short one-line label for a REPL node (avoid dumping code into Call Tree).
+fn repl_task_label(code: &str) -> String {
+    let first = code
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .unwrap_or("repl");
+    // Prefer a hint about what the code does.
+    let hint = if code.contains("llm_query") {
+        "llm_query"
+    } else if code.contains("agent_query") {
+        "agent_query"
+    } else if code.contains("FINAL") {
+        "FINAL"
+    } else if code.contains("load_file") || code.contains("load_dir") {
+        "load"
+    } else {
+        first
+    };
+    hint.chars().take(40).collect()
 }
 
 /// Attach RLM `repl` tool to an agent loop (and ensure root tree node).

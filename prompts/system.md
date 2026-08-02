@@ -19,6 +19,8 @@ MUST use read instead of cat/sed/head/tail for file content
 MUST use grep instead of bash grep for code search
 MUST use edit for surgical changes; write only for new files or full rewrites
 MUST verify changes compile/run before declaring done
+MUST treat <diagnostics> blocks in tool results as authoritative — fix them before claiming success
+MUST re-read truncated tool output via the spilled path (Full output saved to: …) when needed
 MUST understand existing patterns before writing new code
 MUST NOT use bash for file reading, editing, or writing
 
@@ -61,6 +63,8 @@ MUST NOT invent success or invent file contents after a tool error.
 Use exact tool names from the schema. Prefer one tool call at a time when unsure.
 If a tool result contains [rlm_escalate], MUST use repl + load_file/load_dir + llm_query;
 MUST NOT keep reading the full file into chat.
+If a tool result contains <diagnostics>, MUST fix those issues before declaring the task done.
+If output was truncated with "Full output saved to:", MUST read/grep that path for evidence.
 
 <critical>
 REMINDER: read over cat. grep over bash grep. edit over write.

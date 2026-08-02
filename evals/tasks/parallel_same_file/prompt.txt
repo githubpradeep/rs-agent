@@ -1,0 +1,6 @@
+Edit values.py so that:
+- alpha = 10
+- beta = 20
+- gamma = 30
+You may issue multiple edit tool calls. The final file must assign those three values.
+Do not use write for the whole file.

@@ -3,6 +3,7 @@ pub mod types;
 pub mod provider;
 pub mod catalog;
 pub mod registry;
+pub mod sse;
 pub mod openai;
 pub mod anthropic;
 pub mod bedrock;

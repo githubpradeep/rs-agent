@@ -6,7 +6,7 @@ use crate::agent::compact_pins::{
 };
 use crate::agent::repair::{
     is_weak_model, make_arg_parse_error_value, prepare_tool_args, resolve_tool,
-    tool_call_fingerprint, weak_model_system_note,
+    tool_call_fingerprint, tool_near_dupe_key, weak_model_system_note,
 };
 use crate::agent::rlm_escalate;
 use crate::agent::tool::{ToolExecutionMode, ToolExecuteResult};
@@ -108,6 +108,8 @@ pub struct AgentLoop {
     force_sequential: bool,
     /// Recent tool fingerprints for doom-loop detection.
     recent_tool_fps: std::sync::Mutex<std::collections::VecDeque<String>>,
+    /// Recent near-dupe keys (tool + path/cmd) for thrash detection.
+    recent_near_dupes: std::sync::Mutex<std::collections::VecDeque<String>>,
     /// Inject one-shot RLM escalate system note on the next model turn.
     rlm_escalate_hint_pending: std::sync::atomic::AtomicBool,
     rlm_escalate_hint_sent: std::sync::atomic::AtomicBool,
@@ -135,6 +137,7 @@ impl AgentLoop {
             event_sink: None,
             force_sequential,
             recent_tool_fps: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(4)),
+            recent_near_dupes: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(8)),
             rlm_escalate_hint_pending: std::sync::atomic::AtomicBool::new(false),
             rlm_escalate_hint_sent: std::sync::atomic::AtomicBool::new(false),
             hooks: HookRegistry::load(),
@@ -352,6 +355,7 @@ impl AgentLoop {
         callback: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<(), String> {
         self.abort.clear();
+        crate::tools::turn_snapshot::begin_turn();
         self.hooks.on_message(user_message);
         let user_msg = Message {
             role: Role::User,
@@ -373,6 +377,14 @@ impl AgentLoop {
         match self.run_loop(callback).await {
             Ok(()) => Ok(()),
             Err(e) if e == "aborted" => {
+                // OpenCode: unsettled tools become interrupted error results so the
+                // next turn never sends unpaired tool_use to the provider.
+                let n = self.state.settle_dangling_tools();
+                if n > 0 {
+                    callback(AgentEvent::Status {
+                        message: format!("settled {n} interrupted tool call(s)"),
+                    });
+                }
                 callback(AgentEvent::Aborted);
                 Ok(())
             }
@@ -402,7 +414,13 @@ impl AgentLoop {
             });
             match self.run_loop(callback).await {
                 Ok(()) => {}
-                Err(e) if e == "aborted" => {
+            Err(e) if e == "aborted" => {
+                    let n = self.state.settle_dangling_tools();
+                    if n > 0 {
+                        callback(AgentEvent::Status {
+                            message: format!("settled {n} interrupted tool call(s)"),
+                        });
+                    }
                     callback(AgentEvent::Aborted);
                     return Ok(());
                 }
@@ -433,6 +451,34 @@ impl AgentLoop {
         })
     }
 
+    /// Weak free models often emit plan-narration ("Let me explore…") with no tool
+    /// call and stall. Detect that so the harness can nudge.
+    fn looks_like_explore_spin(msg: &AssistantMessage) -> bool {
+        let text: String = msg
+            .content
+            .iter()
+            .filter(|c| c.content_type == ContentType::Text)
+            .filter_map(|c| c.text.as_deref())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        if text.trim().is_empty() || text.chars().count() > 800 {
+            return false;
+        }
+        let starters = [
+            "let me ",
+            "i'll ",
+            "i will ",
+            "i'm going to ",
+            "first,",
+            "first i",
+        ];
+        let has_starter = starters.iter().any(|s| text.contains(s));
+        let action_words = ["explore", "check", "look", "read", "examine", "see what's", "start by"];
+        let has_action = action_words.iter().any(|s| text.contains(s));
+        has_starter && has_action
+    }
+
     async fn run_loop(
         &mut self,
         callback: &mut (dyn FnMut(AgentEvent) + Send),
@@ -443,6 +489,13 @@ impl AgentLoop {
 
         for _ in 0..self.max_iterations {
             self.check_aborted()?;
+            // Guarantee tool_use/tool_result pairing before every LLM call.
+            let settled = self.state.settle_dangling_tools();
+            if settled > 0 {
+                callback(AgentEvent::Status {
+                    message: format!("settled {settled} dangling tool call(s)"),
+                });
+            }
             self.inject_steer_messages(callback);
 
             let used = self.state.estimated_context_tokens(&tool_defs_json);
@@ -501,16 +554,81 @@ impl AgentLoop {
                         attempt = self.blank_retries,
                         "empty assistant response; retrying"
                     );
-                    callback(AgentEvent::Error {
+                    // Status only — never AgentEvent::Error here. Error appends into
+                    // the last chat bubble and the retry then streams into the same
+                    // bubble ("❌ Error: Empty…Let me check…").
+                    callback(AgentEvent::Status {
                         message: format!(
-                            "Empty model response, retrying ({}/2)...",
+                            "empty model response, retrying ({}/2)…",
                             self.blank_retries
                         ),
+                    });
+                    // OpenCode-style nudge: make the emptiness visible to the model.
+                    self.state.add_message(Message {
+                        role: Role::User,
+                        content: vec![Content {
+                            content_type: ContentType::Text,
+                            text: Some(
+                                "[harness] Your previous reply was empty (no text, no tool call). \
+                                 Continue: either emit a <tool_call> or give a final answer."
+                                    .into(),
+                            ),
+                            ..Default::default()
+                        }],
                     });
                     continue;
                 }
                 self.blank_retries = 0;
-                self.state.add_assistant(&assistant_msg);
+
+                // Weak-model thrash: repeated "let me explore…" text turns with no tools.
+                if self.should_force_sequential()
+                    && Self::looks_like_explore_spin(&assistant_msg)
+                {
+                    if let Ok(mut recent) = self.recent_near_dupes.lock() {
+                        let key = "text_explore_spin".to_string();
+                        let streak = recent.iter().rev().take(3).filter(|p| *p == &key).count();
+                        recent.push_back(key);
+                        while recent.len() > 12 {
+                            recent.pop_front();
+                        }
+                        if streak >= 2 {
+                            // Store the spin text, then nudge once toward action.
+                            self.state.add_assistant(&assistant_msg);
+                            self.state.add_message(Message {
+                                role: Role::User,
+                                content: vec![Content {
+                                    content_type: ContentType::Text,
+                                    text: Some(
+                                        "[harness] Stop narrating plans. Call a tool now \
+                                         (read/ls/bash/repl) or give a concrete final answer."
+                                            .into(),
+                                    ),
+                                    ..Default::default()
+                                }],
+                            });
+                            callback(AgentEvent::Status {
+                                message: "nudged model out of explore-spin".into(),
+                            });
+                            continue;
+                        }
+                    }
+                }
+
+                // Thinking-only replies must still round-trip as a valid assistant
+                // message (content or tool_calls) on the next OpenAI-compat request.
+                let mut to_store = assistant_msg;
+                let has_text = to_store.content.iter().any(|c| {
+                    c.content_type == ContentType::Text
+                        && !c.text.as_deref().unwrap_or("").trim().is_empty()
+                });
+                if !has_text {
+                    to_store.content.push(Content {
+                        content_type: ContentType::Text,
+                        text: Some(String::new()),
+                        ..Default::default()
+                    });
+                }
+                self.state.add_assistant(&to_store);
                 callback(AgentEvent::Done);
                 return Ok(());
             }
@@ -616,7 +734,14 @@ impl AgentLoop {
             self.check_aborted()?;
             match self.provider.chat_stream(&api_key, request.clone()).await {
                 Ok(mut stream) => {
-                    let mut content_blocks: Vec<Option<Content>> = Vec::new();
+                    // Accumulate text/thinking by type, not by content_index.
+                    // OpenAI-compat streams (OpenCode/DeepSeek) use index 0 for both
+                    // thinking and text; sharing one slot dropped text from history
+                    // while still painting it in the TUI ("Empty model response").
+                    let mut text_buf = String::new();
+                    let mut thinking_buf = String::new();
+                    let mut thinking_signature: Option<String> = None;
+                    let mut tool_blocks: Vec<Option<Content>> = Vec::new();
                     let mut tool_arg_buf: Vec<String> = Vec::new();
                     let usage: Option<Usage> = None;
                     let mut stop_reason: Option<StopReason> = None;
@@ -630,51 +755,21 @@ impl AgentLoop {
                                 let idx = delta.content_index as usize;
                                 match delta.r#type {
                                     DeltaType::Text { text } => {
-                                        if content_blocks.len() <= idx {
-                                            content_blocks.resize(idx + 1, None);
-                                        }
                                         callback(AgentEvent::TextDelta { text: text.clone() });
-                                        if let Some(Some(b)) = content_blocks.get_mut(idx) {
-                                            if b.content_type == ContentType::Text {
-                                                let existing = b.text.take().unwrap_or_default();
-                                                b.text = Some(existing + &text);
-                                            }
-                                        } else {
-                                            content_blocks[idx] = Some(Content {
-                                                content_type: ContentType::Text,
-                                                text: Some(text),
-                                                ..Default::default()
-                                            });
-                                        }
+                                        text_buf.push_str(&text);
                                     }
                                     DeltaType::Thinking { thinking } => {
-                                        if content_blocks.len() <= idx {
-                                            content_blocks.resize(idx + 1, None);
-                                        }
                                         callback(AgentEvent::ThinkingDelta {
                                             thinking: thinking.clone(),
                                         });
-                                        if let Some(Some(b)) = content_blocks.get_mut(idx) {
-                                            if b.content_type == ContentType::Thinking {
-                                                let existing = b.thinking.take().unwrap_or_default();
-                                                b.thinking = Some(existing + &thinking);
-                                            }
-                                        } else {
-                                            content_blocks[idx] = Some(Content {
-                                                content_type: ContentType::Thinking,
-                                                thinking: Some(thinking),
-                                                ..Default::default()
-                                            });
-                                        }
+                                        thinking_buf.push_str(&thinking);
                                     }
                                     DeltaType::Signature { signature } => {
-                                        if let Some(Some(b)) = content_blocks.get_mut(idx) {
-                                            b.signature = Some(signature);
-                                        }
+                                        thinking_signature = Some(signature);
                                     }
                                     DeltaType::ToolCallStart { id, name, input } => {
-                                        if content_blocks.len() <= idx {
-                                            content_blocks.resize(idx + 1, None);
+                                        if tool_blocks.len() <= idx {
+                                            tool_blocks.resize(idx + 1, None);
                                         }
                                         if tool_arg_buf.len() <= idx {
                                             tool_arg_buf.resize(idx + 1, String::new());
@@ -683,7 +778,7 @@ impl AgentLoop {
                                             id: id.clone(),
                                             name: name.clone(),
                                         });
-                                        content_blocks[idx] = Some(Content {
+                                        tool_blocks[idx] = Some(Content {
                                             content_type: ContentType::ToolUse,
                                             id: Some(id),
                                             name: Some(name),
@@ -734,24 +829,37 @@ impl AgentLoop {
                         continue;
                     }
 
-                    for (i, block) in content_blocks.iter_mut().enumerate() {
+                    for (i, block) in tool_blocks.iter_mut().enumerate() {
                         if let Some(b) = block {
-                            if b.content_type == ContentType::ToolUse {
-                                if let Some(raw) = tool_arg_buf.get(i) {
-                                    b.input = Some(match serde_json::from_str(raw) {
-                                        Ok(v) => v,
-                                        Err(e) => make_arg_parse_error_value(
-                                            &e.to_string(),
-                                            raw,
-                                        ),
-                                    });
-                                }
+                            if let Some(raw) = tool_arg_buf.get(i) {
+                                b.input = Some(match serde_json::from_str(raw) {
+                                    Ok(v) => v,
+                                    Err(e) => make_arg_parse_error_value(&e.to_string(), raw),
+                                });
                             }
                         }
                     }
 
+                    let mut content = Vec::new();
+                    if !thinking_buf.is_empty() {
+                        content.push(Content {
+                            content_type: ContentType::Thinking,
+                            thinking: Some(thinking_buf),
+                            signature: thinking_signature,
+                            ..Default::default()
+                        });
+                    }
+                    if !text_buf.is_empty() {
+                        content.push(Content {
+                            content_type: ContentType::Text,
+                            text: Some(text_buf),
+                            ..Default::default()
+                        });
+                    }
+                    content.extend(tool_blocks.into_iter().flatten());
+
                     return Ok(AssistantMessage {
-                        content: content_blocks.into_iter().flatten().collect(),
+                        content,
                         stop_reason,
                         usage,
                         model,
@@ -848,9 +956,22 @@ impl AgentLoop {
 
     fn store_tool_result(&mut self, id: &str, name: &str, content: &str, is_error: bool) {
         let original_len = content.chars().count();
-        let mut stored = truncate_tool_output(content, MAX_TOOL_OUTPUT_CHARS);
-        if stored.chars().count() < original_len {
-            stored = rlm_escalate::append_truncate_escalate_hint(name, &stored, original_len);
+        // Prefer durable spill when over line/byte limits; fall back to head+tail char cap.
+        let spilled = crate::tools::truncate_store::truncate_or_spill(content);
+        let mut stored = if spilled.truncated {
+            spilled.content
+        } else if original_len > MAX_TOOL_OUTPUT_CHARS {
+            truncate_tool_output(content, MAX_TOOL_OUTPUT_CHARS)
+        } else {
+            content.to_string()
+        };
+        if stored.chars().count() < original_len
+            || spilled.truncated
+        {
+            // RLM escalate only when we dropped body without a spill path (char-cap path).
+            if spilled.output_path.is_none() && stored.chars().count() < original_len {
+                stored = rlm_escalate::append_truncate_escalate_hint(name, &stored, original_len);
+            }
         }
         if rlm_escalate::content_has_escalate(&stored) {
             self.rlm_escalate_hint_pending
@@ -1084,7 +1205,7 @@ impl AgentLoop {
             let same_streak = recent.iter().rev().take(3).filter(|p| *p == &fp).count();
             if same_streak >= 3 {
                 return ToolExecuteResult::error(format!(
-                    "Repeated identical `{resolved_name}` call detected (doom loop).\n\
+                    "STUCK: Repeated identical `{resolved_name}` call detected (doom loop).\n\
                      Change your approach: different arguments, another tool, or ask the user.\n\
                      Do not retry the exact same call again."
                 ));
@@ -1092,6 +1213,23 @@ impl AgentLoop {
             recent.push_back(fp);
             while recent.len() > 6 {
                 recent.pop_front();
+            }
+        }
+
+        let near = tool_near_dupe_key(&resolved_name, &args);
+        if !near.ends_with('|') {
+            if let Ok(mut recent) = self.recent_near_dupes.lock() {
+                let streak = recent.iter().rev().take(4).filter(|p| *p == &near).count();
+                if streak >= 4 {
+                    return ToolExecuteResult::error(format!(
+                        "STUCK: repeated `{resolved_name}` on the same target ({near}).\n\
+                         Change approach — different path, different strategy, or ask the user."
+                    ));
+                }
+                recent.push_back(near);
+                while recent.len() > 12 {
+                    recent.pop_front();
+                }
             }
         }
 

@@ -21,7 +21,7 @@ ONLY=""
 WITH_NETWORK=0
 LIST=0
 
-CORE_TASKS=(write_hello fix_bug find_secret rlm_needle rlm_escalate)
+CORE_TASKS=(write_hello fix_bug find_secret rlm_needle rlm_escalate edit_whitespace_drift post_edit_type_error bash_long_output parallel_same_file)
 NETWORK_TASKS=(webfetch_title)
 
 while [[ $# -gt 0 ]]; do

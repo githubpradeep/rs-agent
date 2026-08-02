@@ -98,6 +98,57 @@ impl AgentState {
         self.messages.push(msg);
     }
 
+    /// OpenCode-style dangling tool settlement: every `tool_use` must have a
+    /// matching `tool_result` before the next LLM call (Anthropic/DeepSeek reject
+    /// unpaired tool_use). Inject synthetic interrupted/error results for orphans.
+    pub fn settle_dangling_tools(&mut self) -> usize {
+        use std::collections::HashSet;
+        let mut pending: Vec<(String, String)> = Vec::new();
+        let mut answered: HashSet<String> = HashSet::new();
+
+        for msg in &self.messages {
+            match msg.role {
+                Role::Assistant => {
+                    for c in &msg.content {
+                        if c.content_type == ContentType::ToolUse {
+                            if let Some(id) = c.id.as_ref() {
+                                pending.push((
+                                    id.clone(),
+                                    c.name.clone().unwrap_or_else(|| "unknown".into()),
+                                ));
+                            }
+                        }
+                    }
+                }
+                Role::Tool => {
+                    for c in &msg.content {
+                        if c.content_type == ContentType::ToolResult {
+                            if let Some(id) = c.tool_use_id.as_ref() {
+                                answered.insert(id.clone());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut settled = 0usize;
+        for (id, name) in pending {
+            if answered.contains(&id) {
+                continue;
+            }
+            self.add_tool_result(
+                id,
+                name,
+                "[Tool execution was interrupted]".to_string(),
+                true,
+            );
+            settled += 1;
+        }
+        settled
+    }
+
     pub fn add_assistant(&mut self, msg: &AssistantMessage) {
         if let Some(ref usage) = msg.usage {
             self.total_input_tokens += usage.input_tokens as usize;
@@ -127,5 +178,65 @@ impl AgentState {
             return 0.0;
         }
         (used as f64) / (limit as f64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settle_dangling_tools_injects_interrupted_results() {
+        let mut state = AgentState::new("m".into(), "p".into());
+        state.add_assistant(&AssistantMessage {
+            content: vec![
+                Content {
+                    content_type: ContentType::Text,
+                    text: Some("calling".into()),
+                    ..Default::default()
+                },
+                Content {
+                    content_type: ContentType::ToolUse,
+                    id: Some("call_1".into()),
+                    name: Some("bash".into()),
+                    input: Some(serde_json::json!({"command": "ls"})),
+                    ..Default::default()
+                },
+            ],
+            stop_reason: None,
+            usage: None,
+            model: "m".into(),
+            id: None,
+        });
+        assert_eq!(state.settle_dangling_tools(), 1);
+        assert_eq!(state.settle_dangling_tools(), 0); // already settled
+        let last = state.messages.last().unwrap();
+        assert_eq!(last.role, Role::Tool);
+        assert!(last.content[0]
+            .text
+            .as_deref()
+            .unwrap_or("")
+            .contains("interrupted"));
+        assert!(last.content[0].is_error);
+    }
+
+    #[test]
+    fn settle_skips_tools_that_already_have_results() {
+        let mut state = AgentState::new("m".into(), "p".into());
+        state.add_assistant(&AssistantMessage {
+            content: vec![Content {
+                content_type: ContentType::ToolUse,
+                id: Some("call_1".into()),
+                name: Some("bash".into()),
+                input: Some(serde_json::json!({})),
+                ..Default::default()
+            }],
+            stop_reason: None,
+            usage: None,
+            model: "m".into(),
+            id: None,
+        });
+        state.add_tool_result("call_1".into(), "bash".into(), "ok".into(), false);
+        assert_eq!(state.settle_dangling_tools(), 0);
     }
 }

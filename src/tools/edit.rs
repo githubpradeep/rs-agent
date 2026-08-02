@@ -2,6 +2,8 @@ use crate::agent::tool::*;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::VecDeque;
+use std::sync::Mutex;
 use tokio::fs;
 
 #[derive(Deserialize)]
@@ -29,6 +31,44 @@ pub struct EditHunk {
 
 pub struct EditTool;
 
+static NOOP_HISTORY: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+
+fn noop_fingerprint(path: &str, hunks: &[EditHunk]) -> String {
+    let mut s = path.to_string();
+    for h in hunks {
+        s.push('|');
+        s.push_str(&h.old_string);
+        s.push('>');
+        s.push_str(&h.new_string);
+        s.push_str(&format!(":{}", h.replace_all));
+    }
+    s
+}
+
+fn record_noop_and_check(fp: &str) -> Option<String> {
+    let mut g = NOOP_HISTORY.lock().ok()?;
+    g.push_back(fp.to_string());
+    while g.len() > 8 {
+        g.pop_front();
+    }
+    let count = g.iter().rev().take_while(|x| *x == fp).count();
+    if count >= 3 {
+        Some(
+            "No-op / identical edit payload repeated 3 times (noop loop).\n\
+             Re-read the file and change approach — do not retry the same edit."
+                .into(),
+        )
+    } else {
+        None
+    }
+}
+
+fn clear_noop_on_success() {
+    if let Ok(mut g) = NOOP_HISTORY.lock() {
+        g.clear();
+    }
+}
+
 #[async_trait]
 impl AgentTool for EditTool {
     fn name(&self) -> &str {
@@ -36,8 +76,8 @@ impl AgentTool for EditTool {
     }
 
     fn description(&self) -> &str {
-        "Edit a file using exact text replacement. Finds old_string and replaces it with new_string. \
-         old_string must match uniquely unless replace_all=true. \
+        "Edit a file using text replacement. Finds old_string and replaces it with new_string. \
+         old_string must match uniquely unless replace_all=true. Soft-matches whitespace/indent drift. \
          For several changes in one file, pass edits=[{old_string,new_string},...] instead."
     }
 
@@ -97,83 +137,112 @@ impl AgentTool for EditTool {
             }
         };
 
-        let content = match fs::read_to_string(&parsed.file_path).await {
-            Ok(c) => c,
-            Err(e) => {
-                return ToolExecuteResult::error(format!(
-                    "Failed to read {}: {}",
-                    parsed.file_path, e
-                ))
-            }
-        };
+        let path = parsed.file_path.clone();
+        crate::tools::mutation_queue::with_file_lock(&path, || async {
+            let _ = crate::tools::turn_snapshot::track(&path);
 
-        let hunks: Vec<EditHunk> = if let Some(edits) = parsed.edits {
-            if edits.is_empty() {
+            let raw = match fs::read(&path).await {
+                Ok(b) => b,
+                Err(e) => {
+                    return ToolExecuteResult::error(format!("Failed to read {}: {}", path, e));
+                }
+            };
+            let (bom, content_body) = strip_bom(&raw);
+            let (newline, content) = normalize_newlines(&content_body);
+
+            let hunks: Vec<EditHunk> = if let Some(edits) = parsed.edits {
+                if edits.is_empty() {
+                    return ToolExecuteResult::error(
+                        "edits array is empty. Pass at least one {old_string, new_string}.",
+                    );
+                }
+                edits
+            } else {
+                let old = match parsed.old_string {
+                    Some(s) if !s.is_empty() => s,
+                    _ => {
+                        return ToolExecuteResult::error(
+                            "Missing old_string (or provide non-empty edits[]).",
+                        )
+                    }
+                };
+                let new = match parsed.new_string {
+                    Some(s) => s,
+                    None => {
+                        return ToolExecuteResult::error("Missing new_string (or provide edits[]).")
+                    }
+                };
+                vec![EditHunk {
+                    old_string: old,
+                    new_string: new,
+                    replace_all: parsed.replace_all,
+                }]
+            };
+
+            let fp = noop_fingerprint(&path, &hunks);
+            let original = content.clone();
+            let mut content = content;
+            let mut total_replacements = 0usize;
+            let mut strategies_used = Vec::new();
+
+            for (i, hunk) in hunks.iter().enumerate() {
+                match apply_hunk_soft(&content, hunk) {
+                    Ok((next, n, strat)) => {
+                        content = next;
+                        total_replacements += n;
+                        strategies_used.push(strat);
+                    }
+                    Err(msg) => {
+                        return ToolExecuteResult::error(format!(
+                            "edit hunk {}/{} failed in {}:\n{}",
+                            i + 1,
+                            hunks.len(),
+                            path,
+                            msg
+                        ));
+                    }
+                }
+            }
+
+            if content == original {
+                if let Some(err) = record_noop_and_check(&fp) {
+                    return ToolExecuteResult::error(err);
+                }
                 return ToolExecuteResult::error(
-                    "edits array is empty. Pass at least one {old_string, new_string}.",
+                    "Edit applied but file content is unchanged (noop). Re-read and adjust old_string/new_string.",
                 );
             }
-            edits
-        } else {
-            let old = match parsed.old_string {
-                Some(s) if !s.is_empty() => s,
-                _ => {
-                    return ToolExecuteResult::error(
-                        "Missing old_string (or provide non-empty edits[]).",
-                    )
-                }
-            };
-            let new = match parsed.new_string {
-                Some(s) => s,
-                None => {
-                    return ToolExecuteResult::error("Missing new_string (or provide edits[]).")
-                }
-            };
-            vec![EditHunk {
-                old_string: old,
-                new_string: new,
-                replace_all: parsed.replace_all,
-            }]
-        };
+            clear_noop_on_success();
 
-        let original = content.clone();
-        let mut content = content;
-        let mut total_replacements = 0usize;
-        for (i, hunk) in hunks.iter().enumerate() {
-            match apply_hunk(&content, hunk) {
-                Ok((next, n)) => {
-                    content = next;
-                    total_replacements += n;
-                }
-                Err(msg) => {
-                    return ToolExecuteResult::error(format!(
-                        "edit hunk {}/{} failed in {}:\n{}",
-                        i + 1,
+            let diff = crate::tools::diffutil::unified_diff(&path, &original, &content);
+            let out_bytes = encode_with_bom_newline(&content, bom, newline);
+
+            match fs::write(&path, &out_bytes).await {
+                Ok(_) => {
+                    let soft_note = if strategies_used.iter().any(|s| *s != "exact") {
+                        format!(
+                            " (match strategy: {})",
+                            strategies_used.join(",")
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let body = format!(
+                        "Successfully edited {} ({} replacement{}, {} hunk{}){soft_note}\n\n{}",
+                        path,
+                        total_replacements,
+                        if total_replacements == 1 { "" } else { "s" },
                         hunks.len(),
-                        parsed.file_path,
-                        msg
-                    ));
+                        if hunks.len() == 1 { "" } else { "s" },
+                        diff,
+                    );
+                    let body = crate::tools::post_mutation::after_mutation(&path, body).await;
+                    ToolExecuteResult::ok(body)
                 }
+                Err(e) => ToolExecuteResult::error(format!("Failed to write {}: {}", path, e)),
             }
-        }
-
-        let diff = crate::tools::diffutil::unified_diff(&parsed.file_path, &original, &content);
-
-        match fs::write(&parsed.file_path, &content).await {
-            Ok(_) => ToolExecuteResult::ok(format!(
-                "Successfully edited {} ({} replacement{}, {} hunk{})\n\n{}",
-                parsed.file_path,
-                total_replacements,
-                if total_replacements == 1 { "" } else { "s" },
-                hunks.len(),
-                if hunks.len() == 1 { "" } else { "s" },
-                diff,
-            )),
-            Err(e) => ToolExecuteResult::error(format!(
-                "Failed to write {}: {}",
-                parsed.file_path, e
-            )),
-        }
+        })
+        .await
     }
 }
 
@@ -181,7 +250,9 @@ impl AgentTool for EditTool {
 pub fn preview_edit_diff(args: &Value) -> Option<String> {
     let args = crate::tools::normalize_file_tool_args(args.clone());
     let parsed: EditArgs = serde_json::from_value(args).ok()?;
-    let original = std::fs::read_to_string(&parsed.file_path).ok()?;
+    let raw = std::fs::read(&parsed.file_path).ok()?;
+    let (_bom, body) = strip_bom(&raw);
+    let (_nl, original) = normalize_newlines(&body);
     let hunks: Vec<EditHunk> = if let Some(edits) = parsed.edits {
         if edits.is_empty() {
             return None;
@@ -198,8 +269,8 @@ pub fn preview_edit_diff(args: &Value) -> Option<String> {
     };
     let mut content = original.clone();
     for hunk in &hunks {
-        match apply_hunk(&content, hunk) {
-            Ok((next, _)) => content = next,
+        match apply_hunk_soft(&content, hunk) {
+            Ok((next, _, _)) => content = next,
             Err(_) => return None,
         }
     }
@@ -211,7 +282,47 @@ pub fn preview_edit_diff(args: &Value) -> Option<String> {
     ))
 }
 
-fn apply_hunk(content: &str, hunk: &EditHunk) -> Result<(String, usize), String> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bom {
+    None,
+    Utf8,
+}
+
+fn strip_bom(raw: &[u8]) -> (Bom, String) {
+    if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        (
+            Bom::Utf8,
+            String::from_utf8_lossy(&raw[3..]).into_owned(),
+        )
+    } else {
+        (Bom::None, String::from_utf8_lossy(raw).into_owned())
+    }
+}
+
+fn normalize_newlines(s: &str) -> (&'static str, String) {
+    if s.contains("\r\n") {
+        ("\r\n", s.replace("\r\n", "\n"))
+    } else {
+        ("\n", s.to_string())
+    }
+}
+
+fn encode_with_bom_newline(content: &str, bom: Bom, newline: &str) -> Vec<u8> {
+    let body = if newline == "\r\n" {
+        content.replace('\n', "\r\n")
+    } else {
+        content.to_string()
+    };
+    let mut out = Vec::new();
+    if bom == Bom::Utf8 {
+        out.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+    }
+    out.extend_from_slice(body.as_bytes());
+    out
+}
+
+/// Progressive soft apply: exact → line-trim → whitespace-normalize → indent-flexible.
+fn apply_hunk_soft(content: &str, hunk: &EditHunk) -> Result<(String, usize, &'static str), String> {
     if hunk.old_string.is_empty() {
         return Err("old_string must not be empty".into());
     }
@@ -219,29 +330,238 @@ fn apply_hunk(content: &str, hunk: &EditHunk) -> Result<(String, usize), String>
         return Err("old_string and new_string are identical — nothing to change".into());
     }
 
-    let count = content.matches(&hunk.old_string).count();
-    if count == 0 {
-        return Err(format_not_found(content, &hunk.old_string));
+    // 1. Exact
+    if let Ok((next, n)) = apply_exact(content, &hunk.old_string, &hunk.new_string, hunk.replace_all)
+    {
+        return Ok((next, n, "exact"));
     }
-    if count > 1 && !hunk.replace_all {
+
+    // 2. Line-trimmed (trim_end per line)
+    if let Some((old_m, new_m)) = line_trim_pair(content, &hunk.old_string, &hunk.new_string) {
+        if let Ok((next, n)) = apply_exact(content, &old_m, &new_m, hunk.replace_all) {
+            return Ok((next, n, "line_trim"));
+        }
+    }
+
+    // 3. Whitespace-normalized
+    if let Some((next, n)) =
+        apply_whitespace_normalized(content, &hunk.old_string, &hunk.new_string, hunk.replace_all)
+    {
+        return Ok((next, n, "whitespace"));
+    }
+
+    // 4. Indentation-flexible
+    if let Some((next, n)) =
+        apply_indent_flexible(content, &hunk.old_string, &hunk.new_string, hunk.replace_all)
+    {
+        return Ok((next, n, "indent"));
+    }
+
+    Err(format_not_found(content, &hunk.old_string))
+}
+
+fn apply_exact(
+    content: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Result<(String, usize), String> {
+    let count = content.matches(old).count();
+    if count == 0 {
+        return Err("no exact match".into());
+    }
+    if count > 1 && !replace_all {
         return Err(format!(
             "Found {count} occurrences of old_string. Provide more surrounding context to uniquely \
              identify the match, or set replace_all=true to replace every occurrence."
         ));
     }
-
-    let new_content = if hunk.replace_all {
-        content.replace(&hunk.old_string, &hunk.new_string)
+    let new_content = if replace_all {
+        content.replace(old, new)
     } else {
-        content.replacen(&hunk.old_string, &hunk.new_string, 1)
+        content.replacen(old, new, 1)
     };
-    Ok((new_content, if hunk.replace_all { count } else { 1 }))
+    Ok((new_content, if replace_all { count } else { 1 }))
+}
+
+fn line_trim_pair(content: &str, old: &str, new: &str) -> Option<(String, String)> {
+    let old_lines: Vec<&str> = old.lines().collect();
+    if old_lines.is_empty() {
+        return None;
+    }
+    let file_lines: Vec<&str> = content.lines().collect();
+    let window = old_lines.len();
+    for start in 0..=file_lines.len().saturating_sub(window) {
+        let chunk = &file_lines[start..start + window];
+        let matches = chunk
+            .iter()
+            .zip(old_lines.iter())
+            .all(|(a, b)| a.trim_end() == b.trim_end());
+        if matches {
+            let found = chunk.join("\n");
+            // Preserve whether old ended with newline by not forcing it.
+            let new_adj = if old.ends_with('\n') && !new.ends_with('\n') {
+                format!("{new}\n")
+            } else {
+                new.to_string()
+            };
+            // Map new lines onto file indentation of first matched line if needed — keep as-is.
+            return Some((found, new_adj));
+        }
+    }
+    None
+}
+
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn apply_whitespace_normalized(
+    content: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Option<(String, usize)> {
+    let needle = collapse_ws(old);
+    if needle.is_empty() {
+        return None;
+    }
+    // Find regions by scanning line windows.
+    let old_lines: Vec<&str> = old.lines().collect();
+    let window = old_lines.len().max(1);
+    let file_lines: Vec<&str> = content.lines().collect();
+    let mut starts = Vec::new();
+    for start in 0..=file_lines.len().saturating_sub(window) {
+        let chunk = file_lines[start..start + window].join("\n");
+        if collapse_ws(&chunk) == needle {
+            starts.push(start);
+        }
+    }
+    if starts.is_empty() {
+        // try larger windows
+        for start in 0..file_lines.len() {
+            for end in (start + 1)..=file_lines.len().min(start + window + 3) {
+                let chunk = file_lines[start..end].join("\n");
+                if collapse_ws(&chunk) == needle {
+                    starts.push(start);
+                    break;
+                }
+            }
+        }
+        starts.sort();
+        starts.dedup();
+    }
+    if starts.is_empty() {
+        return None;
+    }
+    if starts.len() > 1 && !replace_all {
+        return None;
+    }
+
+    let mut result_lines: Vec<String> = file_lines.iter().map(|s| s.to_string()).collect();
+    let new_lines: Vec<String> = new.lines().map(|s| s.to_string()).collect();
+    // Apply from bottom so indices stay valid
+    let mut applied = 0usize;
+    for start in starts.into_iter().rev() {
+        let end = (start + window).min(result_lines.len());
+        // Expand end if collapse matched larger region — recompute
+        let mut end2 = end;
+        while end2 < result_lines.len()
+            && collapse_ws(&result_lines[start..end2].join("\n")) != needle
+        {
+            end2 += 1;
+            if end2 - start > window + 5 {
+                break;
+            }
+        }
+        if collapse_ws(&result_lines[start..end2.min(result_lines.len())].join("\n")) != needle {
+            // use window
+            result_lines.splice(start..end, new_lines.iter().cloned());
+        } else {
+            result_lines.splice(start..end2, new_lines.iter().cloned());
+        }
+        applied += 1;
+        if !replace_all {
+            break;
+        }
+    }
+    let mut out = result_lines.join("\n");
+    if content.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Some((out, applied))
+}
+
+fn apply_indent_flexible(
+    content: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Option<(String, usize)> {
+    let strip = |s: &str| -> String {
+        s.lines()
+            .map(|l| l.trim_start())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let needle = strip(old);
+    if needle.is_empty() {
+        return None;
+    }
+    let old_lines: Vec<&str> = old.lines().collect();
+    let window = old_lines.len().max(1);
+    let file_lines: Vec<&str> = content.lines().collect();
+    let mut starts = Vec::new();
+    for start in 0..=file_lines.len().saturating_sub(window) {
+        let chunk = file_lines[start..start + window].join("\n");
+        if strip(&chunk) == needle {
+            starts.push(start);
+        }
+    }
+    if starts.is_empty() || (starts.len() > 1 && !replace_all) {
+        return None;
+    }
+
+    let mut result_lines: Vec<String> = file_lines.iter().map(|s| s.to_string()).collect();
+    let mut applied = 0usize;
+    for start in starts.into_iter().rev() {
+        let end = (start + window).min(result_lines.len());
+        let indent = leading_ws(result_lines.get(start).map(|s| s.as_str()).unwrap_or(""));
+        let new_block: Vec<String> = new
+            .lines()
+            .enumerate()
+            .map(|(i, l)| {
+                if i == 0 {
+                    format!("{indent}{}", l.trim_start())
+                } else {
+                    // preserve relative indent from new, rebased onto file indent of first line
+                    let rel = leading_ws(l);
+                    let trimmed = l.trim_start();
+                    format!("{indent}{rel}{trimmed}")
+                }
+            })
+            .collect();
+        result_lines.splice(start..end, new_block);
+        applied += 1;
+        if !replace_all {
+            break;
+        }
+    }
+    let mut out = result_lines.join("\n");
+    if content.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Some((out, applied))
+}
+
+fn leading_ws(s: &str) -> String {
+    s.chars().take_while(|c| *c == ' ' || *c == '\t').collect()
 }
 
 fn format_not_found(content: &str, old_string: &str) -> String {
     let mut msg = String::from(
-        "Could not find old_string (exact match).\n\
-         Tips: copy text from a recent read; include more surrounding lines; check whitespace.",
+        "Could not find old_string (tried exact, line-trim, whitespace, and indent-flexible match).\n\
+         Tips: copy text from a recent read; include more surrounding lines.",
     );
 
     if let Some(ws) = whitespace_flexible_hint(content, old_string) {
@@ -269,7 +589,6 @@ fn format_not_found(content: &str, old_string: &str) -> String {
     msg
 }
 
-/// If collapsing whitespace makes old_string appear, tell the model.
 fn whitespace_flexible_hint(content: &str, old_string: &str) -> Option<String> {
     let needle = collapse_ws(old_string);
     if needle.is_empty() {
@@ -280,14 +599,10 @@ fn whitespace_flexible_hint(content: &str, old_string: &str) -> Option<String> {
         return None;
     }
     Some(
-        "Note: a whitespace-insensitive match EXISTS. Your old_string likely has different \
-         spaces/tabs/newlines than the file. Re-read the exact lines and copy them verbatim."
+        "Note: a whitespace-insensitive match EXISTS but soft-apply could not uniquely bind it. \
+         Re-read the exact lines and copy them verbatim, or set replace_all=true."
             .into(),
     )
-}
-
-fn collapse_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 struct FuzzyHit {
@@ -295,7 +610,6 @@ struct FuzzyHit {
     snippet: String,
 }
 
-/// Find line-windows in `content` most similar to `old_string`.
 fn fuzzy_line_suggestions(content: &str, old_string: &str, limit: usize) -> Vec<FuzzyHit> {
     let needle_lines: Vec<&str> = old_string.lines().collect();
     let window = needle_lines.len().max(1);
@@ -317,7 +631,6 @@ fn fuzzy_line_suggestions(content: &str, old_string: &str, limit: usize) -> Vec<
         if score >= 0.45 {
             scored.push((score, start));
         }
-        // Also try slightly larger windows for multi-line drift
         if window > 1 && end + 1 <= file_lines.len() {
             let chunk2 = file_lines[start..end + 1].join("\n");
             let score2 = similarity(&needle_norm, &normalize_for_score(&chunk2));
@@ -344,7 +657,6 @@ fn normalize_for_score(s: &str) -> String {
     collapse_ws(s).to_lowercase()
 }
 
-/// Dice coefficient on character bigrams — cheap fuzzy similarity in [0,1].
 fn similarity(a: &str, b: &str) -> f64 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
@@ -363,7 +675,6 @@ fn similarity(a: &str, b: &str) -> f64 {
     let aa = bi(a);
     let bb = bi(b);
     if aa.is_empty() || bb.is_empty() {
-        // fall back to char overlap for short strings
         let set_a: std::collections::HashSet<char> = a.chars().collect();
         let set_b: std::collections::HashSet<char> = b.chars().collect();
         let inter = set_a.intersection(&set_b).count() as f64;
@@ -435,10 +746,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn whitespace_drift_applies() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.txt");
+        // File has trailing spaces; model old_string does not.
+        std::fs::write(&path, "hello world   \nfoo\n").unwrap();
+        let tool = EditTool;
+        let res = tool
+            .execute(
+                "1",
+                serde_json::json!({
+                    "file_path": path.to_str().unwrap(),
+                    "old_string": "hello world\n",
+                    "new_string": "hi world\n"
+                }),
+            )
+            .await;
+        assert!(!res.is_error, "{}", res.content);
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.starts_with("hi world"), "{out}");
+    }
+
+    #[tokio::test]
     async fn miss_includes_fuzzy_hint() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("t.txt");
-        std::fs::write(&path, "fn greet(name: &str) {\n    println!(\"hi {}\", name);\n}\n").unwrap();
+        std::fs::write(
+            &path,
+            "fn greet(name: &str) {\n    println!(\"hi {}\", name);\n}\n",
+        )
+        .unwrap();
         let tool = EditTool;
         let res = tool
             .execute(
@@ -452,7 +789,8 @@ mod tests {
             .await;
         assert!(res.is_error);
         assert!(
-            res.content.contains("Closest regions") || res.content.contains("whitespace-insensitive"),
+            res.content.contains("Closest regions")
+                || res.content.contains("whitespace-insensitive"),
             "{}",
             res.content
         );

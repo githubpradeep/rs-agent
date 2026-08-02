@@ -40,6 +40,10 @@ Exit code is non-zero if any task fails.
 | `find_secret` | Explore a small tree and recover a hidden token |
 | `rlm_needle` | RLM USP: load padded corpus in `repl`, find token, summarize slice |
 | `rlm_escalate` | Huge corpus (~90KB); agent should follow `[rlm_escalate]` / use `repl` |
+| `edit_whitespace_drift` | Soft edit apply when file has trailing whitespace drift |
+| `post_edit_type_error` | Fix after run/diagnostics feedback; don't stop on broken assert |
+| `bash_long_output` | Recover needle from spilled truncated bash output |
+| `parallel_same_file` | Multiple edits to one file leave a valid result |
 
 Optional / slower (opt-in):
 

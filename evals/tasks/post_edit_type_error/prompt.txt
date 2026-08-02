@@ -1,0 +1,3 @@
+Fix calc.py so add(2, 3) == 5. Use edit (not write). Run python3 calc.py and ensure it prints OK.
+If a tool result shows diagnostics or assertion errors, keep fixing until the run succeeds.
+Do not claim done while the assertion fails.

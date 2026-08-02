@@ -110,6 +110,16 @@ impl OpenCodeCliProvider {
                 };
                 for block in &msg.content {
                     match block.content_type {
+                        ContentType::Thinking => {
+                            if let Some(thinking) = &block.thinking {
+                                if !thinking.trim().is_empty() {
+                                    transcript.push(format!(
+                                        "<turn role=\"assistant\" kind=\"reasoning\">\n{}\n</turn>",
+                                        thinking.trim_end()
+                                    ));
+                                }
+                            }
+                        }
                         ContentType::Text => {
                             if let Some(text) = &block.text {
                                 // XML-ish tags — weak models echo "ASSISTANT:" / "---" from
@@ -175,10 +185,18 @@ impl OpenCodeCliProvider {
         if Self::is_transcript_echo_only(text) {
             return None;
         }
+        // Drop obvious tool-call JSON fragments that free models leak as text.
+        if Self::looks_like_tool_json_fragment(text) {
+            return None;
+        }
+
         let mut out = String::new();
         for line in text.lines() {
             let t = line.trim();
             if t.is_empty() || t == "---" || t == "====" {
+                continue;
+            }
+            if Self::looks_like_tool_json_fragment(t) {
                 continue;
             }
             if let Some(rest) = t
@@ -187,8 +205,8 @@ impl OpenCodeCliProvider {
                 .or_else(|| t.strip_prefix("SYSTEM:"))
             {
                 let rest = rest.trim();
-                if !rest.is_empty() {
-                    out.push_str(rest);
+                if !rest.is_empty() && !Self::looks_like_tool_json_fragment(rest) {
+                    out.push_str(&Self::unescape_common(rest));
                     out.push('\n');
                 }
                 continue;
@@ -199,25 +217,109 @@ impl OpenCodeCliProvider {
             if t.starts_with("<turn") || t == "</turn>" {
                 continue;
             }
-            out.push_str(line);
+            if t.starts_with("<tool_call") || t.starts_with("</tool_call") {
+                continue;
+            }
+            out.push_str(&Self::unescape_common(line));
             out.push('\n');
         }
         // Chunks without newlines (stream fragments)
         if out.is_empty() && !text.contains('\n') {
             let t = text.trim();
+            if Self::looks_like_tool_json_fragment(t) {
+                return None;
+            }
             if let Some(rest) = t.strip_prefix("ASSISTANT:") {
                 let rest = rest.trim();
                 if !rest.is_empty() {
-                    return Some(rest.to_string());
+                    return Some(Self::unescape_common(rest));
                 }
             }
         }
         let trimmed = out.trim();
         if trimmed.is_empty() || Self::is_transcript_echo_only(trimmed) {
             None
+        } else if Self::looks_like_tool_json_fragment(trimmed) {
+            None
         } else {
             Some(out)
         }
+    }
+
+    /// Free models often leak incomplete JSON like `","id":"call_0","name":"repl"}`
+    /// or full `{"name":"repl","arguments":{...}}` into the text stream.
+    fn looks_like_tool_json_fragment(text: &str) -> bool {
+        let t = text.trim();
+        if t.is_empty() {
+            return false;
+        }
+        // Complete or partial tool-call JSON object.
+        if t.contains("\"name\"")
+            && (t.contains("\"arguments\"")
+                || t.contains("\"id\"")
+                || t.contains("\"code\"")
+                || t.contains("call_"))
+        {
+            // Mostly JSON punctuation / escapes?
+            let jsonish = t
+                .chars()
+                .filter(|c| {
+                    matches!(*c, '{' | '}' | '[' | ']' | '"' | ':' | ',' | '\\')
+                        || c.is_ascii_alphanumeric()
+                        || c.is_whitespace()
+                        || *c == '_'
+                        || *c == '-'
+                        || *c == '/'
+                        || *c == '.'
+                })
+                .count();
+            if jsonish * 10 >= t.chars().count() * 8 {
+                return true;
+            }
+        }
+        // Trailing fragment from a tool_call object.
+        if (t.starts_with(",\"") || t.starts_with("\",\"") || t.starts_with("\"id\""))
+            && (t.contains("\"name\"") || t.contains("call_"))
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Unescape common JSON-string sequences when the model echoes escaped text.
+    fn unescape_common(s: &str) -> String {
+        // Only unescape when it looks like escaped content (has \\n or \\t etc.)
+        if !s.contains("\\n") && !s.contains("\\t") && !s.contains("\\\"") {
+            return s.to_string();
+        }
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.peek().copied() {
+                    Some('n') => {
+                        chars.next();
+                        out.push('\n');
+                    }
+                    Some('t') => {
+                        chars.next();
+                        out.push('\t');
+                    }
+                    Some('"') => {
+                        chars.next();
+                        out.push('"');
+                    }
+                    Some('\\') => {
+                        chars.next();
+                        out.push('\\');
+                    }
+                    _ => out.push(c),
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 
     fn is_transcript_echo_only(text: &str) -> bool {
@@ -245,14 +347,8 @@ impl OpenCodeCliProvider {
         let mut calls = Vec::new();
         for cap in re.captures_iter(text) {
             if let Some(json_str) = cap.get(1) {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str.as_str()) {
-                    let name = value["name"].as_str().unwrap_or("").to_string();
-                    let args = value["arguments"].clone();
-                    let id = value["id"]
-                        .as_str()
-                        .unwrap_or(&format!("call_{}", calls.len()))
-                        .to_string();
-                    calls.push((id, name, args));
+                if let Some(call) = Self::parse_json_tool_call_body(json_str.as_str(), calls.len()) {
+                    calls.push(call);
                 }
             }
         }
@@ -260,67 +356,30 @@ impl OpenCodeCliProvider {
             if let Some(start) = text.find("<tool_call>") {
                 let json_part = &text[start + "<tool_call>".len()..];
                 if let Some(end) = json_part.find("</tool_call>") {
-                    let json_str = &json_part[..end];
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
-                        let name = value["name"].as_str().unwrap_or("").to_string();
-                        let args = value["arguments"].clone();
-                        let id = value["id"]
-                            .as_str()
-                            .unwrap_or("call_0")
-                            .to_string();
-                        calls.push((id, name, args));
+                    if let Some(call) = Self::parse_json_tool_call_body(&json_part[..end], 0) {
+                        calls.push(call);
                     }
                 } else {
                     let trimmed = json_part.trim();
-                    if trimmed.ends_with('}') || trimmed.ends_with("}}") {
-                        let end = if trimmed.ends_with("}}") {
-                            trimmed.len()
-                        } else if trimmed.ends_with('}') {
-                            trimmed.rfind('}').map(|i| i + 1).unwrap_or(trimmed.len())
-                        } else {
-                            trimmed.len()
-                        };
-                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&trimmed[..end]) {
-                            let name = value["name"].as_str().unwrap_or("").to_string();
-                            let args = value["arguments"].clone();
-                            let id = value["id"]
-                                .as_str()
-                                .unwrap_or("call_0")
-                                .to_string();
-                            calls.push((id, name, args));
+                    if trimmed.contains('{') {
+                        if let Some(call) = Self::parse_json_tool_call_body(trimmed, 0) {
+                            calls.push(call);
                         }
                     }
                 }
             }
         }
         if calls.is_empty() {
-            let bare_re = Regex::new(r#"\{\s*"name"\s*:"#).unwrap();
+            // Prefer `"name"`-first objects, but also accept `"arguments"`-first.
+            let bare_re = Regex::new(r#"\{\s*"(?:name|arguments)"\s*:"#).unwrap();
             if let Some(m) = bare_re.find(&stripped) {
-                let start = m.start();
-                let mut depth = 0i32;
-                let mut end = stripped.len();
-                for (i, ch) in stripped[start..].char_indices() {
-                    if ch == '{' { depth += 1; }
-                    else if ch == '}' {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = start + i + 1;
-                            break;
-                        }
+                if let Some((_end, json_str)) = Self::find_balanced_json_in(&stripped, m.start()) {
+                    if let Some(call) = Self::parse_json_tool_call_body(&json_str, 0) {
+                        calls.push(call);
                     }
-                }
-                if depth == 0 {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&stripped[start..end]) {
-                        if let Some(name) = value["name"].as_str() {
-                            if value["arguments"].is_object() {
-                                let id = value["id"]
-                                    .as_str()
-                                    .unwrap_or("call_0")
-                                    .to_string();
-                                calls.push((id, name.to_string(), value["arguments"].clone()));
-                            }
-                        }
-                    }
+                } else if let Some(call) = Self::parse_json_tool_call_body(&stripped[m.start()..], 0) {
+                    // Unbalanced / truncated — try brace repair on the suffix.
+                    calls.push(call);
                 }
             }
         }
@@ -329,6 +388,147 @@ impl OpenCodeCliProvider {
             calls = OpenCodeCliProvider::parse_native_tool_calls(text);
         }
         calls
+    }
+
+    /// Parse a `<tool_call>` JSON body, repairing weak-model mistakes:
+    /// missing closing braces, `arguments`-first ordering, and `name`/`id`
+    /// nested inside `arguments`.
+    fn parse_json_tool_call_body(
+        raw: &str,
+        idx: usize,
+    ) -> Option<(String, String, serde_json::Value)> {
+        let value = Self::try_parse_json_lenient(raw)?;
+        Self::normalize_tool_call_json(value, idx)
+    }
+
+    fn try_parse_json_lenient(raw: &str) -> Option<serde_json::Value> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            return Some(v);
+        }
+
+        // Soft-wrap / accidental newlines inside keys break JSON; strip
+        // newlines outside of strings is hard — first try removing all
+        // newlines (keys like "na\nme" → "name") while keeping spaces in values
+        // by only deleting newlines.
+        let no_nl: String = trimmed.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+        if no_nl != trimmed {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&no_nl) {
+                return Some(v);
+            }
+        }
+
+        // Truncated object: append missing closing braces.
+        for candidate in [&no_nl, trimmed] {
+            let mut depth = 0i32;
+            let mut in_string = false;
+            let mut escaped = false;
+            for b in candidate.bytes() {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                match b {
+                    b'\\' if in_string => escaped = true,
+                    b'"' => in_string = !in_string,
+                    b'{' if !in_string => depth += 1,
+                    b'}' if !in_string => depth -= 1,
+                    _ => {}
+                }
+            }
+            if depth > 0 && !in_string {
+                let fixed = format!("{}{}", candidate, "}".repeat(depth as usize));
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&fixed) {
+                    return Some(v);
+                }
+            }
+        }
+
+        // Last resort: find first balanced object in the string.
+        if let Some((_, json_str)) = Self::find_balanced_json_in(trimmed, 0) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                return Some(v);
+            }
+        }
+        if no_nl != trimmed {
+            if let Some((_, json_str)) = Self::find_balanced_json_in(&no_nl, 0) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    }
+
+    fn normalize_tool_call_json(
+        value: serde_json::Value,
+        idx: usize,
+    ) -> Option<(String, String, serde_json::Value)> {
+        let obj = value.as_object()?;
+
+        let mut name = obj
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mut id = obj
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("call_{idx}"));
+
+        let mut args = if let Some(a) = obj.get("arguments") {
+            if a.is_object() {
+                a.clone()
+            } else if a.is_null() {
+                serde_json::json!({})
+            } else {
+                // Non-object arguments — keep empty and hope name is top-level.
+                serde_json::json!({})
+            }
+        } else if !name.is_empty() {
+            // Flat tool call: top-level fields except name/id are args.
+            let mut map = serde_json::Map::new();
+            for (k, v) in obj {
+                if k != "name" && k != "id" {
+                    map.insert(k.clone(), v.clone());
+                }
+            }
+            serde_json::Value::Object(map)
+        } else {
+            serde_json::json!({})
+        };
+
+        // Weak models often put name/id inside arguments.
+        if let Some(map) = args.as_object_mut() {
+            if name.is_empty() {
+                if let Some(n) = map
+                    .remove("name")
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                {
+                    name = n;
+                }
+            } else {
+                map.remove("name");
+            }
+            if let Some(i) = map
+                .remove("id")
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+            {
+                // Prefer explicit top-level id when present; otherwise take nested.
+                if obj.get("id").and_then(|v| v.as_str()).is_none() {
+                    id = i;
+                }
+            }
+        }
+
+        if name.is_empty() {
+            return None;
+        }
+        Some((id, name, args))
     }
 
     fn find_balanced_json_in(s: &str, start: usize) -> Option<(usize, String)> {
@@ -514,6 +714,17 @@ impl OpenCodeCliProvider {
             calls = Self::parse_arg_key_tool_calls(text);
         }
 
+        // Strategy 6: weak-model XML params + bare tool name inside `<tool_call>`
+        //   <tool_call>
+        //   <file_path>/path/to/file.rs</file_path>
+        //   113
+        //   200
+        //   read
+        //   </tool_call>
+        if calls.is_empty() {
+            calls = Self::parse_xml_tagged_param_tool_calls(text);
+        }
+
         calls
     }
 
@@ -590,6 +801,204 @@ impl OpenCodeCliProvider {
         }
 
         calls
+    }
+
+    /// Known built-in tool names used to identify bare-word tool calls in weak
+    /// XML formats (order does not matter).
+    fn known_tool_names() -> &'static [&'static str] {
+        &[
+            "read",
+            "write",
+            "edit",
+            "bash",
+            "find",
+            "grep",
+            "ls",
+            "webfetch",
+            "websearch",
+            "web_fetch",
+            "web_search",
+            "repl",
+            "task",
+            "todowrite",
+            "todo_write",
+            "question",
+            "apply_patch",
+            "applypatch",
+        ]
+    }
+
+    /// Weak-model format: XML-tagged params + optional bare positional values +
+    /// a bare tool-name token, all inside `<tool_call>...</tool_call>`.
+    fn parse_xml_tagged_param_tool_calls(text: &str) -> Vec<(String, String, serde_json::Value)> {
+        let mut calls = Vec::new();
+        let block_re = Regex::new(r"(?s)<tool_call>\s*(.*?)\s*</tool_call>").unwrap();
+        let tag_re =
+            Regex::new(r"(?s)<([a-zA-Z_][a-zA-Z0-9_]*)>(.*?)</([a-zA-Z_][a-zA-Z0-9_]*)>").unwrap();
+
+        let mut bodies: Vec<String> = block_re
+            .captures_iter(text)
+            .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+            .collect();
+        // Streaming path may already have stripped the outer `<tool_call>` tags.
+        if bodies.is_empty() {
+            bodies.push(text.to_string());
+        }
+
+        const RESERVED: &[&str] = &[
+            "tool_call",
+            "tool_name",
+            "tool_arguments",
+            "tool_request",
+            "parameters",
+            "arg_key",
+            "arg_value",
+        ];
+
+        for (idx, body) in bodies.into_iter().enumerate() {
+            let trimmed = body.trim();
+            if trimmed.is_empty()
+                || trimmed.starts_with('{')
+                || trimmed.contains("<tool_name>")
+                || trimmed.contains("<tool_request")
+                || trimmed.contains("<tool_arguments>")
+                || trimmed.contains("<arg_key>")
+            {
+                continue;
+            }
+
+            let mut args = serde_json::Map::new();
+            let mut consumed_ranges: Vec<(usize, usize)> = Vec::new();
+            for cap in tag_re.captures_iter(trimmed) {
+                let open = cap.get(1).unwrap().as_str();
+                let close = cap.get(3).unwrap().as_str();
+                if open != close || RESERVED.iter().any(|r| *r == open) {
+                    continue;
+                }
+                let raw = cap.get(2).unwrap().as_str();
+                let normalized = Self::normalize_xml_param_value(open, raw);
+                if normalized.is_empty() {
+                    continue;
+                }
+                args.insert(open.to_string(), Self::coerce_xml_arg_value(&normalized));
+                let full = cap.get(0).unwrap();
+                consumed_ranges.push((full.start(), full.end()));
+            }
+
+            if args.is_empty() {
+                continue;
+            }
+
+            // Collect bare tokens outside XML tags (tool name + positional leftovers).
+            let mut bare = String::new();
+            let mut cursor = 0usize;
+            consumed_ranges.sort_by_key(|(s, _)| *s);
+            for (start, end) in &consumed_ranges {
+                if cursor < *start {
+                    bare.push_str(&trimmed[cursor..*start]);
+                }
+                cursor = (*end).max(cursor);
+            }
+            if cursor < trimmed.len() {
+                bare.push_str(&trimmed[cursor..]);
+            }
+
+            let tokens: Vec<String> = bare
+                .split_whitespace()
+                .map(|t| t.trim_matches(|c: char| c == '"' || c == '\'' || c == '`').to_string())
+                .filter(|t| !t.is_empty())
+                .collect();
+
+            let known = Self::known_tool_names();
+            let name_idx = tokens
+                .iter()
+                .position(|t| known.iter().any(|k| k.eq_ignore_ascii_case(t)))
+                .or_else(|| {
+                    // Fallback: last identifier-like token (common: name at end).
+                    tokens.iter().rposition(|t| {
+                        t.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                            && t.parse::<i64>().is_err()
+                            && t.parse::<f64>().is_err()
+                    })
+                });
+
+            let Some(name_idx) = name_idx else {
+                continue;
+            };
+            let name = tokens[name_idx].to_ascii_lowercase();
+            let leftovers: Vec<String> = tokens
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| *i != name_idx)
+                .map(|(_, t)| t)
+                .collect();
+
+            Self::assign_positional_tool_args(&name, &mut args, &leftovers);
+            calls.push((
+                format!("call_{idx}"),
+                name,
+                serde_json::Value::Object(args),
+            ));
+        }
+
+        calls
+    }
+
+    fn normalize_xml_param_value(key: &str, raw: &str) -> String {
+        let key_l = key.to_ascii_lowercase();
+        if matches!(
+            key_l.as_str(),
+            "file_path" | "path" | "directory" | "target" | "cwd" | "workdir"
+        ) {
+            // Soft-wrap / accidental newlines inside path tags.
+            raw.chars()
+                .filter(|c| *c != '\n' && *c != '\r')
+                .collect::<String>()
+                .trim()
+                .to_string()
+        } else {
+            raw.trim().to_string()
+        }
+    }
+
+    /// Map leftover bare tokens (often untagged offset/limit) onto common params.
+    fn assign_positional_tool_args(
+        tool: &str,
+        args: &mut serde_json::Map<String, serde_json::Value>,
+        leftovers: &[String],
+    ) {
+        if leftovers.is_empty() {
+            return;
+        }
+        let slots: &[&str] = match tool {
+            "read" => &["offset", "limit"],
+            "grep" => &["pattern", "path"],
+            "find" => &["pattern", "path"],
+            "bash" => &["command", "timeout"],
+            "ls" => &["path"],
+            "webfetch" | "web_fetch" => &["url", "format", "timeout"],
+            "websearch" | "web_search" => &["query"],
+            "write" | "edit" => &["file_path", "content"],
+            _ => &["offset", "limit", "timeout", "path"],
+        };
+        let mut li = 0usize;
+        for slot in slots {
+            if li >= leftovers.len() {
+                break;
+            }
+            if args.contains_key(*slot) {
+                continue;
+            }
+            // Don't overwrite path-like slots when we already have file_path/path.
+            if (*slot == "path" || *slot == "file_path")
+                && (args.contains_key("path") || args.contains_key("file_path"))
+            {
+                continue;
+            }
+            args.insert(slot.to_string(), Self::coerce_xml_arg_value(&leftovers[li]));
+            li += 1;
+        }
     }
 
     fn coerce_xml_arg_value(raw: &str) -> serde_json::Value {
@@ -741,6 +1150,9 @@ impl Provider for OpenCodeCliProvider {
                 .arg("pi-model")
                 .arg("--format")
                 .arg("json")
+                // Stream reasoning parts — DeepSeek often replies with reasoning
+                // and empty text; without this we see a blank turn and false retries.
+                .arg("--thinking")
                 .arg("--dir")
                 .arg(temp_dir.path())
                 .stdin(Stdio::piped())
@@ -797,6 +1209,19 @@ impl Provider for OpenCodeCliProvider {
                                 if let Ok(event) = serde_json::from_str::<serde_json::Value>(&trimmed) {
                                     had_output = true;
                                     match event["type"].as_str() {
+                                        Some("reasoning") => {
+                                            if let Some(part_text) = event["part"]["text"].as_str() {
+                                                if !part_text.is_empty() {
+                                                    let _ = tx.send(Ok(StreamDelta {
+                                                        content_index,
+                                                        r#type: DeltaType::Thinking {
+                                                            thinking: part_text.to_string(),
+                                                        },
+                                                    }));
+                                                    content_index += 1;
+                                                }
+                                            }
+                                        }
                                         Some("text") => {
                                             if let Some(part_text) = event["part"]["text"].as_str() {
                                                 let has_tool_call = part_text.contains("<tool_call>") || tool_call_buffer.contains("<tool_call>");
@@ -825,17 +1250,14 @@ impl Provider for OpenCodeCliProvider {
                                                             }
                                                         }
                                                     if let Some(json_str) = cap.get(1) {
-                                                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str.as_str()) {
-                                                                let name = value["name"].as_str().unwrap_or("").to_string();
-                                                                let args = value["arguments"].clone();
-                                                                let id = value["id"]
-                                                                    .as_str()
-                                                                    .unwrap_or(&format!("call_{}", calls.len()))
-                                                                    .to_string();
-                                                                calls.push((id, name, args));
+                                                            if let Some(call) = OpenCodeCliProvider::parse_json_tool_call_body(
+                                                                json_str.as_str(),
+                                                                calls.len(),
+                                                            ) {
+                                                                calls.push(call);
                                                             } else {
-                                                                // JSON parse failed — captured content may be native /
-                                                                // arg_key format wrapped in <tool_call> tags
+                                                                // Not JSON (or unrecoverable) — try native /
+                                                                // arg_key / xml-param formats on the inner body.
                                                                 let native = OpenCodeCliProvider::parse_native_tool_calls(json_str.as_str());
                                                                 if !native.is_empty() {
                                                                     calls.extend(native);
@@ -913,6 +1335,46 @@ impl Provider for OpenCodeCliProvider {
                                                     content_index += 1;
                                                 }
                                             }
+                                        }
+                                        Some("tool_use") => {
+                                            // OpenCode may still attempt native tools despite
+                                            // deny. Surface that so the model (and user) see
+                                            // why the turn looked empty, and steer to bridge
+                                            // <tool_call> format.
+                                            let tool = event["part"]["tool"]
+                                                .as_str()
+                                                .or_else(|| event["part"]["state"]["input"]["tool"].as_str())
+                                                .unwrap_or("unknown");
+                                            let status = event["part"]["state"]["status"]
+                                                .as_str()
+                                                .unwrap_or("");
+                                            let note = if status == "error"
+                                                || status == "denied"
+                                            {
+                                                format!(
+                                                    "[OpenCode `{tool}` was blocked. Use rs-agent tools via \
+                                                     <tool_call>{{\"name\":\"{tool}\",\"arguments\":{{...}}}}</tool_call>.]"
+                                                )
+                                            } else if status == "completed" {
+                                                let out = event["part"]["state"]["output"]
+                                                    .as_str()
+                                                    .unwrap_or("")
+                                                    .chars()
+                                                    .take(500)
+                                                    .collect::<String>();
+                                                format!(
+                                                    "[OpenCode ran `{tool}` natively — prefer rs-agent <tool_call> next time]\n{out}"
+                                                )
+                                            } else {
+                                                format!(
+                                                    "[OpenCode attempted `{tool}` — use rs-agent <tool_call> format instead]"
+                                                )
+                                            };
+                                            let _ = tx.send(Ok(StreamDelta {
+                                                content_index,
+                                                r#type: DeltaType::Text { text: note },
+                                            }));
+                                            content_index += 1;
                                         }
                                         Some("step_finish") => {
                                             if !tool_call_buffer.is_empty() {
@@ -1394,6 +1856,115 @@ mod tests {
     }
 
     #[test]
+    fn test_xml_tagged_params_tool_name_at_end() {
+        // Exact format from deepseek-v4-flash-free via opencode-cli
+        let text = r#"<tool_call>
+<file_path>/Users/pradeep.borado/work/scripts/metal-operators/src/logistic_regression/mod.rs</file_path>
+113
+200
+
+read
+</tool_call>"#;
+        let calls = OpenCodeCliProvider::parse_tool_calls(text);
+        assert_eq!(calls.len(), 1, "should parse XML-param tool_call: {text}");
+        assert_eq!(calls[0].1, "read");
+        assert_eq!(
+            calls[0].2["file_path"],
+            "/Users/pradeep.borado/work/scripts/metal-operators/src/logistic_regression/mod.rs"
+        );
+        assert_eq!(calls[0].2["offset"], 113);
+        assert_eq!(calls[0].2["limit"], 200);
+    }
+
+    #[test]
+    fn test_xml_tagged_params_wrapped_path_newline() {
+        let text = r#"<tool_call>
+<file_path>/Users/pradeep.borado/work/scripts/metal-operators/src/logistic_regression
+/mod.rs</file_path>
+113
+200
+read
+</tool_call>"#;
+        let calls = OpenCodeCliProvider::parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "read");
+        assert_eq!(
+            calls[0].2["file_path"],
+            "/Users/pradeep.borado/work/scripts/metal-operators/src/logistic_regression/mod.rs"
+        );
+        assert_eq!(calls[0].2["offset"], 113);
+        assert_eq!(calls[0].2["limit"], 200);
+    }
+
+    #[test]
+    fn test_xml_tagged_params_tool_name_at_start() {
+        let text = r#"<tool_call>
+read
+<file_path>/tmp/a.rs</file_path>
+<offset>10</offset>
+<limit>20</limit>
+</tool_call>"#;
+        let calls = OpenCodeCliProvider::parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "read");
+        assert_eq!(calls[0].2["file_path"], "/tmp/a.rs");
+        assert_eq!(calls[0].2["offset"], 10);
+        assert_eq!(calls[0].2["limit"], 20);
+    }
+
+    #[test]
+    fn test_xml_tagged_params_bare_body_streaming() {
+        // Streaming path strips outer <tool_call> before calling parse_native
+        let inner = r#"
+<file_path>/tmp/b.rs</file_path>
+1
+50
+read
+"#;
+        let calls = OpenCodeCliProvider::parse_native_tool_calls(inner);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "read");
+        assert_eq!(calls[0].2["file_path"], "/tmp/b.rs");
+        assert_eq!(calls[0].2["offset"], 1);
+        assert_eq!(calls[0].2["limit"], 50);
+    }
+
+    #[test]
+    fn test_json_tool_call_missing_brace_name_inside_args() {
+        // Exact failure from deepseek-v4-flash-free: missing outer `}`, and
+        // name/id nested inside arguments.
+        let text = r#"<tool_call>{"arguments":{"command":"cd /Users/pradeep.borado/work/scripts/metal-operators && cargo test --test logistic_regression_test 2>&1 | tail -50","id":"call_0","name":"bash","timeout":120000}</tool_call>"#;
+        let calls = OpenCodeCliProvider::parse_tool_calls(text);
+        assert_eq!(calls.len(), 1, "should repair truncated JSON tool_call");
+        assert_eq!(calls[0].1, "bash");
+        assert_eq!(
+            calls[0].2["command"],
+            "cd /Users/pradeep.borado/work/scripts/metal-operators && cargo test --test logistic_regression_test 2>&1 | tail -50"
+        );
+        assert_eq!(calls[0].2["timeout"], 120000);
+        assert!(calls[0].2.get("name").is_none(), "name must not stay in args");
+        assert!(calls[0].2.get("id").is_none(), "id must not stay in args");
+    }
+
+    #[test]
+    fn test_json_tool_call_arguments_first_valid() {
+        let text = r#"<tool_call>{"arguments":{"command":"ls"},"id":"call_0","name":"bash"}</tool_call>"#;
+        let calls = OpenCodeCliProvider::parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "bash");
+        assert_eq!(calls[0].2["command"], "ls");
+    }
+
+    #[test]
+    fn test_json_tool_call_softwrapped_key() {
+        let text = "<tool_call>{\"arguments\":{\"command\":\"ls\"},\"id\":\"call_0\",\"na\nme\":\"bash\"}</tool_call>";
+        let calls = OpenCodeCliProvider::parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "bash");
+        assert_eq!(calls[0].2["command"], "ls");
+    }
+
+    #[test]
     fn test_find_balanced_json_with_braces_in_string() {
         // JSON with braces inside string values
         let s = "{\"code\":\"fn foo() { return 1; }\"}";
@@ -1415,6 +1986,28 @@ mod tests {
         assert!(kept.contains("Let me check the shader"));
         assert!(!kept.contains("ASSISTANT:"));
         assert!(!kept.contains("---"));
+    }
+
+    #[test]
+    fn drops_leaked_tool_json_fragments() {
+        assert!(OpenCodeCliProvider::sanitize_bridge_text(
+            r#"","id":"call_0","name":"repl"}"#
+        )
+        .is_none());
+        assert!(OpenCodeCliProvider::sanitize_bridge_text(
+            r#"{"name":"repl","arguments":{"code":"print(1)"},"id":"call_0"}"#
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn unescapes_literal_backslash_n() {
+        let kept = OpenCodeCliProvider::sanitize_bridge_text(
+            r#"Line one\nLine two\nDone."#,
+        )
+        .unwrap();
+        assert!(kept.contains("Line one\nLine two"));
+        assert!(!kept.contains("\\n"));
     }
 
     #[test]

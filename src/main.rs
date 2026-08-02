@@ -137,19 +137,34 @@ fn maybe_run_first_launch_wizard(cli: &mut Cli, cfg: &mut Config) -> Result<(), 
         cli.model = Some(model);
     }
 
-    let env_name = match provider.to_lowercase().as_str() {
-        "openai" | "opencode" => "OPENAI_API_KEY",
-        "opencode-cli" => "OPENCODE_API_KEY",
-        "bedrock" | "amazon-bedrock" => "AWS_ACCESS_KEY_ID",
-        _ => "ANTHROPIC_API_KEY",
-    };
+    let env_name = rs_agent::ai::registry::api_key_env_for(&provider).to_string();
     if !matches!(
         provider.to_lowercase().as_str(),
         "opencode-cli" | "bedrock" | "amazon-bedrock"
-    ) && std::env::var(env_name).is_err()
+    ) && std::env::var(&env_name).is_err()
+    {
+        // OpenCode Zen: reuse local `auth.json` when present.
+        if matches!(
+            provider.to_lowercase().as_str(),
+            "opencode" | "opencode-go"
+        ) {
+            rs_agent::ai::registry::export_opencode_auth_from_file();
+        }
+    }
+    if !matches!(
+        provider.to_lowercase().as_str(),
+        "opencode-cli" | "bedrock" | "amazon-bedrock"
+    ) && std::env::var(&env_name).is_err()
+        && !rs_agent::ai::registry::has_configured_auth(&provider)
     {
         eprintln!("\nNo {} in the environment yet.", env_name);
         eprintln!("  export {}=...", env_name);
+        if matches!(
+            provider.to_lowercase().as_str(),
+            "opencode" | "opencode-go"
+        ) {
+            eprintln!("  (or sign in with OpenCode — keys are read from ~/.local/share/opencode/auth.json)");
+        }
         let smoke = read_line_prompt("Run a tiny smoke prompt after you set the key? [y/N]: ")?;
         if smoke.eq_ignore_ascii_case("y") || smoke.eq_ignore_ascii_case("yes") {
             eprintln!("Re-run rs-agent after exporting the key; smoke prompt: -p \"reply with pong\"");
@@ -180,6 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = Config::ensure_user_dir();
     let _ = Config::write_default_user_config_if_missing();
     rs_agent::config::export_secrets_to_env();
+    rs_agent::ai::registry::export_opencode_auth_from_file();
 
     // Merge config file values into any CLI fields left at their clap
     // defaults / `None`. Explicit CLI flags always win.
@@ -210,7 +226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider = get_provider(
         &provider_name,
         cli.base_url.as_deref(),
-        cli.model.as_deref(),
+        Some(model.as_str()),
         cli.timeout,
     )?;
 
@@ -224,6 +240,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if std::env::var("AWS_ACCESS_KEY_ID").is_err() {
             rs_agent::ai::bedrock::export_credentials_from_file();
         }
+    }
+
+    // Re-export after provider construction path may have run (auth.json).
+    if matches!(
+        provider_name.to_lowercase().as_str(),
+        "opencode" | "opencode-go"
+    ) {
+        rs_agent::ai::registry::export_opencode_auth_from_file();
     }
 
     let env_name = provider.api_key_env_var().to_string();
@@ -246,6 +270,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !skips_api_key_env && std::env::var(&env_name).is_err() {
         eprintln!("Missing API key for {}.", provider_lower);
         eprintln!("  export {}=sk-...", env_name);
+        if matches!(provider_lower.as_str(), "opencode" | "opencode-go") {
+            eprintln!(
+                "  Or sign in with OpenCode (reads ~/.local/share/opencode/auth.json)."
+            );
+        }
         eprintln!("Or paste a key via /provider|/login (saved to ~/.rs-agent/secrets.toml).");
         std::process::exit(1);
     }

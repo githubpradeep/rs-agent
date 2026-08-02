@@ -1,7 +1,7 @@
 use crate::ai::provider::{BoxStream, Provider};
+use crate::ai::sse::sse_delta_stream;
 use crate::ai::types::*;
 use async_trait::async_trait;
-use futures::StreamExt;
 use reqwest::Client;
 use std::time::Duration;
 
@@ -31,7 +31,18 @@ impl OpenAIProvider {
     }
 }
 
-fn convert_message(msg: &Message) -> serde_json::Value {
+#[derive(Clone, Copy, Default)]
+struct ConvertOpts {
+    /// DeepSeek thinking-mode: always include reasoning_content (even "").
+    force_reasoning_content: bool,
+}
+
+fn needs_reasoning_echo(model: &str) -> bool {
+    let m = model.to_lowercase();
+    m.contains("deepseek") || m.contains("reasoner") || m.contains("r1")
+}
+
+fn convert_message_with_opts(msg: &Message, opts: ConvertOpts) -> serde_json::Value {
     let role_str = match msg.role {
         Role::System => "system",
         Role::User => "user",
@@ -55,6 +66,16 @@ fn convert_message(msg: &Message) -> serde_json::Value {
                 .collect();
             let text = text_parts.join("");
 
+            // Preserve thinking-mode reasoning for providers (DeepSeek via OpenCode,
+            // etc.) that require reasoning_content to be echoed on later turns.
+            let reasoning: String = msg
+                .content
+                .iter()
+                .filter(|c| c.content_type == ContentType::Thinking)
+                .filter_map(|c| c.thinking.as_deref())
+                .collect::<Vec<_>>()
+                .join("");
+
             let tool_calls: Vec<serde_json::Value> = msg.content.iter()
                 .filter(|c| c.content_type == ContentType::ToolUse)
                 .map(|c| {
@@ -69,12 +90,24 @@ fn convert_message(msg: &Message) -> serde_json::Value {
                 })
                 .collect();
 
-            let mut result = serde_json::json!({"role": "assistant", "content": serde_json::Value::Null});
+            // DeepSeek rejects assistant messages where neither content nor
+            // tool_calls is set (reasoning_content alone is not enough). Never
+            // emit content:null unless tool_calls are present.
+            let mut result = serde_json::json!({"role": "assistant"});
             if !text.is_empty() {
                 result["content"] = serde_json::json!(text);
+            } else if tool_calls.is_empty() {
+                result["content"] = serde_json::json!("");
+            } else {
+                result["content"] = serde_json::Value::Null;
             }
             if !tool_calls.is_empty() {
                 result["tool_calls"] = serde_json::json!(tool_calls);
+            }
+            // OpenCode ProviderTransform: always echo reasoning_content for
+            // DeepSeek-class models — empty string still must be present.
+            if !reasoning.is_empty() || opts.force_reasoning_content {
+                result["reasoning_content"] = serde_json::json!(reasoning);
             }
             return result;
         }
@@ -152,9 +185,13 @@ impl Provider for OpenAIProvider {
             .build()
             .map_err(|e| ProviderError::Other(e.to_string()))?;
 
+        let opts = ConvertOpts {
+            force_reasoning_content: needs_reasoning_echo(&request.model)
+                || request.thinking.is_some(),
+        };
         let mut body = serde_json::json!({
             "model": request.model,
-            "messages": request.messages.iter().map(convert_message).collect::<Vec<_>>(),
+            "messages": request.messages.iter().map(|m| convert_message_with_opts(m, opts)).collect::<Vec<_>>(),
             "max_tokens": request.max_tokens,
             "stream": false
         });
@@ -221,9 +258,13 @@ impl Provider for OpenAIProvider {
             .build()
             .map_err(|e| ProviderError::Other(e.to_string()))?;
 
+        let opts = ConvertOpts {
+            force_reasoning_content: needs_reasoning_echo(&request.model)
+                || request.thinking.is_some(),
+        };
         let mut body = serde_json::json!({
             "model": request.model,
-            "messages": request.messages.iter().map(convert_message).collect::<Vec<_>>(),
+            "messages": request.messages.iter().map(|m| convert_message_with_opts(m, opts)).collect::<Vec<_>>(),
             "max_tokens": request.max_tokens,
             "stream": true,
             "stream_options": {"include_usage": true}
@@ -273,27 +314,12 @@ impl Provider for OpenAIProvider {
             });
         }
 
-        let stream = response.bytes_stream().flat_map(move |chunk| {
-            let result = match chunk {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    let mut deltas = Vec::new();
-                    for line in text.lines() {
-                        if let Some(delta) = parse_openai_stream_line(line) {
-                            deltas.push(delta);
-                        }
-                    }
-                    Ok(deltas)
-                }
-                Err(e) => Err(ProviderError::Stream(e.to_string())),
-            };
-            futures::stream::iter(match result {
-                Ok(deltas) => deltas.into_iter().map(Ok).collect::<Vec<_>>(),
-                Err(e) => vec![Err(e)],
-            })
-        });
-
-        let boxed: BoxStream = Box::pin(stream);
+        // Buffer across TCP chunks — SSE events are line-delimited and a chunk
+        // boundary mid-`data: …` line used to drop the event (empty assistant turns).
+        let boxed: BoxStream = Box::pin(sse_delta_stream(
+            response.bytes_stream(),
+            parse_openai_stream_line,
+        ));
         Ok(boxed)
     }
 
@@ -528,4 +554,88 @@ fn parse_openai_stream_line(line: &str) -> Option<StreamDelta> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assistant_with(content: Vec<Content>) -> Message {
+        Message {
+            role: Role::Assistant,
+            content,
+        }
+    }
+
+    #[test]
+    fn convert_thinking_only_sets_empty_content_not_null() {
+        let msg = assistant_with(vec![Content {
+            content_type: ContentType::Thinking,
+            thinking: Some("planning a reply".into()),
+            ..Default::default()
+        }]);
+        let v = convert_message_with_opts(&msg, ConvertOpts::default());
+        assert_eq!(v["role"], "assistant");
+        assert_eq!(v["content"], "");
+        assert_eq!(v["reasoning_content"], "planning a reply");
+        assert!(v.get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn convert_text_and_thinking_roundtrips_reasoning() {
+        let msg = assistant_with(vec![
+            Content {
+                content_type: ContentType::Thinking,
+                thinking: Some("reason".into()),
+                ..Default::default()
+            },
+            Content {
+                content_type: ContentType::Text,
+                text: Some("hello".into()),
+                ..Default::default()
+            },
+        ]);
+        let v = convert_message_with_opts(&msg, ConvertOpts::default());
+        assert_eq!(v["content"], "hello");
+        assert_eq!(v["reasoning_content"], "reason");
+    }
+
+    #[test]
+    fn convert_deepseek_forces_empty_reasoning_content() {
+        let msg = assistant_with(vec![Content {
+            content_type: ContentType::Text,
+            text: Some("hi".into()),
+            ..Default::default()
+        }]);
+        let v = convert_message_with_opts(
+            &msg,
+            ConvertOpts {
+                force_reasoning_content: true,
+            },
+        );
+        assert_eq!(v["content"], "hi");
+        assert_eq!(v["reasoning_content"], "");
+    }
+
+    #[test]
+    fn convert_tool_calls_may_keep_null_content() {
+        let msg = assistant_with(vec![
+            Content {
+                content_type: ContentType::Thinking,
+                thinking: Some("need bash".into()),
+                ..Default::default()
+            },
+            Content {
+                content_type: ContentType::ToolUse,
+                id: Some("call_1".into()),
+                name: Some("bash".into()),
+                input: Some(serde_json::json!({"command": "ls"})),
+                ..Default::default()
+            },
+        ]);
+        let v = convert_message_with_opts(&msg, ConvertOpts::default());
+        assert!(v["content"].is_null());
+        assert!(v["tool_calls"].is_array());
+        assert_eq!(v["reasoning_content"], "need bash");
+    }
 }

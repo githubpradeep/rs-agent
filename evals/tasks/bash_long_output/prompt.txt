@@ -1,0 +1,7 @@
+Run this exact bash command (use the bash tool):
+
+python3 -c 'print("NEEDLE_TOKEN_9f3a"); print("pad\n"*4000); print("TAIL")'
+
+A needle token is printed near the start, then a large padded body. Find NEEDLE_TOKEN_9f3a
+(even if output is truncated — use the spilled full-output path if provided).
+Write the token alone to found.txt using the write tool.

@@ -224,6 +224,11 @@ impl App {
                                 .unwrap_or_else(|_| std::path::PathBuf::from("."));
                             match crate::lsp::LspClient::start_rust_analyzer(root).await {
                                 Ok((c, handle)) => {
+                                    crate::tools::post_mutation::register_shared_diagnostics(
+                                        c.diagnostics.clone(),
+                                    );
+                                    crate::tools::post_mutation::DiagnosticsBridge::global()
+                                        .set_snapshot(c.snapshot());
                                     let summary = c.snapshot().summary_line();
                                     client = Some(c);
                                     _reader = Some(handle);
@@ -252,6 +257,8 @@ impl App {
                                     let _ = c.did_open(p, &text, lang).await;
                                     let _ = c.did_save(p, Some(&text)).await;
                                 }
+                                crate::tools::post_mutation::DiagnosticsBridge::global()
+                                    .set_snapshot(c.snapshot());
                             }
                         }
                         Ok(LspCmd::Stop) => {
@@ -266,7 +273,10 @@ impl App {
                         }
                         Err(channel::RecvTimeoutError::Timeout) => {
                             if let Some(ref c) = client {
-                                let summary = c.snapshot().summary_line();
+                                let snap = c.snapshot();
+                                crate::tools::post_mutation::DiagnosticsBridge::global()
+                                    .set_snapshot(snap.clone());
+                                let summary = snap.summary_line();
                                 let _ = event_tx_lsp.send((0, AgentEvent::LspUpdate { summary }));
                             }
                         }
@@ -288,6 +298,7 @@ impl App {
         let timeout = std::time::Duration::from_secs(timeout_secs);
         let session_id =
             resume.as_ref().map(|s| s.id.clone()).unwrap_or_else(SessionStore::generate_id);
+        crate::tools::turn_snapshot::set_session(&session_id);
         let created_at = resume.as_ref().map(|s| s.created_at.clone()).unwrap_or_else(|| {
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
         });
@@ -924,7 +935,34 @@ impl App {
                         }
                     }
                 }
-                let preview: String = full.chars().take(100).collect();
+                let preview: String = if full.contains("<diagnostics") {
+                    let first_diag = full
+                        .lines()
+                        .find(|l| {
+                            let t = l.trim_start();
+                            t.starts_with("error ") || t.starts_with("warn ")
+                        })
+                        .unwrap_or("LSP diagnostics");
+                    format!("⚠ {}", first_diag.chars().take(90).collect::<String>())
+                } else if full.contains(crate::tools::truncate_store::SPILL_MARKER) {
+                    let path_line = full
+                        .lines()
+                        .find(|l| l.contains(crate::tools::truncate_store::SPILL_MARKER))
+                        .unwrap_or("full output spilled");
+                    format!("… {}", path_line.chars().take(90).collect::<String>())
+                } else if matches!(name.as_str(), "write" | "edit" | "apply_patch") {
+                    let head: String = full.lines().next().unwrap_or("").chars().take(80).collect();
+                    let lsp = if full.contains("<diagnostics") {
+                        " · LSP!"
+                    } else {
+                        ""
+                    };
+                    format!("{head}{lsp}")
+                } else {
+                    full.chars().take(100).collect()
+                };
+                let expand_diag = full.contains("<diagnostics");
+                let expand_spill = full.contains(crate::tools::truncate_store::SPILL_MARKER);
                 // Tools belong on the assistant turn. If the model jumped
                 // straight to a tool with no prior text/thinking, open one.
                 if self.messages.last().map(|m| m.role.as_str()) != Some("assistant") {
@@ -940,12 +978,15 @@ impl App {
                     last.tool_blocks.push(ToolBlock {
                         name,
                         preview,
-                        full,
-                        expanded: false,
-                        is_error: result.is_error,
+                        full: full.clone(),
+                        expanded: expand_diag || expand_spill || result.is_error,
+                        is_error: result.is_error || expand_diag,
                     });
                 }
                 self.follow_bottom = true;
+                if result.is_error && full.contains("STUCK:") {
+                    self.status = "STUCK".to_string();
+                }
             }
             AgentEvent::Error { message } => {
                 if let Some(last) = self.messages.last_mut() {
@@ -974,15 +1015,7 @@ impl App {
                     self.repl_panel.push_str(line);
                     self.repl_panel.push('\n');
                 }
-                const REPL_PANEL_CAP: usize = 8000;
-                if self.repl_panel.len() > REPL_PANEL_CAP {
-                    let excess = self.repl_panel.len() - REPL_PANEL_CAP;
-                    let cut = self.repl_panel[excess..]
-                        .find('\n')
-                        .map(|i| excess + i + 1)
-                        .unwrap_or(excess);
-                    self.repl_panel.drain(..cut);
-                }
+                Self::trim_panel_utf8(&mut self.repl_panel, 8000);
                 self.show_repl_panel = true;
             }
             AgentEvent::ToolOutput { name, stream, text } => {
@@ -996,15 +1029,7 @@ impl App {
                     self.repl_panel.push_str(line);
                     self.repl_panel.push('\n');
                 }
-                const PANEL_CAP: usize = 8000;
-                if self.repl_panel.len() > PANEL_CAP {
-                    let excess = self.repl_panel.len() - PANEL_CAP;
-                    let cut = self.repl_panel[excess..]
-                        .find('\n')
-                        .map(|i| excess + i + 1)
-                        .unwrap_or(excess);
-                    self.repl_panel.drain(..cut);
-                }
+                Self::trim_panel_utf8(&mut self.repl_panel, 8000);
                 self.show_repl_panel = true;
             }
             AgentEvent::ContextWarning { fraction: _, used, limit } => {
@@ -1239,7 +1264,7 @@ impl App {
                      /mode plan|ask|agent  /model [provider/model]  /provider|/login [name]\n\
                      /theme [dark|light|forest]  /compact  /new  /fork [@N] [label]  /timeline  /sessions\n\
                      /export [md|json|html]  /image [path]  /lsp [start|stop|status]  /skill-pack export|import\n\
-                     /trust list|reset  /rename <title>  /history [query|n]\n\n\
+                     /revert  /trust list|reset  /rename <title>  /history [query|n]\n\n\
                      Keys: {}\n\
                      Ctrl+P cycle model · Tab-complete /skill|/prompt|/model|/theme|/mode|/provider · @ file · # dir",
                     self.keys.hint_line(),
@@ -1656,6 +1681,20 @@ impl App {
             "/compact" => {
                 let _ = self.command_tx.send(AppCommand::Compact);
                 self.status = "compacting...".to_string();
+            }
+            "/revert" => {
+                match crate::tools::turn_snapshot::restore_last_turn() {
+                    Ok(n) => {
+                        self.status = format!("restored {n} file(s) from turn");
+                        self.push_system(format!(
+                            "Reverted last turn snapshot ({n} file(s) restored)."
+                        ));
+                    }
+                    Err(e) => {
+                        self.status = "revert failed".into();
+                        self.push_system(format!("Revert failed: {e}"));
+                    }
+                }
             }
             "/new" => {
                 let _ = self.command_tx.send(AppCommand::NewSession);
@@ -2237,16 +2276,28 @@ impl App {
         if !crate::ai::registry::is_known_provider(&mref.provider) {
             return Err(format!("Unknown provider `{}`", mref.provider));
         }
+        // Prefer OpenCode Zen keys from the local OpenCode install when unset.
+        if mref.provider.eq_ignore_ascii_case("opencode")
+            || mref.provider.eq_ignore_ascii_case("opencode-go")
+        {
+            crate::ai::registry::export_opencode_auth_from_file();
+        }
         if !crate::ai::registry::has_configured_auth(&mref.provider) {
             return Err(format!(
-                "Provider `{}` has no credentials (export {}).",
+                "Provider `{}` has no credentials (export {} or sign in via OpenCode).",
                 mref.provider,
                 crate::ai::registry::api_key_env_for(&mref.provider)
             ));
         }
 
         let same_provider = mref.provider.eq_ignore_ascii_case(&self.provider_name);
-        if same_provider {
+        let needs_recreate = crate::ai::registry::provider_client_needs_recreate(
+            &self.provider_name,
+            &self.model_name,
+            &mref.provider,
+            &mref.model,
+        );
+        if same_provider && !needs_recreate {
             self.model_name = mref.model.clone();
             let _ = self.command_tx.send(AppCommand::SetModel {
                 model: mref.model.clone(),
@@ -2299,9 +2350,14 @@ impl App {
         });
         self.note_cycle_entry(&mref.display());
         Self::remember_selection(&mref.provider, &mref.model);
+        let kind = if same_provider {
+            "model + API endpoint"
+        } else {
+            "provider + model"
+        };
         Ok(format!(
-            "Switched to {}/{} (provider + model)",
-            mref.provider, mref.model
+            "Switched to {}/{} ({})",
+            mref.provider, mref.model, kind
         ))
     }
 
@@ -2991,10 +3047,14 @@ impl App {
 
     fn render_tree_panel(&mut self, frame: &mut Frame, area: Rect) {
         let style = Style::default().fg(self.palette.tool);
+        let max_w = (area.width as usize).saturating_sub(2).max(8);
         let lines: Vec<Line> = self
             .tree_panel_text
             .lines()
-            .map(|l| Line::from(Span::styled(l.to_string(), style)))
+            .map(|l| {
+                let one: String = l.chars().take(max_w).collect();
+                Line::from(Span::styled(one, style))
+            })
             .collect();
         let panel = Paragraph::new(lines).block(
             Block::default()
@@ -3034,6 +3094,23 @@ impl App {
                 .border_style(Style::default().fg(self.palette.tool)),
         );
         frame.render_widget(list, area);
+    }
+
+    /// Cap a panel buffer to roughly `cap` bytes without slicing mid-UTF-8
+    /// character (e.g. emoji like ❌). Prefer cutting at a newline.
+    fn trim_panel_utf8(panel: &mut String, cap: usize) {
+        if panel.len() <= cap {
+            return;
+        }
+        let mut start = panel.len() - cap;
+        while start < panel.len() && !panel.is_char_boundary(start) {
+            start += 1;
+        }
+        let cut = panel[start..]
+            .find('\n')
+            .map(|i| start + i + 1)
+            .unwrap_or(start);
+        panel.drain(..cut);
     }
 
     fn render_repl_panel(&mut self, frame: &mut Frame, area: Rect) {
@@ -3325,13 +3402,20 @@ impl App {
         let mut hints = String::from(" ^C quit");
         if self.input_mode == InputMode::Waiting {
             hints.push_str(" · Esc abort · Enter steer");
+            if self.queued_steers > 0 {
+                hints.push_str(&format!(" · queued:{}", self.queued_steers));
+            }
         } else if self.input_mode == InputMode::Question {
             hints.push_str(" · Enter answer · Esc cancel");
+        } else if self.pending_permission.is_some() {
+            hints.push_str(" · ASK: a once · p path · t always · d deny");
         }
         let yolo = if self.approved {
             " YOLO"
         } else if self.auto_mode {
             " AUTO"
+        } else if self.pending_permission.is_some() {
+            " ASK"
         } else {
             ""
         };
@@ -3620,6 +3704,11 @@ impl App {
                 )));
             }
         }
+
+        text.push(Line::from(Span::styled(
+            " Snapshot will track this file — /revert restores the last turn.",
+            Style::default().fg(self.palette.muted),
+        )));
 
         text.push(Line::from(""));
         text.push(Line::from(Span::styled(

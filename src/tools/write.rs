@@ -57,17 +57,35 @@ impl AgentTool for WriteTool {
             }
         };
 
-        if let Some(parent) = std::path::Path::new(&parsed.file_path).parent() {
-            if !parent.as_os_str().is_empty() {
-                if let Err(e) = fs::create_dir_all(parent).await {
-                    return ToolExecuteResult::error(format!("Failed to create directory {}: {}", parent.display(), e));
+        let path = parsed.file_path.clone();
+        crate::tools::mutation_queue::with_file_lock(&path, || async {
+            let _ = crate::tools::turn_snapshot::track(&path);
+
+            if let Some(parent) = std::path::Path::new(&path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    if let Err(e) = fs::create_dir_all(parent).await {
+                        return ToolExecuteResult::error(format!(
+                            "Failed to create directory {}: {}",
+                            parent.display(),
+                            e
+                        ));
+                    }
                 }
             }
-        }
 
-        match fs::write(&parsed.file_path, &parsed.content).await {
-            Ok(_) => ToolExecuteResult::ok(format!("Successfully wrote {} bytes to {}", parsed.content.len(), parsed.file_path)),
-            Err(e) => ToolExecuteResult::error(format!("Failed to write {}: {}", parsed.file_path, e)),
-        }
+            match fs::write(&path, &parsed.content).await {
+                Ok(_) => {
+                    let body = format!(
+                        "Successfully wrote {} bytes to {}",
+                        parsed.content.len(),
+                        path
+                    );
+                    let body = crate::tools::post_mutation::after_mutation(&path, body).await;
+                    ToolExecuteResult::ok(body)
+                }
+                Err(e) => ToolExecuteResult::error(format!("Failed to write {}: {}", path, e)),
+            }
+        })
+        .await
     }
 }

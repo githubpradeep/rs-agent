@@ -78,6 +78,20 @@ impl CallTreeInner {
     }
 }
 
+/// Collapse whitespace/newlines and cap length so Call Tree panel stays readable.
+fn sanitize_task_label(task: &str, max_chars: usize) -> String {
+    let collapsed = task
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let truncated: String = collapsed.chars().take(max_chars).collect();
+    if collapsed.chars().count() > max_chars {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
 /// Shared call tree for RLM recursive decomposition.
 #[derive(Clone, Default)]
 pub struct CallTree {
@@ -101,8 +115,9 @@ impl CallTree {
             id: id.clone(),
             parent_id: None,
             kind: CallKind::Root,
-            task: task.to_string(),
-            status: CallStatus::Running,
+            task: sanitize_task_label(task, 60),
+            // Idle placeholder until Deep Context work actually starts.
+            status: CallStatus::Done,
             summary: None,
         });
         g.root_id = Some(id.clone());
@@ -130,21 +145,47 @@ impl CallTree {
             id: id.clone(),
             parent_id: parent_id.map(|s| s.to_string()),
             kind,
-            task: task.chars().take(200).collect(),
+            task: sanitize_task_label(task, 48),
             status: CallStatus::Running,
             summary: None,
         });
         if g.root_id.is_none() && parent_id.is_none() {
             g.root_id = Some(id.clone());
         }
+        // Mark parent (usually session root) active while children run.
+        if let Some(pid) = parent_id {
+            if let Some(parent) = g.nodes.iter_mut().find(|n| n.id == pid) {
+                if parent.status == CallStatus::Done {
+                    parent.status = CallStatus::Running;
+                }
+            }
+        }
         id
     }
 
     pub fn finish(&self, id: &str, status: CallStatus, summary: Option<String>) {
         let mut g = self.inner.lock().unwrap();
+        let parent_id = g
+            .nodes
+            .iter()
+            .find(|n| n.id == id)
+            .and_then(|n| n.parent_id.clone());
         if let Some(node) = g.nodes.iter_mut().find(|n| n.id == id) {
             node.status = status;
-            node.summary = summary.map(|s| s.chars().take(500).collect());
+            node.summary = summary.map(|s| sanitize_task_label(&s, 80));
+        }
+        // If all siblings under the parent are settled, mark parent Done again.
+        if let Some(pid) = parent_id {
+            let any_running = g.nodes.iter().any(|n| {
+                n.parent_id.as_deref() == Some(pid.as_str()) && n.status == CallStatus::Running
+            });
+            if !any_running {
+                if let Some(parent) = g.nodes.iter_mut().find(|n| n.id == pid) {
+                    if parent.kind == CallKind::Root && parent.status == CallStatus::Running {
+                        parent.status = CallStatus::Done;
+                    }
+                }
+            }
         }
     }
 
@@ -210,22 +251,29 @@ impl CallTree {
 
     pub fn breadcrumb(&self) -> String {
         let g = self.inner.lock().unwrap();
-        let running: Vec<&str> = g
+        let running: Vec<&CallNode> = g
             .nodes
             .iter()
             .filter(|n| n.status == CallStatus::Running)
+            .collect();
+        // `attach_repl_tool` / `attach_task_tool` call ensure_root("session") at
+        // startup, which leaves a lone Running root forever. That is not active
+        // Deep Context — treat it as idle so the TUI does not show `[D]` / `root`.
+        if running.is_empty()
+            || (running.len() == 1 && running[0].kind == CallKind::Root)
+        {
+            return "idle".to_string();
+        }
+        running
+            .iter()
             .map(|n| match n.kind {
                 CallKind::Root => "root",
                 CallKind::Agent => "agent",
                 CallKind::Llm => "llm",
                 CallKind::Repl => "repl",
             })
-            .collect();
-        if running.is_empty() {
-            "idle".to_string()
-        } else {
-            running.join(">")
-        }
+            .collect::<Vec<_>>()
+            .join(">")
     }
 }
 
@@ -248,7 +296,11 @@ mod tests {
         let rendered = tree.render();
         assert!(rendered.contains("root"));
         assert!(rendered.contains("llm"));
-        assert_eq!(tree.breadcrumb(), "root"); // root still running
+        assert_eq!(tree.breadcrumb(), "idle"); // lone running root is not active Deep Context
+        let child2 = tree.spawn(Some(&root), CallKind::Repl, "active");
+        assert_eq!(tree.breadcrumb(), "root>repl");
+        tree.finish(&child2, CallStatus::Done, None);
+        assert_eq!(tree.breadcrumb(), "idle");
     }
 
     #[test]
@@ -265,6 +317,23 @@ mod tests {
     }
 
     #[test]
+    fn call_tree_render_collapses_multiline_task() {
+        let tree = CallTree::new();
+        let root = tree.ensure_root("session");
+        let code = "from pathlib import Path\nimport textwrap\nbase = Path('/tmp')\n";
+        let child = tree.spawn(Some(&root), CallKind::Repl, code);
+        tree.finish(&child, CallStatus::Done, Some("ok".into()));
+        let rendered = tree.render();
+        // Each node label itself must be single-line: no raw "import textwrap" line.
+        assert!(
+            !rendered.lines().any(|l| l.trim_start().starts_with("import ")),
+            "multiline code leaked into tree:\n{rendered}"
+        );
+        assert!(rendered.contains("[repl]"));
+        assert!(rendered.contains("from pathlib"));
+    }
+
+    #[test]
     fn call_tree_inner_summary_reports_counts_and_root_task() {
         let tree = CallTree::new();
         let root = tree.ensure_root("summarize me");
@@ -275,7 +344,8 @@ mod tests {
 
         let summary = tree.snapshot().summary();
         assert!(summary.contains("3 node(s)"));
-        assert!(summary.contains("1 done"));
+        // Root returns to Done once children settle; plus child `a`.
+        assert!(summary.contains("2 done"));
         assert!(summary.contains("1 error"));
         assert!(summary.contains("summarize me"));
     }

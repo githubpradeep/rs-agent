@@ -287,22 +287,19 @@ impl AgentTool for BashTool {
                 text.push('\n');
             }
             text.push_str(&format!("Exit code: {}", exit_code));
+            // Prefer tail for errors (stack traces live at the end); head for success.
+            let direction = if exit_code != 0 { "tail" } else { "head" };
+            let capped = crate::tools::truncate_store::truncate_or_spill_with(
+                &text,
+                crate::tools::truncate_store::DEFAULT_MAX_LINES,
+                crate::tools::truncate_store::DEFAULT_MAX_BYTES,
+                direction,
+            );
+            let body = format!("{warning_prefix}{}", capped.content);
             if exit_code != 0 {
-                let result_text = if text.len() > 10000 {
-                    let truncated = text.chars().take(10000).collect::<String>();
-                    format!("{}\n... (truncated, {} total chars)", truncated, text.len())
-                } else {
-                    text
-                };
-                ToolExecuteResult::error(format!("{warning_prefix}{result_text}"))
-            } else if text.len() > 10000 {
-                let truncated = text.chars().take(10000).collect::<String>();
-                ToolExecuteResult::ok(format!(
-                    "{warning_prefix}{truncated}\n... (truncated, {} total chars)",
-                    text.len()
-                ))
+                ToolExecuteResult::error(body)
             } else {
-                ToolExecuteResult::ok(format!("{warning_prefix}{text}"))
+                ToolExecuteResult::ok(body)
             }
         };
 

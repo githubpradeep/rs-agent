@@ -80,29 +80,40 @@ impl AgentTool for ApplyPatchTool {
             );
         }
 
-        let original = match fs::read_to_string(&path).await {
-            Ok(c) => c,
-            Err(e) => {
-                return ToolExecuteResult::error(format!("Failed to read {path}: {e}"))
+        crate::tools::mutation_queue::with_file_lock(&path, || async {
+            let _ = crate::tools::turn_snapshot::track(&path);
+
+            let original = match fs::read_to_string(&path).await {
+                Ok(c) => c,
+                Err(e) => {
+                    return ToolExecuteResult::error(format!("Failed to read {path}: {e}"))
+                }
+            };
+
+            let updated = match apply_hunks(&original, &hunks) {
+                Ok(c) => c,
+                Err(e) => {
+                    return ToolExecuteResult::error(format!("Patch failed for {path}:\n{e}"))
+                }
+            };
+
+            let diff_preview = crate::tools::diffutil::unified_diff(&path, &original, &updated);
+            match fs::write(&path, &updated).await {
+                Ok(_) => {
+                    let body = format!(
+                        "Successfully applied patch to {} ({} hunk{})\n\n{}",
+                        path,
+                        hunks.len(),
+                        if hunks.len() == 1 { "" } else { "s" },
+                        diff_preview
+                    );
+                    let body = crate::tools::post_mutation::after_mutation(&path, body).await;
+                    ToolExecuteResult::ok(body)
+                }
+                Err(e) => ToolExecuteResult::error(format!("Failed to write {path}: {e}")),
             }
-        };
-
-        let updated = match apply_hunks(&original, &hunks) {
-            Ok(c) => c,
-            Err(e) => return ToolExecuteResult::error(format!("Patch failed for {path}:\n{e}")),
-        };
-
-        let diff_preview = crate::tools::diffutil::unified_diff(&path, &original, &updated);
-        match fs::write(&path, &updated).await {
-            Ok(_) => ToolExecuteResult::ok(format!(
-                "Successfully applied patch to {} ({} hunk{})\n\n{}",
-                path,
-                hunks.len(),
-                if hunks.len() == 1 { "" } else { "s" },
-                diff_preview
-            )),
-            Err(e) => ToolExecuteResult::error(format!("Failed to write {path}: {e}")),
-        }
+        })
+        .await
     }
 }
 

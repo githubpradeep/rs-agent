@@ -329,6 +329,33 @@ pub fn tool_call_fingerprint(name: &str, args: &Value) -> String {
     format!("{name}|{args}")
 }
 
+/// Coarse key for near-duplicate thrash: tool + primary path / command prefix.
+pub fn tool_near_dupe_key(name: &str, args: &Value) -> String {
+    let primary = match name {
+        "edit" | "write" | "apply_patch" | "read" => args
+            .get("file_path")
+            .or_else(|| args.get("path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "bash" => args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|c| {
+                let t = c.trim();
+                t.chars().take(80).collect::<String>()
+            })
+            .unwrap_or_default(),
+        "grep" => format!(
+            "{}|{}",
+            args.get("pattern").and_then(|v| v.as_str()).unwrap_or(""),
+            args.get("path").and_then(|v| v.as_str()).unwrap_or("")
+        ),
+        _ => String::new(),
+    };
+    format!("{name}|{primary}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
