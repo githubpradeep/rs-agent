@@ -160,7 +160,7 @@ impl AgentLoop {
             provider,
             tools: ToolRegistry::new(),
             state,
-            max_iterations: 100,
+            max_iterations: 99999,
             permission_tx: None,
             compacted_up_to: 0,
             overflow_retried: false,
