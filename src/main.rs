@@ -43,7 +43,7 @@ fn apply_config_defaults(cli: &mut Cli, cfg: &Config) {
             cli.timeout = t;
         }
     }
-    if cli.max_iterations == 100 {
+    if cli.max_iterations == 99999 {
         if let Some(m) = cfg.max_iterations {
             cli.max_iterations = m;
         }
@@ -91,6 +91,12 @@ fn maybe_run_first_launch_wizard(cli: &mut Cli, cfg: &mut Config) -> Result<(), 
         return Ok(());
     }
     if cli.prompt.is_some() || cli.list_models || cli.list_sessions {
+        return Ok(());
+    }
+    if matches!(
+        cli.command,
+        Some(rs_agent::cli::Commands::Marshal(_)) | Some(rs_agent::cli::Commands::Fleet(_))
+    ) {
         return Ok(());
     }
     if !Config::user_config_needs_wizard() {
@@ -211,17 +217,150 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     rs_agent::agent::set_escalate_chars(escalate);
 
+    // City control plane (no provider required except fleet up / worker / role gargoyle).
+    if let Some(rs_agent::cli::Commands::Marshal(margs)) = cli.command.take() {
+        if let Some(ref bead) = margs.assign {
+            let seat = margs
+                .seat
+                .clone()
+                .ok_or("--assign requires --seat")?;
+            match rs_agent::marshal::assign_bead(bead, &seat) {
+                Ok(b) => println!("Assigned {} → {} — {}", b.id, seat, b.title),
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+            return Ok(());
+        }
+        let opts = rs_agent::marshal::MarshalOpts {
+            auto_assign: !margs.no_auto_assign,
+            max_assign: 8,
+            stuck_mins: margs.stuck_mins,
+            mail_stuck: margs.stuck_mins > 0,
+        };
+        if margs.r#loop {
+            rs_agent::marshal::run_loop(opts, margs.interval_secs, margs.budget_minutes).await;
+        } else {
+            println!("{}", rs_agent::marshal::run_with_opts(opts));
+        }
+        return Ok(());
+    }
+    if let Some(rs_agent::cli::Commands::Wish(wargs)) = cli.command.take() {
+        let text = wargs.text.join(" ");
+        match rs_agent::wish::create_wish(&text, wargs.task, wargs.auto) {
+            Ok(b) => println!("{}", rs_agent::wish::format_created(&b)),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+    if let Some(rs_agent::cli::Commands::Role(rargs)) = cli.command.take() {
+        let name = rargs
+            .seat
+            .or(rargs.role)
+            .ok_or("role requires --seat Beadle (or positional role name)")?;
+        let kind = rs_agent::roles::RoleKind::parse(&name)
+            .ok_or_else(|| format!("unknown role `{name}` — Beadle|Gargoyle|Drawbridge|Scryer|Marshal"))?;
+        if rargs.r#loop {
+            rs_agent::roles::run_loop(
+                kind,
+                rargs.source.clone(),
+                rargs.interval_secs,
+                rargs.budget_minutes,
+            )
+            .await?;
+        } else {
+            match rs_agent::roles::run_once(kind, rargs.source.as_deref()) {
+                Ok(msg) => println!("{msg}"),
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        return Ok(());
+    }
+    if let Some(rs_agent::cli::Commands::Fleet(fargs)) = cli.command.take() {
+        match fargs.command {
+            rs_agent::cli::FleetCommand::Up {
+                seats,
+                budget_minutes,
+                sleep_secs,
+                quiet,
+                fail_fast,
+            } => {
+                let opts = rs_agent::fleet::FleetUpOpts {
+                    seats: rs_agent::fleet::parse_seat_list(&seats),
+                    budget_minutes,
+                    sleep_secs,
+                    quiet,
+                    provider: cli.provider.clone(),
+                    model: cli.model.clone(),
+                    approve: true, // fleet is unattended
+                    fail_fast,
+                };
+                match rs_agent::fleet::fleet_up(opts) {
+                    Ok(msg) => println!("{msg}"),
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            rs_agent::cli::FleetCommand::Down { seats } => {
+                let list = seats
+                    .as_deref()
+                    .map(rs_agent::fleet::parse_seat_list);
+                println!("{}", rs_agent::fleet::fleet_down(list));
+            }
+            rs_agent::cli::FleetCommand::Status => {
+                println!("{}", rs_agent::fleet::fleet_status());
+            }
+            rs_agent::cli::FleetCommand::Logs { seat, lines } => {
+                println!("{}", rs_agent::fleet::fleet_logs(&seat, lines));
+            }
+        }
+        return Ok(());
+    }
+
     let provider_name = cli
         .provider
         .clone()
         .unwrap_or_else(|| "anthropic".to_string());
-    let model = {
+    let mut model = {
         let m = cli
             .model
             .clone()
             .unwrap_or_else(|| get_default_model(&provider_name).to_string());
         cfg.resolve_model_alias(&m)
     };
+
+    // Fleet seat may override model (and optionally provider) before provider construction.
+    let mut provider_name = provider_name;
+    if let Some(rs_agent::cli::Commands::Worker(ref wargs)) = cli.command {
+        if let Some(ref seat_name) = wargs.seat {
+            if let Ok(seat) = rs_agent::agent::seat::load(seat_name) {
+                if let Some(ref p) = seat.provider {
+                    if !p.trim().is_empty() {
+                        provider_name = p.trim().to_string();
+                    }
+                }
+                if let Some(ref m) = seat.model {
+                    if !m.trim().is_empty() {
+                        model = cfg.resolve_model_alias(m.trim());
+                    }
+                }
+                if seat.role.eq_ignore_ascii_case("marshal") {
+                    eprintln!(
+                        "[worker] seat `{seat_name}` has role marshal — prefer `rs-agent marshal --once` for reclaim/summary"
+                    );
+                }
+            }
+        }
+    }
 
     let provider = get_provider(
         &provider_name,
@@ -288,6 +427,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...");
         eprintln!("  or put keys in ~/.aws/credentials under [default] / $AWS_PROFILE");
         std::process::exit(1);
+    }
+
+    // Overnight factory worker (headless).
+    if let Some(rs_agent::cli::Commands::Worker(wargs)) = cli.command.take() {
+        let thinking_budget = resolve_thinking_budget(&cli, provider.as_ref());
+        let mut system_prompt = if let Some(ref sp) = cli.system_prompt {
+            sp.clone()
+        } else {
+            rs_agent::agent::default_system_prompt()
+        };
+        for extra in &cli.append_system_prompt {
+            if let Some(path) = extra.strip_prefix('@') {
+                if let Ok(body) = std::fs::read_to_string(path) {
+                    system_prompt.push_str("\n\n");
+                    system_prompt.push_str(&body);
+                }
+            } else {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(extra);
+            }
+        }
+        if !cli.no_context_files {
+            let context_files = context::discover_context_files();
+            let context_section = context::build_context_section(&context_files);
+            if !context_section.is_empty() {
+                system_prompt.push_str(&context_section);
+            }
+        }
+        let wcfg = rs_agent::worker::WorkerConfig {
+            loop_mode: wargs.r#loop && !wargs.once,
+            budget_minutes: wargs.budget_minutes,
+            approve: true, // unattended requires approve
+            seat: wargs.seat,
+            fail_fast: wargs.fail_fast,
+            max_rlm_depth: cli.rlm_depth,
+            max_iterations: cli.max_iterations,
+            thinking_budget,
+            sleep_secs: wargs.sleep_secs,
+            goal_verify: cfg.goal_verify.unwrap_or(true),
+            verbose: wargs.verbose && !wargs.quiet,
+        };
+        eprintln!(
+            "rs-agent worker — loop={} budget={}m seat={:?}",
+            wcfg.loop_mode, wcfg.budget_minutes, wcfg.seat
+        );
+        rs_agent::worker::run_worker(
+            provider,
+            model,
+            provider_name,
+            system_prompt,
+            wcfg,
+        )
+        .await?;
+        return Ok(());
     }
 
     if cli.list_models {
@@ -357,7 +550,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .with_thinking_budget(thinking_budget),
         )
         .with_max_iterations(cli.max_iterations)
-        .with_rlm_depth(0, cli.rlm_depth);
+        .with_rlm_depth(0, cli.rlm_depth)
+        .with_goal_verify(cfg.goal_verify.unwrap_or(true));
         rs_agent::tools::register_default_tools_with_rlm(&mut agent, cli.rlm_depth);
         {
             let mcp_cfg = rs_agent::config::Config::load().mcp;

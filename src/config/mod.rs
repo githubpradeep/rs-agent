@@ -31,8 +31,9 @@ const USER_CONFIG_TEMPLATE: &str = r#"# rs-agent user config
 # auto_mode = false
 # rlm_depth = 2
 # rlm_escalate_chars = 10000
+# goal_verify = true
 # thinking_budget = 10000
-# max_iterations = 100
+# max_iterations = 99999
 # timeout = 300
 # base_url = "https://api.anthropic.com/v1"
 # disable_mouse = false
@@ -76,6 +77,8 @@ pub struct Config {
     pub rlm_escalate_chars: Option<usize>,
     pub thinking_budget: Option<u32>,
     pub max_iterations: Option<usize>,
+    /// When true (default), `/goal` runs a tool-using verify subagent after the transcript check.
+    pub goal_verify: Option<bool>,
     pub timeout: Option<u64>,
     pub base_url: Option<String>,
     pub model_aliases: HashMap<String, String>,
@@ -168,6 +171,9 @@ impl Config {
         }
         if other.max_iterations.is_some() {
             self.max_iterations = other.max_iterations;
+        }
+        if other.goal_verify.is_some() {
+            self.goal_verify = other.goal_verify;
         }
         if other.timeout.is_some() {
             self.timeout = other.timeout;

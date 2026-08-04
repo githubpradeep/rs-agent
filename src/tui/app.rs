@@ -104,6 +104,15 @@ enum AppCommand {
     SetTitle { title: String },
     SetSystemPrompt { prompt: String },
     Init { messages: Vec<Message> },
+    GoalSet { condition: String },
+    GoalClear,
+    GoalPause,
+    GoalResume,
+    GoalStatus,
+    /// Request a consenting handoff (injects user message).
+    HandoffRequest,
+    /// Bind or clear seat identity (`None` = clear).
+    SetSeat { name: Option<String> },
     Exit,
 }
 
@@ -148,6 +157,8 @@ pub struct App {
     near_limit: bool,
     session_id: String,
     session_title: Option<String>,
+    /// Footer chip while `/goal` is active/paused (Claude Code `◎ /goal`).
+    goal_indicator: String,
     model_name: String,
     agent_mode: AgentMode,
     chat_area_y: u16,
@@ -303,6 +314,14 @@ impl App {
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
         });
         let resume_msgs = resume.as_ref().map(|s| s.messages.clone()).unwrap_or_default();
+        let resume_goal = resume.as_ref().and_then(|s| s.goal.clone()).filter(|g| {
+            matches!(
+                g.status,
+                crate::agent::goal::GoalStatus::Active | crate::agent::goal::GoalStatus::Paused
+            )
+        });
+        let resume_seat = resume.as_ref().and_then(|s| s.seat.clone());
+        let resume_handoff = resume.as_ref().and_then(|s| s.handoff.clone());
         let title = resume.as_ref().and_then(|s| s.title.clone());
         let parent_id_resume = resume.as_ref().and_then(|s| s.parent_id.clone());
         let branch_label_resume = resume.as_ref().and_then(|s| s.branch_label.clone());
@@ -324,16 +343,31 @@ impl App {
                 let mut state = AgentState::new(model2, provider_name)
                     .with_system_prompt(sp)
                     .with_thinking_budget(thinking_budget);
+                state.goal = resume_goal;
+                state.seat = resume_seat.clone();
+                state.handoff = resume_handoff.clone();
+                crate::agent::handoff::restore(resume_handoff);
+                if let Some(ref seat_name) = resume_seat {
+                    crate::tools::handoff::set_active_seat(Some(seat_name.clone()));
+                }
+                // Wake with purpose after resume (or when seat/handoff present).
+                state.pending_wake = state.seat.is_some()
+                    || state.handoff.is_some()
+                    || state.goal.is_some();
 
                 for msg in &resume_msgs {
                     state.add_message(msg.clone());
                 }
 
+                let goal_verify = crate::config::Config::load()
+                    .goal_verify
+                    .unwrap_or(true);
                 let mut agent_loop = AgentLoop::new(provider2, state)
                     .with_max_iterations(max_iterations)
                     .with_abort(abort_for_thread.clone())
                     .with_steer(steer_for_thread.clone())
-                    .with_rlm_depth(0, max_rlm_depth);
+                    .with_rlm_depth(0, max_rlm_depth)
+                    .with_goal_verify(goal_verify);
                 if !approve {
                     agent_loop.set_permission_channel(permission_tx);
                 }
@@ -391,6 +425,12 @@ impl App {
                         }
                         AppCommand::NewSession => {
                             agent_loop.clear_messages();
+                            agent_loop.clear_goal();
+                            agent_loop.state_mut().seat = None;
+                            agent_loop.state_mut().handoff = None;
+                            agent_loop.state_mut().pending_wake = false;
+                            crate::agent::handoff::clear();
+                            crate::tools::handoff::set_active_seat(None);
                             abort_for_thread.clear();
                             steer_for_thread.clear();
                             crate::tools::todowrite::clear();
@@ -402,6 +442,9 @@ impl App {
                             let _ = event_tx.send((0, AgentEvent::SessionMeta {
                                 id: session_id_local.clone(),
                                 title: None,
+                            }));
+                            let _ = event_tx.send((0, AgentEvent::GoalUpdate {
+                                summary: String::new(),
                             }));
                             let _ = event_tx.send((0, AgentEvent::Status {
                                 message: format!("new session {}", session_id_local),
@@ -428,6 +471,9 @@ impl App {
                                 total_output_tokens: s.total_output_tokens,
                                 call_tree: tree_snapshot,
                                 todos: Some(crate::tools::todowrite::snapshot()),
+                                goal: s.goal.clone(),
+                                seat: s.seat.clone(),
+                                handoff: s.handoff.clone().or_else(crate::agent::handoff::snapshot),
                             };
                             current.ensure_title();
                             let _ = store.save(&current);
@@ -439,10 +485,21 @@ impl App {
                                     parent_id_local = forked.parent_id.clone();
                                     branch_label_local = forked.branch_label.clone();
                                     agent_loop.state_mut().messages = forked.messages.clone();
+                                    agent_loop.state_mut().goal = forked.goal.clone();
+                                    agent_loop.state_mut().seat = forked.seat.clone();
+                                    agent_loop.state_mut().handoff = forked.handoff.clone();
+                                    crate::agent::handoff::restore(forked.handoff.clone());
+                                    crate::tools::handoff::set_active_seat(forked.seat.clone());
+                                    agent_loop.state_mut().pending_wake = true;
                                     let _ = event_tx.send((0, AgentEvent::SessionMeta {
                                         id: session_id_local.clone(),
                                         title: title_local.clone(),
                                     }));
+                                    if let Some(ref g) = forked.goal {
+                                        let _ = event_tx.send((0, AgentEvent::GoalUpdate {
+                                            summary: format!("{}: {}", g.status.as_str(), g.condition),
+                                        }));
+                                    }
                                     let _ = event_tx.send((0, AgentEvent::ReloadTranscript {
                                         messages: forked.messages.clone(),
                                     }));
@@ -505,6 +562,128 @@ impl App {
                                 message: "system prompt rebuilt".to_string(),
                             }));
                         }
+                        AppCommand::GoalSet { condition } => {
+                            agent_loop.set_goal(condition.clone());
+                            let _ = event_tx.send((0, AgentEvent::GoalUpdate {
+                                summary: format!("active: {condition}"),
+                            }));
+                            let _ = event_tx.send((0, AgentEvent::Status {
+                                message: "◎ /goal set — starting turn".into(),
+                            }));
+                        }
+                        AppCommand::GoalClear => {
+                            let msg = match agent_loop.clear_goal() {
+                                Some(g) => format!("Goal cleared: {}", g.condition),
+                                None => "No goal set".into(),
+                            };
+                            let _ = event_tx.send((0, AgentEvent::GoalUpdate {
+                                summary: String::new(),
+                            }));
+                            let _ = event_tx.send((0, AgentEvent::Status { message: msg }));
+                        }
+                        AppCommand::GoalPause => {
+                            let msg = if agent_loop.pause_goal() {
+                                "Goal paused".into()
+                            } else {
+                                "No active goal to pause".into()
+                            };
+                            let _ = event_tx.send((0, AgentEvent::GoalUpdate {
+                                summary: "paused".into(),
+                            }));
+                            let _ = event_tx.send((0, AgentEvent::Status { message: msg }));
+                        }
+                        AppCommand::GoalResume => {
+                            let msg = if agent_loop.resume_goal() {
+                                "Goal resumed".into()
+                            } else {
+                                "No paused goal to resume".into()
+                            };
+                            let summary = agent_loop
+                                .state()
+                                .goal
+                                .as_ref()
+                                .map(|g| format!("{}: {}", g.status.as_str(), g.condition))
+                                .unwrap_or_default();
+                            let _ = event_tx.send((0, AgentEvent::GoalUpdate { summary }));
+                            let _ = event_tx.send((0, AgentEvent::Status { message: msg }));
+                        }
+                        AppCommand::GoalStatus => {
+                            let s = agent_loop.state();
+                            let msg = match &s.goal {
+                                Some(g) => g.status_line(s.total_input_tokens, s.total_output_tokens),
+                                None => "No goal set. Usage: /goal <condition>".into(),
+                            };
+                            let _ = event_tx.send((0, AgentEvent::Status { message: msg.clone() }));
+                            let _ = event_tx.send((0, AgentEvent::GoalUpdate {
+                                summary: format!("STATUS\n{msg}"),
+                            }));
+                        }
+                        AppCommand::HandoffRequest => {
+                            let text = crate::agent::handoff::handoff_request_message();
+                            abort_for_thread.clear();
+                            let event_tx2 = event_tx.clone();
+                            let mut cb = move |event: AgentEvent| {
+                                let _ = event_tx2.send((0, event));
+                            };
+                            let result = tokio::time::timeout(
+                                timeout,
+                                agent_loop.run(&text, &mut cb),
+                            )
+                            .await;
+                            match result {
+                                Ok(Ok(())) => {
+                                    let _ = event_tx.send((0, AgentEvent::TreeUpdate {
+                                        tree: agent_loop.call_tree().clone(),
+                                    }));
+                                }
+                                Ok(Err(e)) => {
+                                    let _ = event_tx.send((0, AgentEvent::Error { message: e }));
+                                }
+                                Err(_) => {
+                                    abort_for_thread.abort();
+                                    let _ = event_tx.send((0, AgentEvent::Error {
+                                        message: format!("Request timed out after {}s", timeout_secs),
+                                    }));
+                                }
+                            }
+                            // Persist after handoff turn
+                            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                            let s = agent_loop.state();
+                            let tree_snapshot =
+                                serde_json::to_value(agent_loop.call_tree().snapshot()).ok();
+                            let mut session_data = SessionData {
+                                id: session_id_local.clone(),
+                                title: title_local.clone(),
+                                parent_id: parent_id_local.clone(),
+                                branch_label: branch_label_local.clone(),
+                                created_at: created_at_local.clone(),
+                                updated_at: now,
+                                model: s.model.clone(),
+                                provider: s.provider.clone(),
+                                system_prompt: s.system_prompt.clone(),
+                                messages: s.messages.clone(),
+                                total_input_tokens: s.total_input_tokens,
+                                total_output_tokens: s.total_output_tokens,
+                                call_tree: tree_snapshot,
+                                todos: Some(crate::tools::todowrite::snapshot()),
+                                goal: s.goal.clone(),
+                                seat: s.seat.clone(),
+                                handoff: s.handoff.clone().or_else(crate::agent::handoff::snapshot),
+                            };
+                            session_data.ensure_title();
+                            title_local = session_data.title.clone();
+                            let _ = store.save(&session_data);
+                        }
+                        AppCommand::SetSeat { name } => {
+                            agent_loop.state_mut().seat = name.clone();
+                            crate::tools::handoff::set_active_seat(name.clone());
+                            agent_loop.state_mut().pending_wake = true;
+                            let msg = match name {
+                                Some(n) => format!("Seat bound: {n} — wake packet armed"),
+                                None => "Seat cleared".to_string(),
+                            };
+                            let _ = event_tx.send((0, AgentEvent::Status { message: msg }));
+                        }
                         AppCommand::SetTitle { title } => {
                             title_local = Some(title.clone());
                             let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -526,6 +705,9 @@ impl App {
                                 total_output_tokens: s.total_output_tokens,
                                 call_tree: tree_snapshot,
                                 todos: Some(crate::tools::todowrite::snapshot()),
+                                goal: s.goal.clone(),
+                                seat: s.seat.clone(),
+                                handoff: s.handoff.clone().or_else(crate::agent::handoff::snapshot),
                             };
                             let _ = store.save(&session_data);
                             let _ = event_tx.send((0, AgentEvent::Status {
@@ -576,6 +758,9 @@ impl App {
                                 total_output_tokens: s.total_output_tokens,
                                 call_tree: tree_snapshot,
                                 todos: Some(crate::tools::todowrite::snapshot()),
+                                goal: s.goal.clone(),
+                                seat: s.seat.clone(),
+                                handoff: s.handoff.clone().or_else(crate::agent::handoff::snapshot),
                             };
                             session_data.ensure_title();
                             title_local = session_data.title.clone();
@@ -739,6 +924,18 @@ impl App {
             near_limit: false,
             session_id,
             session_title: title,
+            goal_indicator: resume
+                .as_ref()
+                .and_then(|s| s.goal.as_ref())
+                .filter(|g| {
+                    matches!(
+                        g.status,
+                        crate::agent::goal::GoalStatus::Active
+                            | crate::agent::goal::GoalStatus::Paused
+                    )
+                })
+                .map(|g| format!("◎ /goal {}", g.status.as_str()))
+                .unwrap_or_default(),
             model_name: model.clone(),
             agent_mode: AgentMode::Agent,
             chat_area_y: 0,
@@ -989,10 +1186,22 @@ impl App {
                 }
             }
             AgentEvent::Error { message } => {
-                if let Some(last) = self.messages.last_mut() {
+                let transport = message.to_lowercase().contains("stream error")
+                    || message.to_lowercase().contains("error sending request")
+                    || message.to_lowercase().contains("timed out")
+                    || message.to_lowercase().contains("connection");
+                if transport {
+                    self.push_system(format!(
+                        "Provider hiccup: {message}\n\
+                         Type continue or /handoff — session stayed open."
+                    ));
+                    self.status = "recover".to_string();
+                } else if let Some(last) = self.messages.last_mut() {
                     last.text.push_str(&format!("\n❌ Error: {}", message));
+                    self.status = "error".to_string();
+                } else {
+                    self.status = "error".to_string();
                 }
-                self.status = "error".to_string();
                 self.input_mode = InputMode::Insert;
                 self.tool_in_progress = None;
             }
@@ -1006,6 +1215,22 @@ impl App {
                 self.near_limit = false;
                 self.queued_steers = 0;
                 self.tool_in_progress = None;
+            }
+            AgentEvent::GoalUpdate { summary } => {
+                if summary.starts_with("STATUS\n") {
+                    self.push_system(summary.trim_start_matches("STATUS\n").to_string());
+                } else if summary.is_empty() {
+                    self.goal_indicator.clear();
+                } else if summary.starts_with("achieved") {
+                    self.goal_indicator = "◎ goal achieved".into();
+                    self.push_system(format!("◎ {summary}"));
+                } else if summary.starts_with("paused") {
+                    self.goal_indicator = "◎ /goal paused".into();
+                } else if summary.starts_with("active") {
+                    self.goal_indicator = "◎ /goal active".into();
+                } else {
+                    self.goal_indicator = format!("◎ /goal {summary}");
+                }
             }
             AgentEvent::ToolUseDelta { input: _ } => {}
             AgentEvent::ReplOutput { stream, text } => {
@@ -1056,6 +1281,15 @@ impl App {
                 self.near_limit = false;
             }
             AgentEvent::Status { message } => {
+                if message.contains("stream failed") || message.contains("recovering") {
+                    if message.contains("stream failed") && message.contains("session ready") {
+                        self.push_system(
+                            "stream failed — type continue or /handoff (tools settled; files restored if possible)",
+                        );
+                    }
+                    self.input_mode = InputMode::Insert;
+                    self.tool_in_progress = None;
+                }
                 self.status = message;
             }
             AgentEvent::Aborted => {
@@ -1262,7 +1496,11 @@ impl App {
                      /help /keys /clear /context [on|off] /commands /tree\n\
                      /skills  /skill <name>  /prompt|/p <name> [args]  /reload\n\
                      /mode plan|ask|agent  /model [provider/model]  /provider|/login [name]\n\
-                     /theme [dark|light|forest]  /compact  /new  /fork [@N] [label]  /timeline  /sessions\n\
+                     /goal [condition|clear|pause|resume]  /theme [dark|light|forest]\n\
+                     /handoff  /seat [name|clear|list|caste|…]  /beads [ready]  /laurel <text>  /laurels\n\
+                     /worker [seat]  /marshal [assign …]  /fleet [up|down|logs|status]\n\
+                     /mail [send|ack]  /wish …  /moot …  /brain remember|falsify <…>\n\
+                     /compact  /new  /fork [@N] [label]  /timeline  /sessions\n\
                      /export [md|json|html]  /image [path]  /lsp [start|stop|status]  /skill-pack export|import\n\
                      /revert  /trust list|reset  /rename <title>  /history [query|n]\n\n\
                      Keys: {}\n\
@@ -1380,7 +1618,526 @@ impl App {
                         self.messages.push(b);
                     }
                 }
+                self.goal_indicator.clear();
+                let _ = self.command_tx.send(AppCommand::GoalClear);
                 self.push_system("Chat cleared (session kept). Use /new for a fresh session.");
+            }
+            "/goal" => {
+                match crate::agent::parse_goal_arg(arg) {
+                    Ok(crate::agent::GoalCommand::Status) => {
+                        let _ = self.command_tx.send(AppCommand::GoalStatus);
+                    }
+                    Ok(crate::agent::GoalCommand::Clear) => {
+                        self.goal_indicator.clear();
+                        let _ = self.command_tx.send(AppCommand::GoalClear);
+                    }
+                    Ok(crate::agent::GoalCommand::Pause) => {
+                        let _ = self.command_tx.send(AppCommand::GoalPause);
+                    }
+                    Ok(crate::agent::GoalCommand::Resume) => {
+                        let _ = self.command_tx.send(AppCommand::GoalResume);
+                    }
+                    Ok(crate::agent::GoalCommand::Set(condition)) => {
+                        self.goal_indicator = "◎ /goal active".into();
+                        let _ = self.command_tx.send(AppCommand::GoalSet {
+                            condition: condition.clone(),
+                        });
+                        self.push_system(format!("◎ /goal set — {condition}"));
+                        // Claude Code: setting a goal starts a turn immediately.
+                        self.submit_user_text(condition);
+                    }
+                    Err(e) => self.push_system(e),
+                }
+            }
+            "/handoff" => {
+                self.push_system(
+                    "Requesting handoff — agent will write notes then end the turn.",
+                );
+                let _ = self.command_tx.send(AppCommand::HandoffRequest);
+            }
+            "/seat" => {
+                match crate::agent::parse_seat_arg(arg) {
+                    Ok(crate::agent::SeatCommand::Status) => {
+                        self.push_system(
+                            "Usage: /seat <name> | clear | list | pronouns … | role … | caste … | orders … | model … | rename …",
+                        );
+                    }
+                    Ok(crate::agent::SeatCommand::Clear) => {
+                        let _ = self.command_tx.send(AppCommand::SetSeat { name: None });
+                        self.push_system("Seat cleared");
+                    }
+                    Ok(crate::agent::SeatCommand::List) => {
+                        let names = crate::agent::seat::list_names();
+                        if names.is_empty() {
+                            self.push_system("No seats yet. Create with /seat <name>");
+                        } else {
+                            self.push_system(format!("Seats: {}", names.join(", ")));
+                        }
+                    }
+                    Ok(crate::agent::SeatCommand::Bind(name)) => {
+                        match crate::agent::seat::load_or_create(&name) {
+                            Ok(seat) => {
+                                let _ = self.command_tx.send(AppCommand::SetSeat {
+                                    name: Some(seat.name.clone()),
+                                });
+                                self.push_system(format!(
+                                    "Seat `{}` bound{}",
+                                    seat.name,
+                                    if seat.role.is_empty() {
+                                        " — set role with /seat role …".to_string()
+                                    } else {
+                                        format!(" ({})", seat.role)
+                                    }
+                                ));
+                            }
+                            Err(e) => self.push_system(e),
+                        }
+                    }
+                    Ok(crate::agent::SeatCommand::SetPronouns(p)) => {
+                        if let Some(name) = crate::tools::handoff::active_seat() {
+                            match crate::agent::seat::load(&name) {
+                                Ok(mut seat) => {
+                                    seat.pronouns = p;
+                                    if let Err(e) = crate::agent::seat::save(&seat) {
+                                        self.push_system(e);
+                                    } else {
+                                        let _ = self.command_tx.send(AppCommand::SetSeat {
+                                            name: Some(seat.name),
+                                        });
+                                        self.push_system("Pronouns updated");
+                                    }
+                                }
+                                Err(e) => self.push_system(e),
+                            }
+                        } else {
+                            self.push_system("Bind a seat first: /seat <name>");
+                        }
+                    }
+                    Ok(crate::agent::SeatCommand::SetRole(role)) => {
+                        if let Some(name) = crate::tools::handoff::active_seat() {
+                            match crate::agent::seat::load(&name) {
+                                Ok(mut seat) => {
+                                    seat.role = role;
+                                    if let Err(e) = crate::agent::seat::save(&seat) {
+                                        self.push_system(e);
+                                    } else {
+                                        let _ = self.command_tx.send(AppCommand::SetSeat {
+                                            name: Some(seat.name),
+                                        });
+                                        self.push_system("Role updated");
+                                    }
+                                }
+                                Err(e) => self.push_system(e),
+                            }
+                        } else {
+                            self.push_system("Bind a seat first: /seat <name>");
+                        }
+                    }
+                    Ok(crate::agent::SeatCommand::SetCaste(caste)) => {
+                        if let Some(name) = crate::tools::handoff::active_seat() {
+                            match crate::agent::seat::load(&name) {
+                                Ok(mut seat) => {
+                                    seat.caste = caste;
+                                    if let Err(e) = crate::agent::seat::save(&seat) {
+                                        self.push_system(e);
+                                    } else {
+                                        let _ = self.command_tx.send(AppCommand::SetSeat {
+                                            name: Some(seat.name.clone()),
+                                        });
+                                        self.push_system(format!(
+                                            "Caste set to `{}` (effective: {})",
+                                            caste.as_str(),
+                                            seat.effective_caste().as_str()
+                                        ));
+                                    }
+                                }
+                                Err(e) => self.push_system(e),
+                            }
+                        } else {
+                            self.push_system("Bind a seat first: /seat <name>");
+                        }
+                    }
+                    Ok(crate::agent::SeatCommand::SetOrders(orders)) => {
+                        if let Some(name) = crate::tools::handoff::active_seat() {
+                            match crate::agent::seat::load(&name) {
+                                Ok(mut seat) => {
+                                    seat.standing_orders = orders;
+                                    if let Err(e) = crate::agent::seat::save(&seat) {
+                                        self.push_system(e);
+                                    } else {
+                                        let _ = self.command_tx.send(AppCommand::SetSeat {
+                                            name: Some(seat.name),
+                                        });
+                                        self.push_system("Standing orders updated");
+                                    }
+                                }
+                                Err(e) => self.push_system(e),
+                            }
+                        } else {
+                            self.push_system("Bind a seat first: /seat <name>");
+                        }
+                    }
+                    Ok(crate::agent::SeatCommand::SetModel(model)) => {
+                        if let Some(name) = crate::tools::handoff::active_seat() {
+                            match crate::agent::seat::load(&name) {
+                                Ok(mut seat) => {
+                                    seat.model = model.clone();
+                                    if let Err(e) = crate::agent::seat::save(&seat) {
+                                        self.push_system(e);
+                                    } else {
+                                        let _ = self.command_tx.send(AppCommand::SetSeat {
+                                            name: Some(seat.name),
+                                        });
+                                        self.push_system(match model {
+                                            Some(m) => format!("Seat model set to {m}"),
+                                            None => "Seat model cleared".into(),
+                                        });
+                                    }
+                                }
+                                Err(e) => self.push_system(e),
+                            }
+                        } else {
+                            self.push_system("Bind a seat first: /seat <name>");
+                        }
+                    }
+                    Ok(crate::agent::SeatCommand::Rename(new_name)) => {
+                        if let Some(old) = crate::tools::handoff::active_seat() {
+                            match crate::agent::seat::rename(&old, &new_name) {
+                                Ok(seat) => {
+                                    let _ = self.command_tx.send(AppCommand::SetSeat {
+                                        name: Some(seat.name.clone()),
+                                    });
+                                    self.push_system(format!(
+                                        "Renamed seat → {} (history preserved)",
+                                        seat.name
+                                    ));
+                                }
+                                Err(e) => self.push_system(e),
+                            }
+                        } else {
+                            self.push_system("Bind a seat first: /seat <name>");
+                        }
+                    }
+                    Err(e) => self.push_system(e),
+                }
+            }
+            "/beads" => {
+                let sub = arg.trim().to_lowercase();
+                if sub == "ready" {
+                    match crate::beads::list_ready(None) {
+                        Ok(items) => {
+                            let mut out = String::new();
+                            if let Some(c) = crate::beads::format_counts_line(None) {
+                                out.push_str(&c);
+                                out.push('\n');
+                            }
+                            if items.is_empty() {
+                                out.push_str("No ready beads.");
+                            } else {
+                                out.push_str("Ready:\n");
+                                out.push_str(&crate::beads::format_summary(&items));
+                            }
+                            self.push_system(out);
+                        }
+                        Err(e) => self.push_system(e),
+                    }
+                } else {
+                    match crate::beads::list(None) {
+                        Ok(items) => {
+                            let mut out = String::new();
+                            if let Some(c) = crate::beads::format_counts_line(None) {
+                                out.push_str(&c);
+                                out.push('\n');
+                            }
+                            out.push_str(&crate::beads::format_summary(&items));
+                            self.push_system(out);
+                        }
+                        Err(e) => self.push_system(e),
+                    }
+                }
+            }
+            "/worker" => {
+                let seat = arg.trim();
+                if seat.is_empty() {
+                    self.push_system(crate::fleet::format_worker_help(None));
+                } else {
+                    self.push_system(crate::fleet::format_worker_help(Some(seat)));
+                }
+            }
+            "/marshal" => {
+                let rest = arg.trim();
+                if rest.is_empty() {
+                    let mut out = crate::marshal::run_once();
+                    if let Some(r) = crate::marshal::read_last_report() {
+                        out.push_str(&format!("\n(report saved at {})", r.at));
+                    }
+                    self.push_system(out);
+                } else if let Some(rest) = rest.strip_prefix("assign ") {
+                    let mut parts = rest.split_whitespace();
+                    let bead = parts.next().unwrap_or("");
+                    let seat = parts.next().unwrap_or("");
+                    if bead.is_empty() || seat.is_empty() {
+                        self.push_system("Usage: /marshal assign <bead> <seat>");
+                    } else {
+                        match crate::marshal::assign_bead(bead, seat) {
+                            Ok(b) => self.push_system(format!(
+                                "Assigned {} → {} — {}",
+                                b.id, seat, b.title
+                            )),
+                            Err(e) => self.push_system(e),
+                        }
+                    }
+                } else {
+                    self.push_system("Usage: /marshal | /marshal assign <bead> <seat>");
+                }
+            }
+            "/mail" => {
+                let rest = arg.trim();
+                if rest.is_empty() || rest == "inbox" || rest == "read" {
+                    let seat = crate::tools::handoff::active_seat();
+                    self.push_system(crate::mail::format_inbox(seat.as_deref()));
+                } else if let Some(rest) = rest.strip_prefix("ack ") {
+                    match crate::mail::ack(rest.trim()) {
+                        Ok(m) => self.push_system(format!("Acked {}", m.id)),
+                        Err(e) => self.push_system(e),
+                    }
+                } else if let Some(rest) = rest.strip_prefix("send ") {
+                    // /mail send <to> <body…>
+                    let mut parts = rest.splitn(2, char::is_whitespace);
+                    let to = parts.next().unwrap_or("").trim();
+                    let body = parts.next().unwrap_or("").trim();
+                    if to.is_empty() || body.is_empty() {
+                        self.push_system("Usage: /mail send <to> <body>");
+                    } else {
+                        let from = crate::tools::handoff::active_seat()
+                            .unwrap_or_else(|| "human".into());
+                        match crate::mail::send(&from, to, body, vec![]) {
+                            Ok(m) => self.push_system(format!("Sent {} → {}", m.id, m.to)),
+                            Err(e) => self.push_system(e),
+                        }
+                    }
+                } else {
+                    self.push_system(
+                        "Usage: /mail | /mail send <to> <body> | /mail ack <id>",
+                    );
+                }
+            }
+            "/wish" => {
+                let text = arg.trim();
+                if text.is_empty() {
+                    self.push_system("Usage: /wish <text>  (creates a design bead labeled wish)");
+                } else {
+                    match crate::wish::create_wish(text, false, true) {
+                        Ok(b) => self.push_system(crate::wish::format_created(&b)),
+                        Err(e) => self.push_system(e),
+                    }
+                }
+            }
+            "/moot" => {
+                let rest = arg.trim();
+                if rest.is_empty() || rest == "list" {
+                    self.push_system(crate::moot::list());
+                } else if let Some(topic) = rest.strip_prefix("open ") {
+                    match crate::moot::open(topic.trim()) {
+                        Ok(m) => self.push_system(format!("Opened {} — {}", m.id, m.topic)),
+                        Err(e) => self.push_system(e),
+                    }
+                } else if let Some(rest) = rest.strip_prefix("append ") {
+                    let mut parts = rest.splitn(2, char::is_whitespace);
+                    let id = parts.next().unwrap_or("");
+                    let text = parts.next().unwrap_or("").trim();
+                    let from = crate::tools::handoff::active_seat()
+                        .unwrap_or_else(|| "human".into());
+                    match crate::moot::append(id, &from, text) {
+                        Ok(m) => self.push_system(format!(
+                            "Appended to {} ({} entries)",
+                            m.id,
+                            m.entries.len()
+                        )),
+                        Err(e) => self.push_system(e),
+                    }
+                } else if let Some(rest) = rest.strip_prefix("close ") {
+                    let mut parts = rest.splitn(2, char::is_whitespace);
+                    let id = parts.next().unwrap_or("");
+                    let summary = parts.next().map(|s| s.trim());
+                    match crate::moot::close(id, summary) {
+                        Ok(m) => self.push_system(format!("Closed {}", m.id)),
+                        Err(e) => self.push_system(e),
+                    }
+                } else if let Some(id) = rest.strip_prefix("show ") {
+                    match crate::moot::show(id.trim()) {
+                        Ok(s) => self.push_system(s),
+                        Err(e) => self.push_system(e),
+                    }
+                } else {
+                    self.push_system(
+                        "Usage: /moot | open <topic> | append <id> <text> | close <id> [summary] | show <id>",
+                    );
+                }
+            }
+            "/laurels" => {
+                let items = crate::agent::laurel::recent(12);
+                if items.is_empty() {
+                    self.push_system(
+                        "No laurels yet. Sit with this quiet — recognition comes without chasing.\n\
+                         Add with /laurel <praise text>.",
+                    );
+                } else {
+                    let mut out = String::from(
+                        "## Laurels (sit with these — no work attached)\n",
+                    );
+                    for l in &items {
+                        let seat = l.seat.as_deref().unwrap_or("—");
+                        out.push_str(&format!(
+                            "- [{}] ({}) {}\n",
+                            l.written_at, seat, l.text.trim()
+                        ));
+                    }
+                    self.push_system(out);
+                }
+            }
+            "/fleet" => {
+                let raw = arg.trim();
+                let lower = raw.to_lowercase();
+                if lower.is_empty() || lower == "status" {
+                    self.push_system(crate::fleet::fleet_status());
+                } else if lower == "down" {
+                    self.push_system(crate::fleet::fleet_down(None));
+                } else if let Some(rest) = lower.strip_prefix("down ") {
+                    let seats = crate::fleet::parse_seat_list(rest);
+                    self.push_system(crate::fleet::fleet_down(Some(seats)));
+                } else if let Some(rest) = lower
+                    .strip_prefix("up ")
+                    .or_else(|| (lower == "up").then_some(""))
+                {
+                    let seats = if rest.trim().is_empty() {
+                        vec!["Fleet-1".into(), "Fleet-2".into()]
+                    } else {
+                        // preserve original casing from raw after "up "
+                        let after = raw
+                            .split_once(char::is_whitespace)
+                            .map(|(_, r)| r.trim())
+                            .unwrap_or("");
+                        crate::fleet::parse_seat_list(if after.is_empty() {
+                            "Fleet-1,Fleet-2"
+                        } else {
+                            after
+                        })
+                    };
+                    let opts = crate::fleet::FleetUpOpts {
+                        seats,
+                        budget_minutes: 480,
+                        sleep_secs: 5,
+                        quiet: false,
+                        provider: Some(self.provider_name.clone()),
+                        model: Some(self.model_name.clone()),
+                        approve: true,
+                        fail_fast: false,
+                    };
+                    match crate::fleet::fleet_up(opts) {
+                        Ok(msg) => self.push_system(msg),
+                        Err(e) => self.push_system(e),
+                    }
+                } else if let Some(seat) = lower.strip_prefix("logs ").or_else(|| {
+                    lower.strip_prefix("log ")
+                }) {
+                    let seat = seat.trim();
+                    // Restore casing from raw if possible
+                    let seat_raw = raw
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or(seat);
+                    if seat_raw.is_empty() {
+                        self.push_system("Usage: /fleet logs <seat>");
+                    } else {
+                        self.push_system(crate::fleet::fleet_logs(seat_raw, 60));
+                    }
+                } else {
+                    self.push_system(
+                        "Usage: /fleet | /fleet status | /fleet up [Fleet-1,Fleet-2] | \
+                         /fleet down [seats] | /fleet logs <seat>",
+                    );
+                }
+            }
+            "/brain" => {
+                let rest = arg.trim();
+                if let Some(fact) = rest
+                    .strip_prefix("remember ")
+                    .or_else(|| rest.strip_prefix("remember"))
+                {
+                    let fact = fact.trim();
+                    if fact.is_empty() {
+                        self.push_system("Usage: /brain remember <short operational fact>");
+                    } else if let Err(e) = crate::brain::remember(fact) {
+                        self.push_system(e);
+                    } else {
+                        self.push_system(format!("Remembered: {fact}"));
+                    }
+                } else if let Some(q) = rest.strip_prefix("falsify ") {
+                    match crate::brain::falsify(q.trim()) {
+                        Ok(n) => self.push_system(format!("Falsified {n} fact(s)")),
+                        Err(e) => self.push_system(e),
+                    }
+                } else if rest == "ledger" {
+                    let items = crate::brain::recent_ledger(20);
+                    if items.is_empty() {
+                        self.push_system("Ledger empty.");
+                    } else {
+                        let mut out = String::from("Ledger:\n");
+                        for e in items {
+                            out.push_str(&format!(
+                                "  [{}] {} {} — {}\n",
+                                e.at,
+                                e.bead,
+                                e.kind.as_deref().unwrap_or("?"),
+                                e.summary
+                            ));
+                        }
+                        self.push_system(out);
+                    }
+                } else {
+                    let facts = crate::brain::recent_facts(12);
+                    if facts.is_empty() {
+                        self.push_system(
+                            "No brain facts yet. Usage: /brain remember <fact> | falsify <q> | ledger\n\
+                             Doctrine: put markdown in ./brain/*.md",
+                        );
+                    } else {
+                        let mut out = String::from("Brain facts:\n");
+                        for f in facts {
+                            out.push_str(&format!(
+                                "- [{}] [{}] {}\n",
+                                f.id.as_deref().unwrap_or("-"),
+                                f.written_at,
+                                f.text
+                            ));
+                        }
+                        self.push_system(out);
+                    }
+                }
+            }
+            "/laurel" => {
+                let text = arg.trim();
+                if text.is_empty() {
+                    self.push_system("Usage: /laurel <praise text>");
+                } else {
+                    let seat = crate::tools::handoff::active_seat();
+                    let laurel =
+                        crate::agent::laurel::Laurel::new(text.to_string(), seat.clone());
+                    if let Err(e) = crate::agent::laurel::append(&laurel) {
+                        self.push_system(e);
+                    } else {
+                        if let Some(ref name) = seat {
+                            if let Ok(mut s) = crate::agent::seat::load(name) {
+                                s.append_laurel(laurel);
+                                let _ = crate::agent::seat::save(&s);
+                            }
+                        }
+                        self.push_system(format!(
+                            "Laurel recorded (recognition only): {text}"
+                        ));
+                    }
+                }
             }
             "/context" => {
                 match arg.to_lowercase().as_str() {
@@ -1697,6 +2454,7 @@ impl App {
                 }
             }
             "/new" => {
+                self.goal_indicator.clear();
                 let _ = self.command_tx.send(AppCommand::NewSession);
                 self.push_system("Starting new session…");
             }
@@ -3434,8 +4192,18 @@ impl App {
             .as_ref()
             .map(|t| format!(" \"{}\"", t.chars().take(40).collect::<String>()))
             .unwrap_or_default();
+        let goal_chip = if self.goal_indicator.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", self.goal_indicator)
+        };
+        let beads_chip = crate::beads::list_ready(None)
+            .ok()
+            .filter(|r| !r.is_empty())
+            .map(|r| format!(" beads:{} ready", r.len()))
+            .unwrap_or_default();
         let meta = format!(
-            " {}/{} · {} · d{}{}{}{} [{}]{} | {}",
+            " {}/{} · {} · d{}{}{}{} [{}]{}{}{} | {}",
             self.provider_name,
             self.model_name,
             self.agent_mode.as_str(),
@@ -3445,6 +4213,8 @@ impl App {
             lsp,
             self.session_id,
             title_str,
+            goal_chip,
+            beads_chip,
             self.tree_breadcrumb
         );
 

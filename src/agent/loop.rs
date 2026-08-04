@@ -4,12 +4,18 @@ use crate::agent::state::AgentState;
 use crate::agent::compact_pins::{
     append_pins_to_summary, collect_pins_from_messages, CompactPins,
 };
+use crate::agent::goal::{
+    self, evaluator_system_prompt, evaluator_user_prompt, format_transcript_for_evaluator,
+    parse_evaluator_reply, parse_verify_reply, verify_system_prompt, verify_user_prompt,
+    GoalStatus, MAX_CONSECUTIVE_BLOCKS,
+};
+use crate::agent::mode::AgentMode;
 use crate::agent::repair::{
     is_weak_model, make_arg_parse_error_value, prepare_tool_args, resolve_tool,
     tool_call_fingerprint, tool_near_dupe_key, weak_model_system_note,
 };
 use crate::agent::rlm_escalate;
-use crate::agent::tool::{ToolExecutionMode, ToolExecuteResult};
+use crate::agent::tool::{AgentTool, ToolExecutionMode, ToolExecuteResult};
 use crate::ai::provider::Provider;
 use crate::ai::token_count;
 use crate::ai::types::*;
@@ -61,6 +67,8 @@ pub enum AgentEvent {
     TimelineSnapshot { entries: Vec<(usize, String)> },
     /// LSP diagnostics summary for the status bar.
     LspUpdate { summary: String },
+    /// `/goal` status changed (set/clear/pause/achieve).
+    GoalUpdate { summary: String },
 }
 
 /// Truncates a tool result to `max` chars by keeping the head and tail and
@@ -133,6 +141,8 @@ pub struct AgentLoop {
     compacted_up_to: usize,
     overflow_retried: bool,
     blank_retries: u8,
+    /// Soft recoveries after provider stream/transport death (per `run_loop`).
+    stream_recoveries: u8,
     abort: AbortFlag,
     steer: SteerQueue,
     call_tree: CallTree,
@@ -149,8 +159,10 @@ pub struct AgentLoop {
     /// Inject one-shot RLM escalate system note on the next model turn.
     rlm_escalate_hint_pending: std::sync::atomic::AtomicBool,
     rlm_escalate_hint_sent: std::sync::atomic::AtomicBool,
-    /// Optional disk-loaded hooks (before_tool / after_tool / on_message).
+    /// Optional disk-loaded hooks (before_tool / after_tool / on_message / goal / handoff).
     hooks: HookRegistry,
+    /// When true, `/goal` may spawn a tool-using verify subagent.
+    goal_verify: bool,
 }
 
 impl AgentLoop {
@@ -165,6 +177,7 @@ impl AgentLoop {
             compacted_up_to: 0,
             overflow_retried: false,
             blank_retries: 0,
+            stream_recoveries: 0,
             abort: AbortFlag::new(),
             steer: SteerQueue::new(),
             call_tree: CallTree::new(),
@@ -177,7 +190,13 @@ impl AgentLoop {
             rlm_escalate_hint_pending: std::sync::atomic::AtomicBool::new(false),
             rlm_escalate_hint_sent: std::sync::atomic::AtomicBool::new(false),
             hooks: HookRegistry::load(),
+            goal_verify: true,
         }
+    }
+
+    pub fn with_goal_verify(mut self, enabled: bool) -> Self {
+        self.goal_verify = enabled;
+        self
     }
 
     pub fn with_hooks(mut self, hooks: HookRegistry) -> Self {
@@ -268,6 +287,282 @@ impl AgentLoop {
 
     pub fn state_mut(&mut self) -> &mut AgentState {
         &mut self.state
+    }
+
+    /// Set or replace the session goal (does not start a turn by itself).
+    pub fn set_goal(&mut self, condition: String) {
+        self.state.goal = Some(goal::GoalState::new(
+            condition,
+            self.state.total_input_tokens,
+            self.state.total_output_tokens,
+        ));
+    }
+
+    pub fn clear_goal(&mut self) -> Option<goal::GoalState> {
+        let mut g = self.state.goal.take()?;
+        g.status = GoalStatus::Cleared;
+        Some(g)
+    }
+
+    pub fn pause_goal(&mut self) -> bool {
+        if let Some(g) = self.state.goal.as_mut() {
+            if g.status == GoalStatus::Active {
+                g.status = GoalStatus::Paused;
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn resume_goal(&mut self) -> bool {
+        if let Some(g) = self.state.goal.as_mut() {
+            if g.status == GoalStatus::Paused {
+                g.status = GoalStatus::Active;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// After a finished text turn: evaluate `/goal` and optionally auto-continue.
+    /// Returns `true` when the agent loop should keep iterating.
+    async fn maybe_continue_for_goal(
+        &mut self,
+        callback: &mut (dyn FnMut(AgentEvent) + Send),
+    ) -> Result<bool, String> {
+        let Some(goal) = self.state.goal.clone() else {
+            return Ok(false);
+        };
+        if !goal.is_running() {
+            return Ok(false);
+        }
+        // Codex: plan/ask modes don't auto-continue.
+        if self.state.mode != AgentMode::Agent {
+            return Ok(false);
+        }
+        if goal.consecutive_blocks >= MAX_CONSECUTIVE_BLOCKS {
+            callback(AgentEvent::Status {
+                message: format!(
+                    "goal paused after {MAX_CONSECUTIVE_BLOCKS} consecutive unmet checks — /goal resume or /goal clear"
+                ),
+            });
+            if let Some(g) = self.state.goal.as_mut() {
+                g.status = GoalStatus::Paused;
+                g.last_reason = Some(format!(
+                    "auto-paused after {MAX_CONSECUTIVE_BLOCKS} unmet evaluations"
+                ));
+            }
+            callback(AgentEvent::GoalUpdate {
+                summary: "paused (safety bound)".into(),
+            });
+            return Ok(false);
+        }
+
+        if let Err(msg) = self.hooks.before_goal_continue(&goal.condition) {
+            callback(AgentEvent::Status {
+                message: format!("◎ goal gate: {msg}"),
+            });
+            if let Some(g) = self.state.goal.as_mut() {
+                g.status = GoalStatus::Paused;
+                g.last_reason = Some(msg.clone());
+            }
+            callback(AgentEvent::GoalUpdate {
+                summary: format!("paused (gate): {msg}"),
+            });
+            return Ok(false);
+        }
+
+        // Fast path: bead-store conditions without an LLM round-trip.
+        if let Some((met, reason)) = crate::beads::evaluate_bead_condition(&goal.condition) {
+            return self.finish_goal_eval(met, reason, &goal.condition, callback).await;
+        }
+
+        callback(AgentEvent::Status {
+            message: "evaluating /goal…".into(),
+        });
+
+        let (mut met, mut reason) = self.evaluate_goal_condition(&goal.condition).await?;
+
+        // Tool-using verify when enabled and transcript says unmet, or when
+        // condition looks like it needs external proof (tests/files/beads).
+        let needs_tools = self.goal_verify
+            && (!met
+                || crate::beads::goal_mentions_beads(&goal.condition)
+                || goal_likely_needs_tools(&goal.condition));
+        if needs_tools {
+            callback(AgentEvent::Status {
+                message: "◎ verifying /goal with tools…".into(),
+            });
+            match self.verify_goal_with_tools(&goal.condition).await {
+                Ok((v_met, v_reason)) => {
+                    met = v_met;
+                    reason = v_reason;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "goal verify subagent failed; using transcript result");
+                    if met {
+                        // Don't trust transcript YES without verify when we wanted tools.
+                        met = false;
+                        reason = format!("verify failed ({e}); treating as unmet");
+                    }
+                }
+            }
+        }
+
+        self.finish_goal_eval(met, reason, &goal.condition, callback)
+            .await
+    }
+
+    async fn finish_goal_eval(
+        &mut self,
+        met: bool,
+        reason: String,
+        condition: &str,
+        callback: &mut (dyn FnMut(AgentEvent) + Send),
+    ) -> Result<bool, String> {
+        let mut met = met;
+        let mut reason = reason;
+
+        // Soft goals must not achieve while the bead backlog still has work.
+        if met && crate::beads::soft_goal_blocked_by_backlog(condition) {
+            met = false;
+            let ready = crate::beads::list_ready(None)
+                .map(|r| r.len())
+                .unwrap_or(0);
+            let open = crate::beads::list_open(None)
+                .map(|r| r.len())
+                .unwrap_or(0);
+            reason = format!(
+                "backlog remains ({ready} ready / {open} open) — keep implementing; \
+                 use /goal no open beads for a hard stop"
+            );
+        }
+
+        if let Some(g) = self.state.goal.as_mut() {
+            g.turns_evaluated = g.turns_evaluated.saturating_add(1);
+            g.last_reason.replace(reason.clone());
+        }
+
+        if met {
+            if let Some(g) = self.state.goal.as_mut() {
+                g.status = GoalStatus::Achieved;
+            }
+            self.hooks.on_goal_achieved(condition, &reason);
+            callback(AgentEvent::Status {
+                message: format!("◎ goal achieved — {reason}"),
+            });
+            callback(AgentEvent::GoalUpdate {
+                summary: format!("achieved: {reason}"),
+            });
+            return Ok(false);
+        }
+
+        if let Some(g) = self.state.goal.as_mut() {
+            g.consecutive_blocks = g.consecutive_blocks.saturating_add(1);
+        }
+
+        callback(AgentEvent::Status {
+            message: format!("◎ goal continues — {reason}"),
+        });
+        callback(AgentEvent::GoalUpdate {
+            summary: format!("active: {reason}"),
+        });
+
+        self.state.add_message(Message {
+            role: Role::User,
+            content: vec![Content {
+                content_type: ContentType::Text,
+                text: Some(format!(
+                    "[goal] Condition not yet met: {reason}\n\
+                     Continue working toward: {condition}\n\
+                     Verify with tools; do not stop until the condition holds."
+                )),
+                ..Default::default()
+            }],
+        });
+        Ok(true)
+    }
+
+    /// Shallow nested agent that can run bash/read/grep/… to prove the goal.
+    /// Goes through `TaskTool::execute` (async_trait-boxed) to avoid async recursion
+    /// with `AgentLoop::run` / `maybe_continue_for_goal`.
+    async fn verify_goal_with_tools(&self, condition: &str) -> Result<(bool, String), String> {
+        use crate::tools::task::TaskTool;
+        use serde_json::json;
+
+        let root_id = self.call_tree.ensure_root("session");
+        let tool = TaskTool::new(
+            self.provider.clone(),
+            self.state.model.clone(),
+            self.state.provider.clone(),
+            verify_system_prompt().to_string(),
+            self.abort.clone(),
+            self.call_tree.clone(),
+            self.rlm_depth,
+            self.max_rlm_depth.min(self.rlm_depth.saturating_add(1).max(1)),
+            15,
+            root_id,
+        );
+        let args = json!({
+            "task": verify_user_prompt(condition),
+            "profile": "verify",
+            "tools": ["bash", "read", "grep", "ls", "find", "bead"],
+        });
+        let result = tool.execute("goal-verify", args).await;
+        if result.is_error {
+            return Err(result.content);
+        }
+        // Strip "Sub-agent result:\n" prefix if present.
+        let text = result
+            .content
+            .strip_prefix("Sub-agent result:\n")
+            .unwrap_or(&result.content);
+        Ok(parse_verify_reply(text))
+    }
+
+    async fn evaluate_goal_condition(&self, condition: &str) -> Result<(bool, String), String> {
+        let api_key = std::env::var(self.provider.api_key_env_var())
+            .map_err(|_| format!("{} not set", self.provider.api_key_env_var()))?;
+        let transcript = format_transcript_for_evaluator(&self.state.messages, 12_000);
+        let request = ChatRequest {
+            model: self.state.model.clone(),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![Content {
+                    content_type: ContentType::Text,
+                    text: Some(evaluator_user_prompt(condition, &transcript)),
+                    ..Default::default()
+                }],
+            }],
+            system: Some(evaluator_system_prompt().to_string()),
+            tools: Vec::new(),
+            max_tokens: 256,
+            temperature: Some(0.0),
+            top_p: None,
+            stop_sequences: None,
+            stream: false,
+            thinking: None,
+        };
+        match self.provider.chat(&api_key, request).await {
+            Ok(msg) => {
+                let text: String = msg
+                    .content
+                    .iter()
+                    .filter(|c| c.content_type == ContentType::Text)
+                    .filter_map(|c| c.text.as_deref())
+                    .collect::<Vec<_>>()
+                    .join("");
+                if text.trim().is_empty() {
+                    // Fail open toward continue (safer than false "achieved").
+                    return Ok((false, "evaluator returned empty reply".into()));
+                }
+                Ok(parse_evaluator_reply(&text))
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "goal evaluator failed; continuing");
+                Ok((false, format!("evaluator error ({e:?}); continuing")))
+            }
+        }
     }
 
     pub fn register_tool(&mut self, tool: crate::agent::tool::SharedTool) {
@@ -371,9 +666,52 @@ impl AgentLoop {
     fn is_retryable(err: &ProviderError) -> bool {
         match err {
             ProviderError::RateLimited(_) | ProviderError::Timeout => true,
-            ProviderError::Http(code, _) if (500..=599).contains(code) => true,
-            _ => false,
+            ProviderError::Stream(_) => true,
+            ProviderError::Http(code, _) if (500..=599).contains(code) || *code == 429 => true,
+            ProviderError::Http(_, msg)
+                if msg.contains("error sending request")
+                    || msg.contains("connection")
+                    || msg.contains("timed out")
+                    || msg.contains("Broken pipe") =>
+            {
+                true
+            }
+            ProviderError::Other(msg)
+                if msg.contains("error sending request")
+                    || msg.contains("connection")
+                    || msg.contains("stream")
+                    || msg.contains("timed out")
+                    || msg.contains("Broken pipe") =>
+            {
+                true
+            }
+            _ => {
+                let s = format!("{err:?}");
+                Self::is_transport_failure_msg(&s)
+            }
         }
+    }
+
+    /// Public for worker soft-fail classification.
+    pub fn is_transport_failure_msg(e: &str) -> bool {
+        let l = e.to_lowercase();
+        l.contains("stream error")
+            || l.contains("error sending request")
+            || l.contains("connection reset")
+            || l.contains("connection closed")
+            || l.contains("connection refused")
+            || l.contains("broken pipe")
+            || l.contains("timed out")
+            || l.contains("timeout")
+            || l.contains("temporarily unavailable")
+            || l.contains("dns error")
+            || l.contains("http2")
+            || l.contains("tcp")
+            || l.contains("tls")
+            || l.contains("cloudflare")
+            || l.contains("502")
+            || l.contains("503")
+            || l.contains("504")
     }
 
     fn retry_delay(err: &ProviderError, attempt: u32) -> Duration {
@@ -382,6 +720,75 @@ impl AgentLoop {
                 Duration::from_secs_f64((*secs).min(60.0))
             }
             _ => Duration::from_millis(500 * 2u64.pow(attempt.min(4))),
+        }
+    }
+
+    /// Settle tools, restore files, crash-handoff, inject recover nudge.
+    /// Returns `true` if the outer loop should `continue` (retry the turn).
+    async fn recover_from_stream_failure(
+        &mut self,
+        err: &str,
+        callback: &mut (dyn FnMut(AgentEvent) + Send),
+    ) -> bool {
+        const MAX_STREAM_RECOVERIES: u8 = 3;
+
+        let _ = self.state.settle_dangling_tools();
+        let restored = crate::tools::turn_snapshot::restore_last_turn().unwrap_or(0);
+        let notes = crate::agent::handoff::HandoffNotes::new(
+            format!("interrupted: {err}"),
+            if restored > 0 {
+                format!("restored {restored} file(s) from turn snapshot")
+            } else {
+                String::new()
+            },
+            "Retry or type continue — prefer small tool calls".into(),
+            vec![],
+        );
+        crate::agent::handoff::store(notes.clone());
+        self.state.handoff = Some(notes);
+
+        self.stream_recoveries = self.stream_recoveries.saturating_add(1);
+        let n = self.stream_recoveries;
+
+        callback(AgentEvent::Status {
+            message: format!(
+                "stream failed — settled tools{}; recover {n}/{MAX_STREAM_RECOVERIES} ({err})",
+                if restored > 0 {
+                    format!(", restored {restored} file(s)")
+                } else {
+                    String::new()
+                }
+            ),
+        });
+
+        self.state.add_message(Message {
+            role: Role::User,
+            content: vec![Content {
+                content_type: ContentType::Text,
+                text: Some(format!(
+                    "[recover] Provider stream failed (attempt {n}/{MAX_STREAM_RECOVERIES}): {err}\n\
+                     Continue from the last good state. Prefer small tool calls. \
+                     If blocked, call escalate or bead block."
+                )),
+                ..Default::default()
+            }],
+        });
+
+        if n < MAX_STREAM_RECOVERIES {
+            let backoff = Duration::from_secs(2u64.saturating_mul(n as u64));
+            callback(AgentEvent::Status {
+                message: format!("recovering… retrying model in {}s", backoff.as_secs()),
+            });
+            tokio::time::sleep(backoff).await;
+            true
+        } else {
+            callback(AgentEvent::Status {
+                message: "stream failed after recoveries — type continue or /handoff (session ready)"
+                    .into(),
+            });
+            // Soft end: do not surface as hard Error / do not leave Waiting wedged.
+            callback(AgentEvent::Done);
+            false
         }
     }
 
@@ -426,7 +833,34 @@ impl AgentLoop {
                 callback(AgentEvent::Aborted);
                 Ok(())
             }
-            Err(e) => Err(e),
+            // Transport death that escaped run_loop: soft-recover instead of hard Error.
+            Err(e) if Self::is_transport_failure_msg(&e) => {
+                if self.recover_from_stream_failure(&e, callback).await {
+                    // One last outer retry of the whole loop body via a fresh stream call.
+                    match self.run_loop(callback).await {
+                        Ok(()) => Ok(()),
+                        Err(e2) if e2 == "aborted" => {
+                            callback(AgentEvent::Aborted);
+                            Ok(())
+                        }
+                        Err(e2) if Self::is_transport_failure_msg(&e2) => {
+                            let _ = self.recover_from_stream_failure(&e2, callback).await;
+                            Ok(())
+                        }
+                        Err(e2) => {
+                            callback(AgentEvent::Done);
+                            Err(e2)
+                        }
+                    }
+                } else {
+                    Ok(())
+                }
+            }
+            Err(e) => {
+                let _ = self.state.settle_dangling_tools();
+                callback(AgentEvent::Done);
+                Err(e)
+            }
         }
     }
 
@@ -525,6 +959,7 @@ impl AgentLoop {
     ) -> Result<(), String> {
         self.overflow_retried = false;
         self.blank_retries = 0;
+        self.stream_recoveries = 0;
         let tool_defs_json = serde_json::to_string(&self.tools.tool_defs()).unwrap_or_default();
 
         for _ in 0..self.max_iterations {
@@ -547,10 +982,23 @@ impl AgentLoop {
             let fraction = used as f64 / limit as f64;
 
             if fraction >= 0.95 {
+                // Welfare: prefer handoff over a hard clonk when context is exhausted.
+                let notes = crate::agent::handoff::HandoffNotes::new(
+                    format!(
+                        "Context limit approaching ({used}/{limit} tokens, {:.0}%)",
+                        fraction * 100.0
+                    ),
+                    "Session near context ceiling".into(),
+                    "Open a new session with same seat; wake packet has diary".into(),
+                    vec![],
+                );
+                crate::agent::handoff::store(notes.clone());
+                self.state.handoff = Some(notes);
                 callback(AgentEvent::Error {
                     message: format!(
-                        "Context limit approaching ({}/{} tokens, {:.0}%). Please use a new session.",
-                        used, limit, fraction * 100.0
+                        "Context limit approaching ({used}/{limit} tokens, {:.0}%). \
+                         Handoff notes written — please use a new session (/handoff done).",
+                        fraction * 100.0
                     ),
                 });
                 return Err("Context limit exceeded".to_string());
@@ -572,6 +1020,12 @@ impl AgentLoop {
                     self.overflow_retried = true;
                     let _ = self.compact(callback).await;
                     continue;
+                }
+                Err(e) if Self::is_transport_failure_msg(&e) => {
+                    if self.recover_from_stream_failure(&e, callback).await {
+                        continue;
+                    }
+                    return Ok(());
                 }
                 Err(e) => return Err(e),
             };
@@ -673,12 +1127,22 @@ impl AgentLoop {
                     });
                 }
                 self.state.add_assistant(&to_store);
+                // Claude Code–style `/goal`: evaluate completion; if unmet, continue.
+                if self.maybe_continue_for_goal(callback).await? {
+                    continue;
+                }
                 callback(AgentEvent::Done);
                 return Ok(());
             }
 
             self.blank_retries = 0;
             self.state.add_assistant(&assistant_msg);
+            // Tool use counts as progress toward the goal (reset Stop-hook safety).
+            if let Some(g) = self.state.goal.as_mut() {
+                if g.is_running() {
+                    g.consecutive_blocks = 0;
+                }
+            }
 
             let has_sequential = self.tools.iter().any(|t| {
                 t.execution_mode() == ToolExecutionMode::Sequential
@@ -701,7 +1165,7 @@ impl AgentLoop {
     }
 
     async fn stream_assistant(
-        &self,
+        &mut self,
         callback: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<AssistantMessage, String> {
         let api_key = std::env::var(self.provider.api_key_env_var())
@@ -753,6 +1217,34 @@ impl AgentLoop {
             self.rlm_escalate_hint_pending
                 .store(false, std::sync::atomic::Ordering::Relaxed);
         }
+        if let Some(note) = self.state.goal.as_ref().and_then(|g| g.system_note()) {
+            if !system.is_empty() {
+                system.push_str("\n\n");
+            }
+            system.push_str(&note);
+        }
+        if self.state.pending_wake {
+            let seat = self.state.seat.as_ref().and_then(|n| {
+                crate::agent::seat::load(n).ok()
+            });
+            let handoff = self
+                .state
+                .handoff
+                .clone()
+                .or_else(crate::agent::handoff::snapshot);
+            let inputs = crate::agent::wake::WakeInputs::from_parts(
+                seat,
+                handoff,
+                self.state.goal.clone(),
+            );
+            if let Some(packet) = crate::agent::wake::build(&inputs) {
+                if !system.is_empty() {
+                    system.push_str("\n\n");
+                }
+                system.push_str(&packet);
+            }
+            self.state.pending_wake = false;
+        }
         let tools: Vec<_> = self
             .tools
             .tool_defs()
@@ -774,7 +1266,7 @@ impl AgentLoop {
         };
 
         let mut last_err = None;
-        for attempt in 0..3u32 {
+        for attempt in 0..5u32 {
             self.check_aborted()?;
             match self.provider.chat_stream(&api_key, request.clone()).await {
                 Ok(mut stream) => {
@@ -848,7 +1340,7 @@ impl AgentLoop {
                                 }
                             }
                             Err(e) => {
-                                if Self::is_retryable(&e) && attempt < 2 {
+                                if Self::is_retryable(&e) && attempt < 4 {
                                     last_err = Some(e);
                                     break;
                                 }
@@ -864,9 +1356,9 @@ impl AgentLoop {
                         let delay = Self::retry_delay(&err, attempt);
                         callback(AgentEvent::Status {
                             message: format!(
-                                "retrying after {:?} (attempt {}/3)...",
-                                err,
-                                attempt + 1
+                                "stream retry {}/5 after {:?}…",
+                                attempt + 1,
+                                err
                             ),
                         });
                         tokio::time::sleep(delay).await;
@@ -910,13 +1402,13 @@ impl AgentLoop {
                         id: msg_id,
                     });
                 }
-                Err(e) if Self::is_retryable(&e) && attempt < 2 => {
+                Err(e) if Self::is_retryable(&e) && attempt < 4 => {
                     let delay = Self::retry_delay(&e, attempt);
                     callback(AgentEvent::Status {
                         message: format!(
-                            "retrying after {:?} (attempt {}/3)...",
-                            e,
-                            attempt + 1
+                            "stream retry {}/5 after {:?}…",
+                            attempt + 1,
+                            e
                         ),
                     });
                     tokio::time::sleep(delay).await;
@@ -950,6 +1442,7 @@ impl AgentLoop {
                 result: result.clone(),
             });
             self.store_tool_result(id, name, &result.content, result.is_error);
+            self.after_tool_side_effects(name, &result, callback);
 
             if result.terminate {
                 break;
@@ -987,6 +1480,7 @@ impl AgentLoop {
                 result: result.clone(),
             });
             self.store_tool_result(&job.id, &job.name, &result.content, result.is_error);
+            self.after_tool_side_effects(&job.name, result, callback);
         }
 
         for result in &results {
@@ -996,6 +1490,44 @@ impl AgentLoop {
         }
 
         Ok(())
+    }
+
+    /// Sync handoff notes / escalate → pause goal after tool execution.
+    fn after_tool_side_effects(
+        &mut self,
+        name: &str,
+        result: &ToolExecuteResult,
+        callback: &mut (dyn FnMut(AgentEvent) + Send),
+    ) {
+        let resolved = resolve_tool(&self.tools, name)
+            .map(|t| t.name().to_string())
+            .unwrap_or_else(|_| name.to_lowercase());
+
+        if resolved == "handoff" && !result.is_error {
+            if let Some(notes) = crate::agent::handoff::snapshot() {
+                self.state.handoff = Some(notes);
+                self.state.pending_wake = true;
+                callback(AgentEvent::Status {
+                    message: "handoff recorded — next wake will load these notes".into(),
+                });
+            }
+        }
+
+        if resolved == "escalate" && !result.is_error {
+            if let Some(esc) = crate::tools::escalate::take_pending() {
+                if self.pause_goal() {
+                    callback(AgentEvent::GoalUpdate {
+                        summary: format!("paused (escalated): {}", esc.reason),
+                    });
+                }
+                callback(AgentEvent::Status {
+                    message: format!(
+                        "escalated (needs: {}) — {}",
+                        esc.needs, esc.reason
+                    ),
+                });
+            }
+        }
     }
 
     fn store_tool_result(&mut self, id: &str, name: &str, content: &str, is_error: bool) {
@@ -1112,15 +1644,46 @@ impl AgentLoop {
             .map_err(|_| format!("{} not set", self.provider.api_key_env_var()))?;
 
         let user_msg = if let Some(prev) = previous_summary {
+            let handoff_snap = crate::agent::handoff::snapshot();
+            let handoff_seed = self
+                .state
+                .handoff
+                .as_ref()
+                .or(handoff_snap.as_ref())
+                .map(|h| h.compaction_seed())
+                .unwrap_or_default();
+            let handoff_block = if handoff_seed.is_empty() {
+                String::new()
+            } else {
+                format!("\n\n<agent-handoff>\n{handoff_seed}\n</agent-handoff>\n")
+            };
             format!(
                 "Update the anchored summary below with the new conversation. \
-                 Preserve still-true details, remove stale details, and merge in new facts.\n\n\
-                 <previous-summary>\n{prev}\n</previous-summary>\n\n\
+                 Preserve still-true details, remove stale details, and merge in new facts.\
+                 Prefer facts from <agent-handoff> when present.\n\n\
+                 <previous-summary>\n{prev}\n</previous-summary>\
+                 {handoff_block}\n\
                  <new-conversation>\n{conv_text}\n</new-conversation>"
             )
         } else {
+            let handoff_snap = crate::agent::handoff::snapshot();
+            let handoff_seed = self
+                .state
+                .handoff
+                .as_ref()
+                .or(handoff_snap.as_ref())
+                .map(|h| h.compaction_seed())
+                .unwrap_or_default();
+            let preface = if handoff_seed.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "Prefer the agent-authored handoff below when summarizing.\n\
+                     <agent-handoff>\n{handoff_seed}\n</agent-handoff>\n\n"
+                )
+            };
             format!(
-                "Summarize the following conversation. Use this exact structure:\n\
+                "{preface}Summarize the following conversation. Use this exact structure:\n\
                  ## Goal\n...\n\
                  ## Constraints & Preferences\n...\n\
                  ## Progress\n\
@@ -1232,6 +1795,19 @@ impl AgentLoop {
             ));
         }
 
+        if resolved_name == "bead" && self.state.mode == AgentMode::Plan {
+            let action = input
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if !matches!(action.as_str(), "list" | "ls" | "show" | "get" | "") {
+                return ToolExecuteResult::error(
+                    "In plan mode, bead only allows list/show. Switch to /mode agent to mutate beads.",
+                );
+            }
+        }
+
         let args = match prepare_tool_args(tool.as_ref(), input.clone()) {
             Ok(a) => a,
             Err(msg) => return ToolExecuteResult::error(msg),
@@ -1239,6 +1815,16 @@ impl AgentLoop {
 
         if let Err(msg) = self.hooks.before_tool(&resolved_name, &args.to_string()) {
             return ToolExecuteResult::error(msg);
+        }
+
+        if resolved_name == "handoff" {
+            let summary = args
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if let Err(msg) = self.hooks.before_handoff(summary) {
+                return ToolExecuteResult::error(msg);
+            }
         }
 
         let fp = tool_call_fingerprint(&resolved_name, &args);
@@ -1319,6 +1905,20 @@ impl AgentLoop {
             .after_tool(&resolved_name, result.is_error, &result.content);
         result
     }
+}
+
+fn goal_likely_needs_tools(condition: &str) -> bool {
+    let lower = condition.to_lowercase();
+    lower.contains("test")
+        || lower.contains("cargo ")
+        || lower.contains("npm ")
+        || lower.contains("pytest")
+        || lower.contains("file ")
+        || lower.contains("exists")
+        || lower.contains("passes")
+        || lower.contains("green")
+        || lower.contains("compile")
+        || lower.contains("build")
 }
 
 #[cfg(test)]

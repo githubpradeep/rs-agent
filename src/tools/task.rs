@@ -19,6 +19,47 @@ struct TaskArgs {
     /// Optional tool allow-list (e.g. ["read","grep","ls"]). Omit = all default tools.
     #[serde(default)]
     tools: Option<Vec<String>>,
+    /// Optional role profile: plan | implement | verify.
+    #[serde(default)]
+    profile: Option<String>,
+}
+
+fn profile_defaults(profile: &str) -> (String, Option<Vec<String>>) {
+    match profile.trim().to_lowercase().as_str() {
+        "plan" => (
+            "PROFILE: plan. Read-only research and design. Do not edit files or run mutating shell. \
+             Return a clear plan and success criteria."
+                .into(),
+            Some(vec![
+                "read".into(),
+                "grep".into(),
+                "ls".into(),
+                "find".into(),
+                "webfetch".into(),
+                "websearch".into(),
+                "bead".into(),
+            ]),
+        ),
+        "verify" => (
+            "PROFILE: verify. Prove the task criteria with tools. Final line must start with \
+             VERIFIED or NOT_VERIFIED."
+                .into(),
+            Some(vec![
+                "bash".into(),
+                "read".into(),
+                "grep".into(),
+                "ls".into(),
+                "find".into(),
+                "bead".into(),
+            ]),
+        ),
+        "implement" => (
+            "PROFILE: implement. Execute the assigned work. Prefer small diffs and run checks."
+                .into(),
+            None,
+        ),
+        _ => (String::new(), None),
+    }
 }
 
 /// Spawns a nested AgentLoop (same path as REPL `agent_query`).
@@ -73,7 +114,8 @@ impl AgentTool for TaskTool {
         "Spawn a nested sub-agent for a focused subtask. The child has the same tools \
          (read/edit/bash/…) and returns a summary to you — use for parallelizable research, \
          isolated fixes, or long explorations that would clutter this transcript. \
-         Optional tools=[...] restricts the child. Prefer this over stuffing huge context here; \
+         Optional tools=[...] restricts the child. Optional profile=plan|implement|verify \
+         sets role defaults. Prefer this over stuffing huge context here; \
          for corpora already in the REPL, use repl + agent_query instead."
     }
 
@@ -89,6 +131,10 @@ impl AgentTool for TaskTool {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Optional allow-list of tool names for the child"
+                },
+                "profile": {
+                    "type": "string",
+                    "description": "Optional: plan | implement | verify"
                 }
             },
             "required": ["task"]
@@ -120,11 +166,25 @@ impl AgentTool for TaskTool {
             return ToolExecuteResult::error("aborted");
         }
 
+        let (profile_note, profile_tools) = parsed
+            .profile
+            .as_deref()
+            .map(profile_defaults)
+            .unwrap_or_else(|| (String::new(), None));
+        let tools = parsed.tools.or(profile_tools);
+        let mut system = self.system_prompt.clone();
+        if !profile_note.is_empty() {
+            if !system.is_empty() {
+                system.push_str("\n\n");
+            }
+            system.push_str(&profile_note);
+        }
+
         let host = RlmHost {
             provider: self.provider.clone(),
             model: self.model.clone(),
             provider_name: self.provider_name.clone(),
-            system_prompt: self.system_prompt.clone(),
+            system_prompt: system,
             abort: self.abort.clone(),
             tree: self.tree.clone(),
             parent_node_id: self.parent_node_id.clone(),
@@ -134,7 +194,7 @@ impl AgentTool for TaskTool {
             tool_factory: Arc::new(|| crate::tools::default_tools_list()),
         };
 
-        match host.agent_query(&task, parsed.tools).await {
+        match host.agent_query(&task, tools).await {
             Ok(text) => ToolExecuteResult::ok(format!("Sub-agent result:\n{text}")),
             Err(e) => ToolExecuteResult::error(format!("Sub-agent failed: {e}")),
         }

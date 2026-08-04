@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(name = "rs-agent", version, about = "Everyday coding agent with Deep Context")]
@@ -51,7 +51,7 @@ pub struct Cli {
     #[arg(long)]
     pub append_system_prompt: Vec<String>,
 
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 99999)]
     pub max_iterations: usize,
 
     /// Auto-approve read-only tools and file edits (write/edit); still prompt for
@@ -74,4 +74,159 @@ pub struct Cli {
     /// Extended thinking budget in tokens (Anthropic). 0 disables. Default: 10000 for anthropic, off otherwise.
     #[arg(long)]
     pub thinking_budget: Option<u32>,
+
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Commands {
+    /// Overnight factory: claim ready beads and implement until empty or budget.
+    Worker(WorkerArgs),
+    /// Reclaim stale leases, dead pids, auto-assign, stuck mail.
+    Marshal(MarshalArgs),
+    /// Start/stop/inspect multiple workers (Phase B).
+    Fleet(FleetArgs),
+    /// Wish Factory — intake a wish as a design/task bead.
+    Wish(WishArgs),
+    /// Standing role runner (Beadle, Gargoyle, …).
+    Role(RoleArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct WorkerArgs {
+    /// Claim at most one ready bead then exit (default when --loop is off).
+    #[arg(long, default_value = "false")]
+    pub once: bool,
+
+    /// Keep polling for ready beads until budget expires.
+    #[arg(long, default_value = "false")]
+    pub r#loop: bool,
+
+    /// Wall-clock budget in minutes (default 480).
+    #[arg(long, default_value_t = 480)]
+    pub budget_minutes: u64,
+
+    /// Claimant / seat name (default worker-<pid>). Loads seat model/provider if set.
+    #[arg(long)]
+    pub seat: Option<String>,
+
+    /// Exit on first non-transport failure.
+    #[arg(long, default_value = "false")]
+    pub fail_fast: bool,
+
+    /// Seconds to sleep when idle / after recoverable errors.
+    #[arg(long, default_value_t = 5)]
+    pub sleep_secs: u64,
+
+    /// Log tools/text to stderr and `.rs-agent/fleet/<seat>.log` (default on).
+    #[arg(long, default_value = "true")]
+    pub verbose: bool,
+
+    /// Quiet mode — status lines only (disables --verbose).
+    #[arg(long, default_value = "false")]
+    pub quiet: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct MarshalArgs {
+    /// Run once and exit (default).
+    #[arg(long, default_value = "true")]
+    pub once: bool,
+
+    /// Keep reclaiming/assigning until budget.
+    #[arg(long, default_value = "false")]
+    pub r#loop: bool,
+
+    /// Assign bead to seat: `--assign b12 --seat Fleet-1`
+    #[arg(long)]
+    pub assign: Option<String>,
+
+    #[arg(long)]
+    pub seat: Option<String>,
+
+    /// Disable auto-assign of implement beads to idle fleet.
+    #[arg(long, default_value = "false")]
+    pub no_auto_assign: bool,
+
+    #[arg(long, default_value_t = 60)]
+    pub interval_secs: u64,
+
+    #[arg(long, default_value_t = 480)]
+    pub budget_minutes: u64,
+
+    /// Minutes before blocked/stuck claims get mailed (0 = skip).
+    #[arg(long, default_value_t = 45)]
+    pub stuck_mins: u64,
+}
+
+#[derive(Parser, Debug)]
+pub struct FleetArgs {
+    #[command(subcommand)]
+    pub command: FleetCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum FleetCommand {
+    /// Spawn workers for each seat (detached).
+    Up {
+        /// Comma/space separated seat names (default Fleet-1,Fleet-2).
+        #[arg(long, default_value = "Fleet-1,Fleet-2")]
+        seats: String,
+        /// Wall-clock budget minutes per worker.
+        #[arg(long, default_value_t = 480)]
+        budget_minutes: u64,
+        #[arg(long, default_value_t = 5)]
+        sleep_secs: u64,
+        /// Quiet worker logs.
+        #[arg(long, default_value = "false")]
+        quiet: bool,
+        #[arg(long, default_value = "false")]
+        fail_fast: bool,
+    },
+    /// Stop fleet workers (all, or --seats …).
+    Down {
+        #[arg(long)]
+        seats: Option<String>,
+    },
+    /// Print live fleet + backlog status.
+    Status,
+    /// Tail a seat's log.
+    Logs {
+        seat: String,
+        #[arg(long, default_value_t = 60)]
+        lines: usize,
+    },
+}
+
+#[derive(Parser, Debug)]
+pub struct WishArgs {
+    /// Wish text (or pass as trailing args).
+    pub text: Vec<String>,
+    /// Create as task instead of design.
+    #[arg(long, default_value = "false")]
+    pub task: bool,
+    /// Mark ready for overnight (lower priority number).
+    #[arg(long, default_value = "false")]
+    pub auto: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct RoleArgs {
+    /// Role name: Beadle | Gargoyle | Drawbridge | Scryer | Marshal
+    #[arg(long)]
+    pub seat: Option<String>,
+    /// Alias for --seat when positional feels better.
+    pub role: Option<String>,
+    #[arg(long, default_value = "false")]
+    pub once: bool,
+    #[arg(long, default_value = "false")]
+    pub r#loop: bool,
+    #[arg(long, default_value_t = 300)]
+    pub interval_secs: u64,
+    #[arg(long, default_value_t = 480)]
+    pub budget_minutes: u64,
+    /// Optional source path/URL for Scryer.
+    #[arg(long)]
+    pub source: Option<String>,
 }

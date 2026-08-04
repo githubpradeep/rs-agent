@@ -34,7 +34,7 @@ impl AgentMode {
             Self::Plan => {
                 matches!(
                     name,
-                    "read" | "grep" | "ls" | "find" | "webfetch" | "websearch"
+                    "read" | "grep" | "ls" | "find" | "webfetch" | "websearch" | "bead"
                 ) || name.contains("__read") // common MCP read-only naming
             }
         }
@@ -44,7 +44,7 @@ impl AgentMode {
         match self {
             Self::Agent => None,
             Self::Plan => Some(
-                "MODE: plan. You may only use read-only tools (read, grep, ls, find, webfetch, websearch). Do not edit or run shell. Propose a plan; wait for the user to switch to agent mode to implement.",
+                "MODE: plan. You may only use read-only tools (read, grep, ls, find, webfetch, websearch, bead list/show). Do not edit or run shell. Propose a plan; wait for the user to switch to agent mode to implement.",
             ),
             Self::Ask => Some(
                 "MODE: ask. Answer questions only. Do not call any tools.",

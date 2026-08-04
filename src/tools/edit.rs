@@ -217,7 +217,7 @@ impl AgentTool for EditTool {
             let diff = crate::tools::diffutil::unified_diff(&path, &original, &content);
             let out_bytes = encode_with_bom_newline(&content, bom, newline);
 
-            match fs::write(&path, &out_bytes).await {
+            match crate::tools::write::atomic_write_bytes(&path, &out_bytes).await {
                 Ok(_) => {
                     let soft_note = if strategies_used.iter().any(|s| *s != "exact") {
                         format!(

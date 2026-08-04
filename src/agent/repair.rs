@@ -49,6 +49,12 @@ const NAME_ALIASES: &[(&str, &str)] = &[
     ("subagent", "task"),
     ("agent_query", "task"),
     ("delegate", "task"),
+    ("handoff_notes", "handoff"),
+    ("pass_off", "handoff"),
+    ("beads", "bead"),
+    ("issue", "bead"),
+    ("refuse", "escalate"),
+    ("needs_human", "escalate"),
 ];
 
 /// Heuristic: free/tiny/flash models need stricter harness behavior.

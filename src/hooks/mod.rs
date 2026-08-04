@@ -6,6 +6,13 @@
 //!   Non-zero exit blocks the tool (stderr becomes the error).
 //! - `after_tool` — argv: tool_name, is_error ("0"|"1"); stdin = tool result.
 //! - `on_message` — argv: none; stdin = user message text.
+//! - `before_goal_continue` — argv: none; stdin = goal condition.
+//!   Non-zero exit pauses goal auto-continue.
+//! - `on_goal_achieved` — argv: none; stdin = condition + reason (advisory).
+//! - `before_handoff` — argv: none; stdin = handoff summary.
+//!   Non-zero exit blocks the handoff tool.
+//! - `before_bead_close` — argv: none; stdin = bead JSON (id, kind, title, …).
+//!   Non-zero exit blocks closing the bead.
 //!
 //! Hooks are best-effort: missing dirs/scripts are ignored. Timeout: 5s.
 
@@ -21,6 +28,10 @@ pub struct HookRegistry {
     before_tool: Option<PathBuf>,
     after_tool: Option<PathBuf>,
     on_message: Option<PathBuf>,
+    before_goal_continue: Option<PathBuf>,
+    on_goal_achieved: Option<PathBuf>,
+    before_handoff: Option<PathBuf>,
+    before_bead_close: Option<PathBuf>,
 }
 
 impl HookRegistry {
@@ -48,12 +59,30 @@ impl HookRegistry {
             if let Some(p) = find_hook(dir, "on_message") {
                 reg.on_message = Some(p);
             }
+            if let Some(p) = find_hook(dir, "before_goal_continue") {
+                reg.before_goal_continue = Some(p);
+            }
+            if let Some(p) = find_hook(dir, "on_goal_achieved") {
+                reg.on_goal_achieved = Some(p);
+            }
+            if let Some(p) = find_hook(dir, "before_handoff") {
+                reg.before_handoff = Some(p);
+            }
+            if let Some(p) = find_hook(dir, "before_bead_close") {
+                reg.before_bead_close = Some(p);
+            }
         }
         reg
     }
 
     pub fn has_any(&self) -> bool {
-        self.before_tool.is_some() || self.after_tool.is_some() || self.on_message.is_some()
+        self.before_tool.is_some()
+            || self.after_tool.is_some()
+            || self.on_message.is_some()
+            || self.before_goal_continue.is_some()
+            || self.on_goal_achieved.is_some()
+            || self.before_handoff.is_some()
+            || self.before_bead_close.is_some()
     }
 
     pub fn summary(&self) -> String {
@@ -66,6 +95,18 @@ impl HookRegistry {
         }
         if let Some(p) = &self.on_message {
             parts.push(format!("on_message={}", p.display()));
+        }
+        if let Some(p) = &self.before_goal_continue {
+            parts.push(format!("before_goal_continue={}", p.display()));
+        }
+        if let Some(p) = &self.on_goal_achieved {
+            parts.push(format!("on_goal_achieved={}", p.display()));
+        }
+        if let Some(p) = &self.before_handoff {
+            parts.push(format!("before_handoff={}", p.display()));
+        }
+        if let Some(p) = &self.before_bead_close {
+            parts.push(format!("before_bead_close={}", p.display()));
         }
         if parts.is_empty() {
             "no hooks loaded".into()
@@ -109,6 +150,80 @@ impl HookRegistry {
             return;
         };
         let _ = run_hook(script, &[], Some(text));
+    }
+
+    /// Returns `Err(message)` to pause goal auto-continue.
+    pub fn before_goal_continue(&self, condition: &str) -> Result<(), String> {
+        let Some(script) = &self.before_goal_continue else {
+            return Ok(());
+        };
+        match run_hook(script, &[], Some(condition)) {
+            HookResult::Ok => Ok(()),
+            HookResult::Failed { code, stderr } => Err(format!(
+                "before_goal_continue hook paused goal (exit {code}): {}",
+                if stderr.trim().is_empty() {
+                    "(no stderr)".into()
+                } else {
+                    stderr.trim().chars().take(500).collect::<String>()
+                }
+            )),
+            HookResult::Error(e) => {
+                tracing::warn!(error = %e, "before_goal_continue hook error (allowing continue)");
+                Ok(())
+            }
+        }
+    }
+
+    pub fn on_goal_achieved(&self, condition: &str, reason: &str) {
+        let Some(script) = &self.on_goal_achieved else {
+            return;
+        };
+        let body = format!("{condition}\n---\n{reason}");
+        let _ = run_hook(script, &[], Some(&body));
+    }
+
+    /// Returns `Err(message)` to block the handoff tool.
+    pub fn before_handoff(&self, summary: &str) -> Result<(), String> {
+        let Some(script) = &self.before_handoff else {
+            return Ok(());
+        };
+        match run_hook(script, &[], Some(summary)) {
+            HookResult::Ok => Ok(()),
+            HookResult::Failed { code, stderr } => Err(format!(
+                "before_handoff hook blocked handoff (exit {code}): {}",
+                if stderr.trim().is_empty() {
+                    "(no stderr)".into()
+                } else {
+                    stderr.trim().chars().take(500).collect::<String>()
+                }
+            )),
+            HookResult::Error(e) => {
+                tracing::warn!(error = %e, "before_handoff hook error (allowing handoff)");
+                Ok(())
+            }
+        }
+    }
+
+    /// Returns `Err(message)` to block bead close.
+    pub fn before_bead_close(&self, bead_json: &str) -> Result<(), String> {
+        let Some(script) = &self.before_bead_close else {
+            return Ok(());
+        };
+        match run_hook(script, &[], Some(bead_json)) {
+            HookResult::Ok => Ok(()),
+            HookResult::Failed { code, stderr } => Err(format!(
+                "before_bead_close hook blocked close (exit {code}): {}",
+                if stderr.trim().is_empty() {
+                    "(no stderr)".into()
+                } else {
+                    stderr.trim().chars().take(500).collect::<String>()
+                }
+            )),
+            HookResult::Error(e) => {
+                tracing::warn!(error = %e, "before_bead_close hook error (allowing close)");
+                Ok(())
+            }
+        }
     }
 }
 

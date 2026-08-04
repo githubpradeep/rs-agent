@@ -69,7 +69,7 @@ auto_mode = false
 rlm_depth = 2
 rlm_escalate_chars = 10000   # auto Deep Context escalate on huge reads
 thinking_budget = 10000
-max_iterations = 100
+max_iterations = 99999
 timeout = 300
 base_url = "https://api.anthropic.com/v1"
 disable_mouse = false   # true = native text selection; Shift+drag also works with mouse on
@@ -100,10 +100,34 @@ State that's already live under `~/.rs-agent/`:
 | `~/.rs-agent/trust.json` | Per-project "always allow" tool-permission store |
 | `~/.rs-agent/AGENTS.md` | Global instructions merged into every system prompt |
 | `~/.rs-agent/skills/` | User-global skills (see below) |
+| `~/.rs-agent/seats/` | Named seats (persistent agent identity + diary) |
 
 Project-local `AGENTS.md` / `CLAUDE.md` (walked up from cwd) and `.rs-agent/commands/*.md` are
 also discovered automatically and merged into the system prompt unless `--no-context-files` is
-passed.
+passed. Project work graph: `.rs-agent/beads.json`. Laurels: `.rs-agent/laurels.jsonl`.
+Project brain: `brain/*.md` + `brain/facts.jsonl`. Worker status: `.rs-agent/worker-status.json`.
+
+## Long-run & continuity
+
+| Command / tool | Purpose |
+|----------------|---------|
+| `/goal <condition>` | Auto-continue until the condition holds (tool-using verify when `goal_verify = true`) |
+| `/handoff` + `handoff` tool | Consenting handoff — agent writes notes for the next wake |
+| `/seat <name>` | Bind a persistent named seat (role, pronouns, diary) |
+| `/beads` / `/beads ready` / `bead` tool | Work graph with deps, leases, ready queue |
+| `/worker` | Read last headless worker status (`.rs-agent/worker-status.json`) |
+| `/marshal` / `/fleet` | Reclaim stale leases + backlog / lease holders |
+| `/brain` / `/brain remember` | Project doctrine (`brain/*.md`) + short facts |
+| `/laurel <text>` | Recognition only — injected on wake, no work attached |
+| `escalate` tool | Pause `/goal` and ask for a human |
+| `task` `profile=` | `plan` \| `implement` \| `verify` sub-agent defaults |
+| `rs-agent worker --loop` | Overnight factory: claim → implement → close |
+| `rs-agent marshal --once` | Reclaim stale leases + print fleet backlog |
+
+Pipeline bead kinds: `design` → `implement` → `review` (close advances; `bead fail` reopens implement; `bead land` checks review). Soft goals like “keep implementing…” will **not** achieve while ready/open beads remain. Prefer `/goal no open beads` for a hard stop.
+
+See [`docs/overnight.md`](docs/overnight.md) for the overnight worker, fleet seats, marshal, brain wake pack, and crash recovery.
+See [`docs/hooks.md`](docs/hooks.md) for `before_goal_continue`, `before_bead_close`, `on_goal_achieved`, and `before_handoff`.
 
 ## Skills
 
@@ -194,7 +218,7 @@ Full reference: [`docs/keymap.md`](docs/keymap.md).
 | `--no-context-files` | Skip `AGENTS.md`/`CLAUDE.md`/project-command discovery |
 | `--system-prompt` | Override the default system prompt entirely |
 | `--append-system-prompt` | Append text (or `@path/to/file`) to the system prompt; repeatable |
-| `--max-iterations` | Cap on agent loop iterations per turn (default 100) |
+| `--max-iterations` | Cap on agent loop iterations per turn (default 99999) |
 | `--api-key` / `--api-key-env` | Supply or redirect the provider API key |
 | `--base-url` | Override the provider's API base URL |
 | `--timeout` | Request timeout in seconds (default 300) |

@@ -73,7 +73,7 @@ impl AgentTool for WriteTool {
                 }
             }
 
-            match fs::write(&path, &parsed.content).await {
+            match atomic_write(&path, &parsed.content).await {
                 Ok(_) => {
                     let body = format!(
                         "Successfully wrote {} bytes to {}",
@@ -88,4 +88,33 @@ impl AgentTool for WriteTool {
         })
         .await
     }
+}
+
+/// Write via temp file + rename so mid-crash doesn't leave truncated content.
+pub async fn atomic_write(path: &str, content: &str) -> Result<(), String> {
+    atomic_write_bytes(path, content.as_bytes()).await
+}
+
+/// Binary-safe atomic write (temp + rename).
+pub async fn atomic_write_bytes(path: &str, content: &[u8]) -> Result<(), String> {
+    let p = std::path::Path::new(path);
+    let parent = p.parent().filter(|x| !x.as_os_str().is_empty());
+    let tmp = match parent {
+        Some(dir) => {
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file");
+            dir.join(format!(".{name}.rs-agent.tmp"))
+        }
+        None => std::path::PathBuf::from(format!(".{path}.rs-agent.tmp")),
+    };
+    fs::write(&tmp, content)
+        .await
+        .map_err(|e| format!("temp write: {e}"))?;
+    fs::rename(&tmp, path).await.map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("rename: {e}")
+    })?;
+    Ok(())
 }

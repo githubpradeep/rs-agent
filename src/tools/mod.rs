@@ -1,15 +1,21 @@
 pub mod apply_patch;
 pub mod bash;
+pub mod bead;
 pub mod diffutil;
 pub mod edit;
+pub mod escalate;
 pub mod find;
 pub mod grep;
+pub mod handoff;
 pub mod ls;
+pub mod mail;
+pub mod moot;
 pub mod mutation_queue;
 pub mod output_sink;
 pub mod post_mutation;
 pub mod question;
 pub mod read;
+pub mod remember;
 pub mod repl_tool;
 pub mod task;
 pub mod todowrite;
@@ -21,12 +27,18 @@ pub mod write;
 
 pub use apply_patch::ApplyPatchTool;
 pub use bash::BashTool;
+pub use bead::BeadTool;
 pub use edit::EditTool;
+pub use escalate::EscalateTool;
 pub use find::FindTool;
 pub use grep::GrepTool;
+pub use handoff::HandoffTool;
 pub use ls::LsTool;
+pub use mail::MailTool;
+pub use moot::MootTool;
 pub use question::QuestionTool;
 pub use read::ReadTool;
+pub use remember::RememberTool;
 pub use repl_tool::ReplTool;
 pub use task::TaskTool;
 pub use todowrite::TodoWriteTool;
@@ -88,6 +100,12 @@ pub fn default_tools_list() -> Vec<SharedTool> {
         Arc::new(WebFetchTool) as SharedTool,
         Arc::new(TodoWriteTool) as SharedTool,
         Arc::new(QuestionTool) as SharedTool,
+        Arc::new(HandoffTool) as SharedTool,
+        Arc::new(BeadTool) as SharedTool,
+        Arc::new(EscalateTool) as SharedTool,
+        Arc::new(MailTool) as SharedTool,
+        Arc::new(RememberTool) as SharedTool,
+        Arc::new(MootTool) as SharedTool,
     ]
 }
 

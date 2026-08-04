@@ -33,6 +33,15 @@ pub struct SessionData {
     /// In-session todo list from the `todowrite` tool.
     #[serde(default)]
     pub todos: Option<Vec<crate::tools::todowrite::TodoItem>>,
+    /// Session-scoped `/goal` (restored on `--resume` if still active/paused).
+    #[serde(default)]
+    pub goal: Option<crate::agent::goal::GoalState>,
+    /// Bound seat name for persistent identity.
+    #[serde(default)]
+    pub seat: Option<String>,
+    /// Last handoff notes (agent-authored continuity).
+    #[serde(default)]
+    pub handoff: Option<crate::agent::handoff::HandoffNotes>,
 }
 
 impl SessionData {
@@ -474,6 +483,9 @@ mod tests {
             total_output_tokens: 50,
             call_tree: None,
             todos: None,
+            goal: None,
+            seat: None,
+            handoff: None,
         }
     }
 

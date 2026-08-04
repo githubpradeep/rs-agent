@@ -341,44 +341,44 @@ First real line.
 
     #[test]
     fn discovery_overrides_by_name_in_search_order() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home_skills = tmp.path().join("home/.rs-agent/skills");
-        let project_skills = tmp.path().join("project/skills");
-        std::fs::create_dir_all(&home_skills).unwrap();
-        std::fs::create_dir_all(&project_skills).unwrap();
+        crate::with_temp_cwd(|root| {
+            let home_skills = root.join("home/.rs-agent/skills");
+            let project_skills = root.join("project/skills");
+            std::fs::create_dir_all(&home_skills).unwrap();
+            std::fs::create_dir_all(&project_skills).unwrap();
 
-        std::fs::write(
-            home_skills.join("shared.md"),
-            "---\nname: shared\ndescription: from home\n---\nHome body\n",
-        )
-        .unwrap();
-        std::fs::write(
-            project_skills.join("shared.md"),
-            "---\nname: shared\ndescription: from project\n---\nProject body\n",
-        )
-        .unwrap();
-        std::fs::write(
-            home_skills.join("only-home.md"),
-            "---\nname: only-home\ndescription: only in home\n---\nBody\n",
-        )
-        .unwrap();
+            std::fs::write(
+                home_skills.join("shared.md"),
+                "---\nname: shared\ndescription: from home\n---\nHome body\n",
+            )
+            .unwrap();
+            std::fs::write(
+                project_skills.join("shared.md"),
+                "---\nname: shared\ndescription: from project\n---\nProject body\n",
+            )
+            .unwrap();
+            std::fs::write(
+                home_skills.join("only-home.md"),
+                "---\nname: only-home\ndescription: only in home\n---\nBody\n",
+            )
+            .unwrap();
 
-        let old_home = std::env::var("HOME").ok();
-        let old_cwd = std::env::current_dir().unwrap();
-        std::env::set_var("HOME", tmp.path().join("home"));
-        std::env::set_current_dir(tmp.path().join("project")).unwrap();
+            let old_home = std::env::var("HOME").ok();
+            std::env::set_var("HOME", root.join("home"));
+            std::env::set_current_dir(root.join("project")).unwrap();
 
-        let skills = discover_skills();
+            let skills = discover_skills();
 
-        if let Some(h) = old_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        std::env::set_current_dir(old_cwd).unwrap();
+            if let Some(h) = old_home {
+                std::env::set_var("HOME", h);
+            } else {
+                std::env::remove_var("HOME");
+            }
+            // with_temp_cwd restores cwd after; leave on project is fine until then.
 
-        let shared = find_skill(&skills, "shared").expect("shared skill found");
-        assert_eq!(shared.description, "from project");
-        assert!(find_skill(&skills, "only-home").is_some());
+            let shared = find_skill(&skills, "shared").expect("shared skill found");
+            assert_eq!(shared.description, "from project");
+            assert!(find_skill(&skills, "only-home").is_some());
+        });
     }
 }

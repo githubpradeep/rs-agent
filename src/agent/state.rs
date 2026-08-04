@@ -1,5 +1,7 @@
 use crate::ai::token_count;
 use crate::ai::types::*;
+use crate::agent::goal::GoalState;
+use crate::agent::handoff::HandoffNotes;
 use crate::agent::mode::AgentMode;
 
 
@@ -15,6 +17,14 @@ pub struct AgentState {
     pub mode: AgentMode,
     /// Active skill tool allow-list (Skills 2.0). Empty = unrestricted.
     pub skill_tools: Vec<String>,
+    /// Session-scoped `/goal` completion condition (Claude Code–style).
+    pub goal: Option<GoalState>,
+    /// Bound seat name (persistent identity).
+    pub seat: Option<String>,
+    /// Last handoff notes for this session.
+    pub handoff: Option<HandoffNotes>,
+    /// Inject wake packet on next stream_assistant call.
+    pub pending_wake: bool,
 }
 
 impl AgentState {
@@ -29,6 +39,10 @@ impl AgentState {
             total_output_tokens: 0,
             mode: AgentMode::Agent,
             skill_tools: Vec::new(),
+            goal: None,
+            seat: None,
+            handoff: None,
+            pending_wake: false,
         }
     }
 
