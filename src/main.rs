@@ -95,7 +95,10 @@ fn maybe_run_first_launch_wizard(cli: &mut Cli, cfg: &mut Config) -> Result<(), 
     }
     if matches!(
         cli.command,
-        Some(rs_agent::cli::Commands::Marshal(_)) | Some(rs_agent::cli::Commands::Fleet(_))
+        Some(rs_agent::cli::Commands::Marshal(_))
+            | Some(rs_agent::cli::Commands::Fleet(_))
+            | Some(rs_agent::cli::Commands::Wish(_))
+            | Some(rs_agent::cli::Commands::Role(_))
     ) {
         return Ok(());
     }
@@ -218,14 +221,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     rs_agent::agent::set_escalate_chars(escalate);
 
     // City control plane (no provider required except fleet up / worker / role gargoyle).
-    if let Some(rs_agent::cli::Commands::Marshal(margs)) = cli.command.take() {
-        if let Some(ref bead) = margs.assign {
-            let seat = margs
-                .seat
-                .clone()
-                .ok_or("--assign requires --seat")?;
-            match rs_agent::marshal::assign_bead(bead, &seat) {
-                Ok(b) => println!("Assigned {} → {} — {}", b.id, seat, b.title),
+    // IMPORTANT: match once — `if let ... = cli.command.take()` drops non-matching
+    // variants and would fall through to the TUI (wish/fleet/role/worker).
+    match cli.command.take() {
+        Some(rs_agent::cli::Commands::Marshal(margs)) => {
+            if let Some(ref bead) = margs.assign {
+                let seat = margs
+                    .seat
+                    .clone()
+                    .ok_or("--assign requires --seat")?;
+                match rs_agent::marshal::assign_bead(bead, &seat) {
+                    Ok(b) => println!("Assigned {} → {} — {}", b.id, seat, b.title),
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
+                }
+                return Ok(());
+            }
+            let opts = rs_agent::marshal::MarshalOpts {
+                auto_assign: !margs.no_auto_assign,
+                max_assign: 8,
+                stuck_mins: margs.stuck_mins,
+                mail_stuck: margs.stuck_mins > 0,
+            };
+            if margs.r#loop {
+                rs_agent::marshal::run_loop(opts, margs.interval_secs, margs.budget_minutes).await;
+            } else {
+                println!("{}", rs_agent::marshal::run_with_opts(opts));
+            }
+            return Ok(());
+        }
+        Some(rs_agent::cli::Commands::Wish(wargs)) => {
+            let text = wargs.text.join(" ");
+            match rs_agent::wish::create_wish(&text, wargs.task, wargs.auto) {
+                Ok(b) => println!("{}", rs_agent::wish::format_created(&b)),
                 Err(e) => {
                     eprintln!("{e}");
                     std::process::exit(1);
@@ -233,76 +263,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             return Ok(());
         }
-        let opts = rs_agent::marshal::MarshalOpts {
-            auto_assign: !margs.no_auto_assign,
-            max_assign: 8,
-            stuck_mins: margs.stuck_mins,
-            mail_stuck: margs.stuck_mins > 0,
-        };
-        if margs.r#loop {
-            rs_agent::marshal::run_loop(opts, margs.interval_secs, margs.budget_minutes).await;
-        } else {
-            println!("{}", rs_agent::marshal::run_with_opts(opts));
-        }
-        return Ok(());
-    }
-    if let Some(rs_agent::cli::Commands::Wish(wargs)) = cli.command.take() {
-        let text = wargs.text.join(" ");
-        match rs_agent::wish::create_wish(&text, wargs.task, wargs.auto) {
-            Ok(b) => println!("{}", rs_agent::wish::format_created(&b)),
-            Err(e) => {
-                eprintln!("{e}");
-                std::process::exit(1);
-            }
-        }
-        return Ok(());
-    }
-    if let Some(rs_agent::cli::Commands::Role(rargs)) = cli.command.take() {
-        let name = rargs
-            .seat
-            .or(rargs.role)
-            .ok_or("role requires --seat Beadle (or positional role name)")?;
-        let kind = rs_agent::roles::RoleKind::parse(&name)
-            .ok_or_else(|| format!("unknown role `{name}` — Beadle|Gargoyle|Drawbridge|Scryer|Marshal"))?;
-        if rargs.r#loop {
-            rs_agent::roles::run_loop(
-                kind,
-                rargs.source.clone(),
-                rargs.interval_secs,
-                rargs.budget_minutes,
-            )
-            .await?;
-        } else {
-            match rs_agent::roles::run_once(kind, rargs.source.as_deref()) {
-                Ok(msg) => println!("{msg}"),
-                Err(e) => {
-                    eprintln!("{e}");
-                    std::process::exit(1);
-                }
-            }
-        }
-        return Ok(());
-    }
-    if let Some(rs_agent::cli::Commands::Fleet(fargs)) = cli.command.take() {
-        match fargs.command {
-            rs_agent::cli::FleetCommand::Up {
-                seats,
-                budget_minutes,
-                sleep_secs,
-                quiet,
-                fail_fast,
-            } => {
-                let opts = rs_agent::fleet::FleetUpOpts {
-                    seats: rs_agent::fleet::parse_seat_list(&seats),
-                    budget_minutes,
-                    sleep_secs,
-                    quiet,
-                    provider: cli.provider.clone(),
-                    model: cli.model.clone(),
-                    approve: true, // fleet is unattended
-                    fail_fast,
-                };
-                match rs_agent::fleet::fleet_up(opts) {
+        Some(rs_agent::cli::Commands::Role(rargs)) => {
+            let name = rargs
+                .seat
+                .or(rargs.role)
+                .ok_or("role requires --seat Beadle (or positional role name)")?;
+            let kind = rs_agent::roles::RoleKind::parse(&name).ok_or_else(|| {
+                format!("unknown role `{name}` — Beadle|Gargoyle|Drawbridge|Scryer|Marshal")
+            })?;
+            if rargs.r#loop {
+                rs_agent::roles::run_loop(
+                    kind,
+                    rargs.source.clone(),
+                    rargs.interval_secs,
+                    rargs.budget_minutes,
+                )
+                .await?;
+            } else {
+                match rs_agent::roles::run_once(kind, rargs.source.as_deref()) {
                     Ok(msg) => println!("{msg}"),
                     Err(e) => {
                         eprintln!("{e}");
@@ -310,20 +288,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            rs_agent::cli::FleetCommand::Down { seats } => {
-                let list = seats
-                    .as_deref()
-                    .map(rs_agent::fleet::parse_seat_list);
-                println!("{}", rs_agent::fleet::fleet_down(list));
-            }
-            rs_agent::cli::FleetCommand::Status => {
-                println!("{}", rs_agent::fleet::fleet_status());
-            }
-            rs_agent::cli::FleetCommand::Logs { seat, lines } => {
-                println!("{}", rs_agent::fleet::fleet_logs(&seat, lines));
-            }
+            return Ok(());
         }
-        return Ok(());
+        Some(rs_agent::cli::Commands::Fleet(fargs)) => {
+            match fargs.command {
+                rs_agent::cli::FleetCommand::Up {
+                    seats,
+                    budget_minutes,
+                    sleep_secs,
+                    quiet,
+                    fail_fast,
+                } => {
+                    let opts = rs_agent::fleet::FleetUpOpts {
+                        seats: rs_agent::fleet::parse_seat_list(&seats),
+                        budget_minutes,
+                        sleep_secs,
+                        quiet,
+                        provider: cli.provider.clone(),
+                        model: cli.model.clone(),
+                        approve: true, // fleet is unattended
+                        fail_fast,
+                    };
+                    match rs_agent::fleet::fleet_up(opts) {
+                        Ok(msg) => println!("{msg}"),
+                        Err(e) => {
+                            eprintln!("{e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                rs_agent::cli::FleetCommand::Down { seats } => {
+                    let list = seats.as_deref().map(rs_agent::fleet::parse_seat_list);
+                    println!("{}", rs_agent::fleet::fleet_down(list));
+                }
+                rs_agent::cli::FleetCommand::Status => {
+                    println!("{}", rs_agent::fleet::fleet_status());
+                }
+                rs_agent::cli::FleetCommand::Logs { seat, lines } => {
+                    println!("{}", rs_agent::fleet::fleet_logs(&seat, lines));
+                }
+            }
+            return Ok(());
+        }
+        other => {
+            // Worker needs a provider; put it back for the later handler.
+            cli.command = other;
+        }
     }
 
     let provider_name = cli

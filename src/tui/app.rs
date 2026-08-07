@@ -113,7 +113,35 @@ enum AppCommand {
     HandoffRequest,
     /// Bind or clear seat identity (`None` = clear).
     SetSeat { name: Option<String> },
+    /// Replace agent state with a worker/TUI session (fleet attach).
+    LoadSession { data: SessionData },
+    /// Force-save current session to disk (fleet detach).
+    PersistSession,
     Exit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FleetAttachPhase {
+    /// Live log follow only (worker keeps running).
+    Follow,
+    /// Sent pause; waiting for worker `state=paused`.
+    Attaching,
+    /// Human owns the seat session; worker is paused.
+    Attached,
+    /// Read-only session inspect; worker keeps running (no chat takeover).
+    Inspect,
+}
+
+struct FleetAttachState {
+    seat: String,
+    phase: FleetAttachPhase,
+    follower: crate::fleet::LogFollower,
+    /// Session id we adopted from the worker (Attached).
+    worker_session_id: Option<String>,
+    /// TUI session id before attach (reserved for future restore-on-detach).
+    #[allow(dead_code)]
+    prior_session_id: Option<String>,
+    attach_started: Instant,
 }
 
 pub struct App {
@@ -195,6 +223,8 @@ pub struct App {
     pending_kitty_images: Vec<String>,
     lsp_summary: String,
     lsp_cmd_tx: Option<channel::Sender<LspCmd>>,
+    /// Live fleet follow / attach takeover.
+    fleet_attach: Option<FleetAttachState>,
 }
 
 enum LspCmd {
@@ -684,6 +714,99 @@ impl App {
                             };
                             let _ = event_tx.send((0, AgentEvent::Status { message: msg }));
                         }
+                        AppCommand::LoadSession { data } => {
+                            abort_for_thread.clear();
+                            steer_for_thread.clear();
+                            agent_loop.clear_messages();
+                            session_id_local = data.id.clone();
+                            created_at_local = data.created_at.clone();
+                            title_local = data.title.clone();
+                            parent_id_local = data.parent_id.clone();
+                            branch_label_local = data.branch_label.clone();
+                            if !data.system_prompt.trim().is_empty() {
+                                agent_loop.state_mut().system_prompt = data.system_prompt.clone();
+                            }
+                            agent_loop.state_mut().seat = data.seat.clone();
+                            agent_loop.state_mut().handoff = data.handoff.clone();
+                            agent_loop.state_mut().goal = data.goal.clone();
+                            agent_loop.state_mut().pending_wake = true;
+                            crate::agent::handoff::restore(data.handoff.clone());
+                            crate::tools::handoff::set_active_seat(data.seat.clone());
+                            if let Some(todos) = data.todos.clone() {
+                                crate::tools::todowrite::restore(todos);
+                            } else {
+                                crate::tools::todowrite::clear();
+                            }
+                            for msg in &data.messages {
+                                agent_loop.state_mut().add_message(msg.clone());
+                            }
+                            let _ = event_tx.send((
+                                0,
+                                AgentEvent::SessionMeta {
+                                    id: data.id.clone(),
+                                    title: data.title.clone(),
+                                },
+                            ));
+                            let _ = event_tx.send((
+                                0,
+                                AgentEvent::ReloadTranscript {
+                                    messages: data.messages.clone(),
+                                },
+                            ));
+                            if let Some(ref g) = data.goal {
+                                let _ = event_tx.send((
+                                    0,
+                                    AgentEvent::GoalUpdate {
+                                        summary: format!("◎ /goal {}", g.status.as_str()),
+                                    },
+                                ));
+                            }
+                            let _ = event_tx.send((
+                                0,
+                                AgentEvent::Status {
+                                    message: format!(
+                                        "loaded session {} ({} msgs) seat={:?}",
+                                        data.id,
+                                        data.messages.len(),
+                                        data.seat
+                                    ),
+                                },
+                            ));
+                        }
+                        AppCommand::PersistSession => {
+                            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                            let s = agent_loop.state();
+                            let tree_snapshot =
+                                serde_json::to_value(agent_loop.call_tree().snapshot()).ok();
+                            let mut session_data = SessionData {
+                                id: session_id_local.clone(),
+                                title: title_local.clone(),
+                                parent_id: parent_id_local.clone(),
+                                branch_label: branch_label_local.clone(),
+                                created_at: created_at_local.clone(),
+                                updated_at: now,
+                                model: s.model.clone(),
+                                provider: s.provider.clone(),
+                                system_prompt: s.system_prompt.clone(),
+                                messages: s.messages.clone(),
+                                total_input_tokens: s.total_input_tokens,
+                                total_output_tokens: s.total_output_tokens,
+                                call_tree: tree_snapshot,
+                                todos: Some(crate::tools::todowrite::snapshot()),
+                                goal: s.goal.clone(),
+                                seat: s.seat.clone(),
+                                handoff: s.handoff.clone().or_else(crate::agent::handoff::snapshot),
+                            };
+                            session_data.ensure_title();
+                            title_local = session_data.title.clone();
+                            let _ = store.save(&session_data);
+                            let _ = event_tx.send((
+                                0,
+                                AgentEvent::Status {
+                                    message: format!("persisted session {}", session_id_local),
+                                },
+                            ));
+                        }
                         AppCommand::SetTitle { title } => {
                             title_local = Some(title.clone());
                             let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -985,6 +1108,7 @@ impl App {
             pending_kitty_images: Vec::new(),
             lsp_summary: String::new(),
             lsp_cmd_tx: Some(lsp_cmd_tx),
+            fleet_attach: None,
         }
     }
 
@@ -1009,6 +1133,8 @@ impl App {
             while let Ok((_idx, event)) = self.event_rx.try_recv() {
                 self.handle_agent_event(event);
             }
+
+            self.poll_fleet_attach();
 
             self.poll_model_picker();
 
@@ -1043,6 +1169,9 @@ impl App {
                 break;
             }
         }
+
+        // Resume any paused fleet seat so workers are not wedged.
+        self.fleet_detach(true);
 
         let _ = self.command_tx.send(AppCommand::Exit);
         terminal::disable_raw_mode()?;
@@ -1481,6 +1610,425 @@ impl App {
         self.follow_bottom = true;
     }
 
+    fn push_fleet_log_line(&mut self, line: &crate::fleet::ParsedLogLine) {
+        use crate::fleet::LogKind;
+        let prefix = match line.kind {
+            LogKind::Tool => "⚙",
+            LogKind::ToolResult => "↳",
+            LogKind::Say => "💬",
+            LogKind::Heartbeat => "♥",
+            LogKind::Claimed => "▶",
+            LogKind::Closed => "✓",
+            LogKind::Session => "◉",
+            LogKind::Error => "✗",
+            LogKind::Status => "·",
+            LogKind::Raw => "·",
+        };
+        let ts = line
+            .timestamp
+            .as_deref()
+            .map(|t| format!("[{t}] "))
+            .unwrap_or_default();
+        self.messages.push(ChatMessage {
+            role: match line.kind {
+                LogKind::Say => "assistant".to_string(),
+                LogKind::Tool | LogKind::ToolResult => "tool".to_string(),
+                LogKind::Error => "system".to_string(),
+                _ => "system".to_string(),
+            },
+            text: format!("{prefix} {ts}{}", line.body),
+            thinking: None,
+            show_thinking: false,
+            tool_blocks: Vec::new(),
+        });
+        self.follow_bottom = true;
+    }
+
+    fn fleet_start_follow(&mut self, seat: &str) {
+        if self.fleet_attach.is_some() {
+            self.fleet_detach(true);
+        }
+        let (follower, initial) = crate::fleet::LogFollower::from_tail(seat, 40);
+        self.push_system(format!(
+            "Following `{seat}` — live log (worker keeps running).\n\
+             Steer: /seat steer <text>   Abort turn: /seat abort   Stop: /seat detach\n\
+             Take over: /seat attach {seat}"
+        ));
+        for line in &initial {
+            self.push_fleet_log_line(line);
+        }
+        self.fleet_attach = Some(FleetAttachState {
+            seat: seat.to_string(),
+            phase: FleetAttachPhase::Follow,
+            follower,
+            worker_session_id: None,
+            prior_session_id: None,
+            attach_started: Instant::now(),
+        });
+        self.status = format!("following {seat}");
+        self.push_system(crate::fleet::format_city_board(Some(seat)));
+    }
+
+    fn fleet_start_attach(&mut self, seat: &str) {
+        if self.fleet_attach.is_some() {
+            self.fleet_detach(true);
+        }
+        let st = crate::fleet::read_seat_status(seat);
+        if st
+            .as_ref()
+            .map(|s| !s.running && s.state == "stopped")
+            .unwrap_or(false)
+        {
+            self.push_system(format!(
+                "Seat `{seat}` does not look running. Start with /fleet up first."
+            ));
+        }
+        crate::fleet::append_control(seat, crate::fleet::ControlOp::Pause, Some("tui attach"));
+        let (follower, initial) = crate::fleet::LogFollower::from_tail(seat, 30);
+        self.push_system(format!(
+            "Attaching to `{seat}` — pausing worker… (Esc abort once attached; /seat detach to return)"
+        ));
+        for line in &initial {
+            self.push_fleet_log_line(line);
+        }
+        self.fleet_attach = Some(FleetAttachState {
+            seat: seat.to_string(),
+            phase: FleetAttachPhase::Attaching,
+            follower,
+            worker_session_id: st.and_then(|s| s.session_id),
+            prior_session_id: Some(self.session_id.clone()),
+            attach_started: Instant::now(),
+        });
+        self.status = format!("attaching {seat}…");
+    }
+
+    /// Load a worker session, retrying briefly (file may appear just after status updates).
+    fn load_worker_session_retry(sid: &str) -> Result<SessionData, String> {
+        let store = SessionStore::new();
+        let mut last = String::new();
+        for attempt in 0..6 {
+            match store.load(sid) {
+                Ok(data) => return Ok(data),
+                Err(e) => {
+                    last = e;
+                    if attempt + 1 < 6 {
+                        std::thread::sleep(Duration::from_millis(400));
+                    }
+                }
+            }
+        }
+        Err(format!(
+            "{last}\n\
+             Tip: worker advertises session_id before the file exists on old binaries — \
+             `fleet down` + `fleet up` with the latest rs-agent, or wait for the turn to flush. \
+             Path: {}",
+            store.session_path(sid)
+        ))
+    }
+
+    /// Inspect session without pausing the worker (read-only).
+    fn fleet_open_inspect(&mut self, seat: &str) {
+        if self.fleet_attach.as_ref().map(|a| a.phase) == Some(FleetAttachPhase::Attached)
+            || self.fleet_attach.as_ref().map(|a| a.phase) == Some(FleetAttachPhase::Attaching)
+        {
+            self.push_system("Detach first (`/seat detach`) before opening another seat.");
+            return;
+        }
+        if self.fleet_attach.is_some() {
+            self.fleet_detach(true);
+        }
+        self.push_system(crate::fleet::format_seat_card(seat));
+        let st = crate::fleet::read_seat_status(seat);
+        let sid = st.as_ref().and_then(|s| s.session_id.clone());
+        let Some(sid) = sid else {
+            self.push_system(format!(
+                "No session_id for `{seat}` yet — follow logs with `/seat follow {seat}`."
+            ));
+            return;
+        };
+        match Self::load_worker_session_retry(&sid) {
+            Ok(data) => {
+                let (follower, _) = crate::fleet::LogFollower::from_tail(seat, 0);
+                self.fleet_attach = Some(FleetAttachState {
+                    seat: seat.to_string(),
+                    phase: FleetAttachPhase::Inspect,
+                    follower,
+                    worker_session_id: Some(sid.clone()),
+                    prior_session_id: Some(self.session_id.clone()),
+                    attach_started: Instant::now(),
+                });
+                self.push_system(format!(
+                    "INSPECT `{seat}` session {sid} (worker still running — chat disabled).\n\
+                     /seat follow {seat} · /seat attach {seat} · /seat detach"
+                ));
+                let _ = self.command_tx.send(AppCommand::LoadSession { data });
+                self.status = format!("inspect {seat}");
+            }
+            Err(e) => self.push_system(format!("Failed to load session {sid}: {e}")),
+        }
+    }
+
+    fn fleet_steer_remote(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            self.push_system("Usage: /seat steer <instruction>");
+            return;
+        }
+        let Some(attach) = &self.fleet_attach else {
+            self.push_system("Follow or attach a seat first: /seat follow <seat>");
+            return;
+        };
+        let seat = attach.seat.clone();
+        match attach.phase {
+            FleetAttachPhase::Follow | FleetAttachPhase::Attaching => {
+                crate::fleet::append_control(
+                    &seat,
+                    crate::fleet::ControlOp::Steer,
+                    Some(text),
+                );
+                self.push_system(format!("Steer → `{seat}`: {text}"));
+            }
+            FleetAttachPhase::Attached => {
+                // Local steer queue (same as Waiting-mode Enter).
+                self.steer_queue.push(text.to_string());
+                let _ = self.command_tx.send(AppCommand::Steer {
+                    text: text.to_string(),
+                });
+                self.push_system(format!("Steer (attached): {text}"));
+            }
+            FleetAttachPhase::Inspect => {
+                self.push_system(
+                    "Inspect is read-only. `/seat follow` + `/seat steer …`, or `/seat attach`.",
+                );
+            }
+        }
+    }
+
+    fn fleet_abort_remote(&mut self) {
+        let Some(attach) = &self.fleet_attach else {
+            self.push_system("Follow or attach a seat first: /seat follow <seat>");
+            return;
+        };
+        let seat = attach.seat.clone();
+        match attach.phase {
+            FleetAttachPhase::Follow | FleetAttachPhase::Attaching => {
+                crate::fleet::append_control(&seat, crate::fleet::ControlOp::Abort, None);
+                self.push_system(format!("Abort → `{seat}` (worker turn)"));
+            }
+            FleetAttachPhase::Attached => {
+                self.abort_flag.abort();
+                let _ = self.command_tx.send(AppCommand::Abort);
+                self.push_system("Abort (attached turn)");
+            }
+            FleetAttachPhase::Inspect => {
+                self.push_system("Inspect is read-only. `/seat follow` then `/seat abort`.");
+            }
+        }
+    }
+
+    fn fleet_complete_attach(&mut self) {
+        let Some(attach) = self.fleet_attach.as_mut() else {
+            return;
+        };
+        if attach.phase != FleetAttachPhase::Attaching {
+            return;
+        }
+        let seat = attach.seat.clone();
+        let st = crate::fleet::read_seat_status(&seat);
+        let session_id = st
+            .as_ref()
+            .and_then(|s| s.session_id.clone())
+            .or_else(|| attach.worker_session_id.clone());
+        let Some(sid) = session_id else {
+            if attach.attach_started.elapsed() > Duration::from_secs(90) {
+                self.push_system(format!(
+                    "Attach to `{seat}` timed out waiting for session_id (is the worker alive?)."
+                ));
+                self.fleet_attach = None;
+                crate::fleet::append_control(&seat, crate::fleet::ControlOp::Resume, None);
+            }
+            return;
+        };
+        let paused = st
+            .as_ref()
+            .map(|s| s.state == "paused" || s.state == "attached")
+            .unwrap_or(false);
+        if !paused {
+            if attach.attach_started.elapsed() > Duration::from_secs(120) {
+                self.push_system(format!(
+                    "Attach to `{seat}` timed out waiting for pause. Sent resume."
+                ));
+                crate::fleet::append_control(&seat, crate::fleet::ControlOp::Resume, None);
+                self.fleet_attach = None;
+            }
+            return;
+        }
+        match Self::load_worker_session_retry(&sid) {
+            Ok(data) => {
+                attach.phase = FleetAttachPhase::Attached;
+                attach.worker_session_id = Some(sid.clone());
+                if let Some(mut status) = crate::fleet::read_seat_status(&seat) {
+                    status.state = "attached".into();
+                    status.paused_reason = Some("tui attached".into());
+                    crate::fleet::write_seat_status(&status);
+                }
+                let bead = st
+                    .as_ref()
+                    .and_then(|s| s.last_bead.clone())
+                    .unwrap_or_else(|| "-".into());
+                self.push_system(format!(
+                    "ATTACHED `{seat}` · bead {bead} · session {sid}\n\
+                     Chat to continue as this seat. Esc aborts the turn. /seat detach returns control."
+                ));
+                let _ = self.command_tx.send(AppCommand::LoadSession { data });
+                self.status = format!("ATTACHED {seat}");
+                self.input_mode = InputMode::Insert;
+            }
+            Err(e) => {
+                self.push_system(format!(
+                    "Paused `{seat}` but failed to load session `{sid}`: {e}. Detaching."
+                ));
+                crate::fleet::append_control(&seat, crate::fleet::ControlOp::Resume, None);
+                self.fleet_attach = None;
+            }
+        }
+    }
+
+    /// `quiet`: skip chatter when switching follow→attach.
+    fn fleet_detach(&mut self, quiet: bool) {
+        let Some(attach) = self.fleet_attach.take() else {
+            if !quiet {
+                self.push_system("Not attached to a fleet seat.");
+            }
+            return;
+        };
+        let seat = attach.seat;
+        match attach.phase {
+            FleetAttachPhase::Attached | FleetAttachPhase::Attaching => {
+                let _ = self.command_tx.send(AppCommand::PersistSession);
+                crate::fleet::append_control(&seat, crate::fleet::ControlOp::Resume, None);
+                if let Some(mut st) = crate::fleet::read_seat_status(&seat) {
+                    crate::fleet::clear_paused(&mut st);
+                    st.state = "idle".into();
+                    crate::fleet::write_seat_status(&st);
+                }
+                if !quiet {
+                    self.push_system(format!(
+                        "Detached from `{seat}` — worker resume signaled. Session saved."
+                    ));
+                }
+            }
+            FleetAttachPhase::Follow => {
+                if !quiet {
+                    self.push_system(format!("Stopped following `{seat}`."));
+                }
+            }
+            FleetAttachPhase::Inspect => {
+                if !quiet {
+                    self.push_system(format!("Closed inspect view for `{seat}`."));
+                }
+            }
+        }
+        self.status = "ready".to_string();
+    }
+
+    fn city_highlight_seat(&self) -> Option<&str> {
+        self.fleet_attach.as_ref().map(|a| a.seat.as_str())
+    }
+
+    fn show_city_board(&mut self) {
+        let highlight = self.city_highlight_seat().map(|s| s.to_string());
+        self.push_system(crate::fleet::format_city_board(highlight.as_deref()));
+    }
+
+    /// Handle `/seat …` and shared fleet aliases. Returns true if handled.
+    fn handle_seat_ops(&mut self, raw: &str) -> bool {
+        let raw = raw.trim();
+        let lower = raw.to_lowercase();
+        if lower.is_empty() || lower == "status" || lower == "board" {
+            self.show_city_board();
+            return true;
+        }
+        if lower == "detach" {
+            self.fleet_detach(false);
+            return true;
+        }
+        if let Some(rest) = lower.strip_prefix("follow ") {
+            let seat = raw.split_whitespace().nth(1).unwrap_or(rest.trim());
+            if seat.is_empty() {
+                self.push_system("Usage: /seat follow <seat>");
+            } else {
+                self.fleet_start_follow(seat);
+            }
+            return true;
+        }
+        if let Some(rest) = lower.strip_prefix("attach ") {
+            let seat = raw.split_whitespace().nth(1).unwrap_or(rest.trim());
+            if seat.is_empty() {
+                self.push_system("Usage: /seat attach <seat>");
+            } else {
+                self.fleet_start_attach(seat);
+            }
+            return true;
+        }
+        if let Some(rest) = lower
+            .strip_prefix("open ")
+            .or_else(|| lower.strip_prefix("inspect "))
+        {
+            let seat = raw.split_whitespace().nth(1).unwrap_or(rest.trim());
+            if seat.is_empty() {
+                self.push_system("Usage: /seat open <seat>");
+            } else {
+                self.fleet_open_inspect(seat);
+            }
+            return true;
+        }
+        if let Some(rest) = lower.strip_prefix("steer ") {
+            // Preserve original casing for steer text from raw after first token.
+            let text = raw
+                .split_once(char::is_whitespace)
+                .map(|(_, r)| r.trim())
+                .unwrap_or(rest.trim());
+            self.fleet_steer_remote(text);
+            return true;
+        }
+        if lower == "abort" {
+            self.fleet_abort_remote();
+            return true;
+        }
+        if let Some(rest) = lower.strip_prefix("logs ").or_else(|| lower.strip_prefix("log ")) {
+            let seat = raw.split_whitespace().nth(1).unwrap_or(rest.trim());
+            if seat.is_empty() {
+                self.push_system("Usage: /seat logs <seat>");
+            } else {
+                self.push_system(crate::fleet::fleet_logs(seat, 60));
+            }
+            return true;
+        }
+        self.push_system(
+            "Usage: /seat | /seat follow|attach|detach|open|steer|abort|logs <seat>\n\
+             Also: /city   (board)   /fleet up|down   aliases work for follow/attach/…",
+        );
+        true
+    }
+
+    fn poll_fleet_attach(&mut self) {
+        // Drain log follower.
+        let lines = {
+            let Some(attach) = self.fleet_attach.as_mut() else {
+                return;
+            };
+            attach.follower.poll()
+        };
+        for line in &lines {
+            self.push_fleet_log_line(line);
+        }
+        let phase = self.fleet_attach.as_ref().map(|a| a.phase);
+        if phase == Some(FleetAttachPhase::Attaching) {
+            self.fleet_complete_attach();
+        }
+    }
+
     fn handle_slash_command(&mut self, text: &str) -> bool {
         let trimmed = text.trim();
         if !trimmed.starts_with('/') {
@@ -1498,8 +2046,8 @@ impl App {
                      /mode plan|ask|agent  /model [provider/model]  /provider|/login [name]\n\
                      /goal [condition|clear|pause|resume]  /theme [dark|light|forest]\n\
                      /handoff  /seat [name|clear|list|caste|…]  /beads [ready]  /laurel <text>  /laurels\n\
-                     /worker [seat]  /marshal [assign …]  /fleet [up|down|logs|status]\n\
-                     /mail [send|ack]  /wish …  /moot …  /brain remember|falsify <…>\n\
+                     /worker [seat]  /marshal [assign …]  /city  /seat [follow|attach|…]  /fleet …\n\
+                     /detach  /mail [send|ack]  /wish …  /moot …  /brain remember|falsify <…>\n\
                      /compact  /new  /fork [@N] [label]  /timeline  /sessions\n\
                      /export [md|json|html]  /image [path]  /lsp [start|stop|status]  /skill-pack export|import\n\
                      /revert  /trust list|reset  /rename <title>  /history [query|n]\n\n\
@@ -1656,10 +2204,28 @@ impl App {
                 let _ = self.command_tx.send(AppCommand::HandoffRequest);
             }
             "/seat" => {
+                let raw = arg.trim();
+                let lower = raw.to_lowercase();
+                let is_ops = lower.is_empty()
+                    || lower == "status"
+                    || lower == "board"
+                    || lower == "detach"
+                    || lower == "abort"
+                    || lower.starts_with("follow ")
+                    || lower.starts_with("attach ")
+                    || lower.starts_with("open ")
+                    || lower.starts_with("inspect ")
+                    || lower.starts_with("steer ")
+                    || lower.starts_with("logs ")
+                    || lower.starts_with("log ");
+                if is_ops {
+                    let _ = self.handle_seat_ops(raw);
+                } else {
                 match crate::agent::parse_seat_arg(arg) {
                     Ok(crate::agent::SeatCommand::Status) => {
                         self.push_system(
-                            "Usage: /seat <name> | clear | list | pronouns … | role … | caste … | orders … | model … | rename …",
+                            "Usage: /seat <name> | clear | list | pronouns … | role … | caste … | orders … | model … | rename …\n\
+                             Ops: /city | /seat follow|attach|detach|steer|abort|open <seat>",
                         );
                     }
                     Ok(crate::agent::SeatCommand::Clear) => {
@@ -1820,6 +2386,7 @@ impl App {
                     }
                     Err(e) => self.push_system(e),
                 }
+                } // end else identity
             }
             "/beads" => {
                 let sub = arg.trim().to_lowercase();
@@ -1996,11 +2563,14 @@ impl App {
                     self.push_system(out);
                 }
             }
+            "/city" => {
+                self.show_city_board();
+            }
             "/fleet" => {
                 let raw = arg.trim();
                 let lower = raw.to_lowercase();
                 if lower.is_empty() || lower == "status" {
-                    self.push_system(crate::fleet::fleet_status());
+                    self.show_city_board();
                 } else if lower == "down" {
                     self.push_system(crate::fleet::fleet_down(None));
                 } else if let Some(rest) = lower.strip_prefix("down ") {
@@ -2013,7 +2583,6 @@ impl App {
                     let seats = if rest.trim().is_empty() {
                         vec!["Fleet-1".into(), "Fleet-2".into()]
                     } else {
-                        // preserve original casing from raw after "up "
                         let after = raw
                             .split_once(char::is_whitespace)
                             .map(|(_, r)| r.trim())
@@ -2038,26 +2607,16 @@ impl App {
                         Ok(msg) => self.push_system(msg),
                         Err(e) => self.push_system(e),
                     }
-                } else if let Some(seat) = lower.strip_prefix("logs ").or_else(|| {
-                    lower.strip_prefix("log ")
-                }) {
-                    let seat = seat.trim();
-                    // Restore casing from raw if possible
-                    let seat_raw = raw
-                        .split_whitespace()
-                        .nth(1)
-                        .unwrap_or(seat);
-                    if seat_raw.is_empty() {
-                        self.push_system("Usage: /fleet logs <seat>");
-                    } else {
-                        self.push_system(crate::fleet::fleet_logs(seat_raw, 60));
-                    }
+                } else if self.handle_seat_ops(raw) {
+                    // follow/attach/detach/steer/abort/open/logs
                 } else {
                     self.push_system(
-                        "Usage: /fleet | /fleet status | /fleet up [Fleet-1,Fleet-2] | \
-                         /fleet down [seats] | /fleet logs <seat>",
+                        "Usage: /fleet | /fleet up|down | /seat follow|attach|detach|steer|abort|open",
                     );
                 }
+            }
+            "/detach" => {
+                self.fleet_detach(false);
             }
             "/brain" => {
                 let rest = arg.trim();
@@ -2842,6 +3401,13 @@ impl App {
     /// Push a non-slash user message to the agent: records it in
     /// `input_history`, appends chat bubbles, and dispatches `Submit`.
     fn submit_user_text(&mut self, text: String) {
+        if self.fleet_attach.as_ref().map(|a| a.phase) == Some(FleetAttachPhase::Inspect) {
+            self.push_system(
+                "Inspect is read-only. Use `/seat attach <seat>` to take over, or `/seat follow` + `/seat steer …`.",
+            );
+            self.input.clear();
+            return;
+        }
         if self.input_history.last().map(|s| s.as_str()) != Some(text.as_str()) {
             self.input_history.push(text.clone());
         }
@@ -4202,8 +4768,18 @@ impl App {
             .filter(|r| !r.is_empty())
             .map(|r| format!(" beads:{} ready", r.len()))
             .unwrap_or_default();
+        let attach_chip = self
+            .fleet_attach
+            .as_ref()
+            .map(|a| match a.phase {
+                FleetAttachPhase::Follow => format!(" FOLLOW {}", a.seat),
+                FleetAttachPhase::Attaching => format!(" ATTACHING {}", a.seat),
+                FleetAttachPhase::Attached => format!(" ATTACHED {}", a.seat),
+                FleetAttachPhase::Inspect => format!(" INSPECT {}", a.seat),
+            })
+            .unwrap_or_default();
         let meta = format!(
-            " {}/{} · {} · d{}{}{}{} [{}]{}{}{} | {}",
+            " {}/{} · {} · d{}{}{}{} [{}]{}{}{}{} | {}",
             self.provider_name,
             self.model_name,
             self.agent_mode.as_str(),
@@ -4215,6 +4791,7 @@ impl App {
             title_str,
             goal_chip,
             beads_chip,
+            attach_chip,
             self.tree_breadcrumb
         );
 

@@ -4,10 +4,10 @@
 //! during long turns, session persistence, honest idle messaging.
 
 use crate::agent::handoff::{self, HandoffNotes};
-use crate::agent::{AgentEvent, AgentLoop, AgentState};
+use crate::agent::{AbortFlag, AgentEvent, AgentLoop, AgentState, SteerQueue};
 use crate::ai::provider::Provider;
 use crate::beads::{self, Bead};
-use crate::fleet::{self, SeatStatus};
+use crate::fleet::{self, ControlOp, SeatStatus};
 use crate::session::{SessionData, SessionStore};
 use crate::tools;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,6 +61,62 @@ fn truncate(s: &str, n: usize) -> String {
     } else {
         t
     }
+}
+
+/// Shared control state for a worker process (pause / abort / steer).
+struct WorkerControl {
+    abort: AbortFlag,
+    steer: SteerQueue,
+    pause_requested: AtomicBool,
+    resume_requested: AtomicBool,
+}
+
+impl WorkerControl {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            abort: AbortFlag::new(),
+            steer: SteerQueue::new(),
+            pause_requested: AtomicBool::new(false),
+            resume_requested: AtomicBool::new(false),
+        })
+    }
+
+    fn apply_commands(&self, cmds: &[fleet::ControlCommand]) {
+        for cmd in cmds {
+            match cmd.op {
+                ControlOp::Pause => {
+                    self.pause_requested.store(true, Ordering::SeqCst);
+                    self.abort.abort();
+                }
+                ControlOp::Resume => {
+                    self.resume_requested.store(true, Ordering::SeqCst);
+                    self.pause_requested.store(false, Ordering::SeqCst);
+                }
+                ControlOp::Abort => {
+                    self.abort.abort();
+                }
+                ControlOp::Steer => {
+                    if let Some(ref text) = cmd.text {
+                        if !text.trim().is_empty() {
+                            self.steer.push(text.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn clear_turn_flags(&self) {
+        self.abort.clear();
+        self.steer.clear();
+    }
+}
+
+fn find_claimed_by(claimant: &str) -> Option<Bead> {
+    beads::list_claimed(None)
+        .ok()?
+        .into_iter()
+        .find(|b| b.claimant.as_deref() == Some(claimant))
 }
 
 fn bead_task_prompt(bead: &Bead, caste: crate::agent::SeatCaste) -> String {
@@ -155,7 +211,56 @@ fn persist_session(
         data.created_at = prev.created_at;
     }
     data.ensure_title();
-    let _ = store.save(&data);
+    if let Err(e) = store.save(&data) {
+        eprintln!("[worker:{seat}] session save failed: {e}");
+        fleet::append_log(seat, &format!("session save failed: {e}"));
+    }
+}
+
+/// Write a loadable session file as soon as `session_id` is advertised in status
+/// (so `/seat open|attach` works mid-turn, before the first persist_session).
+fn seed_session_file(
+    store: &SessionStore,
+    session_id: &str,
+    model: &str,
+    provider: &str,
+    seat: &str,
+    bead: &Bead,
+    system_prompt: &str,
+    state: &crate::agent::AgentState,
+) {
+    if store.exists(session_id) {
+        return;
+    }
+    let now = chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let mut data = SessionData {
+        id: session_id.to_string(),
+        title: Some(format!("{}: {}", bead.id, truncate(&bead.title, 40))),
+        parent_id: None,
+        branch_label: Some(format!("worker:{seat}")),
+        created_at: now.clone(),
+        updated_at: now,
+        model: model.to_string(),
+        provider: provider.to_string(),
+        system_prompt: system_prompt.to_string(),
+        messages: state.messages.clone(),
+        total_input_tokens: state.total_input_tokens,
+        total_output_tokens: state.total_output_tokens,
+        call_tree: None,
+        todos: Some(crate::tools::todowrite::snapshot()),
+        goal: state.goal.clone(),
+        seat: Some(seat.to_string()),
+        handoff: state.handoff.clone().or_else(crate::agent::handoff::snapshot),
+    };
+    data.ensure_title();
+    if let Err(e) = store.save(&data) {
+        eprintln!("[worker:{seat}] session seed failed: {e}");
+        fleet::append_log(seat, &format!("session seed failed: {e}"));
+    } else {
+        fleet::append_log(seat, &format!("session {session_id} seeded (attach/open ready)"));
+    }
 }
 
 struct EventSink {
@@ -261,6 +366,8 @@ async fn run_one_bead(
     bead: &Bead,
     claimant: &str,
     status: Arc<Mutex<SeatStatus>>,
+    control: Arc<WorkerControl>,
+    resume_session_id: Option<String>,
 ) -> Result<(), String> {
     tools::handoff::set_active_seat(Some(claimant.to_string()));
     let mut state = AgentState::new(model.clone(), provider_name.clone())
@@ -274,17 +381,51 @@ async fn run_one_bead(
         0,
     ));
 
-    let session_id = format!(
-        "worker_{}_{}",
-        fleet::seat_slug(claimant),
-        chrono::Local::now().format("%Y%m%d_%H%M%S")
+    let store = SessionStore::new();
+    let session_id = resume_session_id.unwrap_or_else(|| {
+        format!(
+            "worker_{}_{}",
+            fleet::seat_slug(claimant),
+            chrono::Local::now().format("%Y%m%d_%H%M%S")
+        )
+    });
+    if let Ok(prev) = store.load(&session_id) {
+        state.messages = prev.messages;
+        state.goal = prev.goal.or(state.goal);
+        state.handoff = prev.handoff;
+        if !prev.system_prompt.trim().is_empty() {
+            state.system_prompt = prev.system_prompt.clone();
+        }
+        crate::agent::handoff::restore(state.handoff.clone());
+        if let Some(todos) = prev.todos {
+            crate::tools::todowrite::restore(todos);
+        }
+        fleet::append_log(
+            claimant,
+            &format!("reloaded session {session_id} ({} msgs)", state.messages.len()),
+        );
+    }
+
+    // Advertise session_id only after a loadable file exists on disk.
+    seed_session_file(
+        &store,
+        &session_id,
+        &model,
+        &provider_name,
+        claimant,
+        bead,
+        &state.system_prompt,
+        &state,
     );
+
     if let Ok(mut st) = status.lock() {
         st.session_id = Some(session_id.clone());
         st.last_bead = Some(bead.id.clone());
         st.last_title = Some(bead.title.clone());
         st.state = "working".into();
         st.last_error = None;
+        fleet::clear_paused(&mut st);
+        st.state = "working".into();
         fleet::heartbeat_touch(&mut st, Some("starting turn"));
         fleet::write_seat_status(&st);
     }
@@ -293,29 +434,72 @@ async fn run_one_bead(
         &format!("session {session_id} claimed {} — {}", bead.id, bead.title),
     );
 
+    control.clear_turn_flags();
+    // Re-apply any pending pause before we start.
+    let pending = fleet::poll_control(claimant);
+    control.apply_commands(&pending);
+    if control.pause_requested.load(Ordering::SeqCst) {
+        // Pause before starting — stub already on disk.
+        if let Ok(mut st) = status.lock() {
+            st.session_id = Some(session_id.clone());
+            fleet::set_paused(&mut st, "tui attach");
+            fleet::write_seat_status(&st);
+        }
+        return Ok(());
+    }
+
     let mut agent = AgentLoop::new(provider, state)
         .with_max_iterations(cfg.max_iterations)
         .with_rlm_depth(0, cfg.max_rlm_depth)
-        .with_goal_verify(cfg.goal_verify);
+        .with_goal_verify(cfg.goal_verify)
+        .with_abort(control.abort.clone())
+        .with_steer(control.steer.clone());
     tools::register_default_tools_with_rlm(&mut agent, cfg.max_rlm_depth);
 
-    let stop_hb = Arc::new(AtomicBool::new(false));
-    let stop_hb2 = stop_hb.clone();
-    let seat_hb = claimant.to_string();
-    let bead_hb = bead.id.clone();
-    let status_hb = status.clone();
-    let hb_task = tokio::spawn(async move {
-        while !stop_hb2.load(Ordering::Relaxed) {
-            tokio::time::sleep(Duration::from_secs(45)).await;
-            if stop_hb2.load(Ordering::Relaxed) {
+    // Refresh file with live agent state so open/attach mid-turn has context.
+    persist_session(
+        &store,
+        &session_id,
+        &agent,
+        &model,
+        &provider_name,
+        claimant,
+        bead,
+    );
+
+    let stop_ctrl = Arc::new(AtomicBool::new(false));
+    let stop_ctrl2 = stop_ctrl.clone();
+    let seat_ctrl = claimant.to_string();
+    let control_poll = control.clone();
+    let ctrl_task = tokio::spawn(async move {
+        while !stop_ctrl2.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if stop_ctrl2.load(Ordering::Relaxed) {
                 break;
             }
-            let _ = beads::heartbeat(None, &bead_hb, &seat_hb);
-            if let Ok(mut st) = status_hb.lock() {
+            let cmds = fleet::poll_control(&seat_ctrl);
+            control_poll.apply_commands(&cmds);
+        }
+    });
+
+    // Lease heartbeat every 45s.
+    let stop_lease = Arc::new(AtomicBool::new(false));
+    let stop_lease2 = stop_lease.clone();
+    let seat_lease = claimant.to_string();
+    let bead_lease = bead.id.clone();
+    let status_lease = status.clone();
+    let lease_task = tokio::spawn(async move {
+        while !stop_lease2.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_secs(45)).await;
+            if stop_lease2.load(Ordering::Relaxed) {
+                break;
+            }
+            let _ = beads::heartbeat(None, &bead_lease, &seat_lease);
+            if let Ok(mut st) = status_lease.lock() {
                 fleet::heartbeat_touch(&mut st, Some("lease heartbeat"));
                 fleet::write_seat_status(&st);
             }
-            fleet::append_log(&seat_hb, &format!("heartbeat lease on {bead_hb}"));
+            fleet::append_log(&seat_lease, &format!("heartbeat lease on {bead_lease}"));
         }
     });
 
@@ -328,18 +512,30 @@ async fn run_one_bead(
     };
     let last_status_msg = sink.last_status_msg.clone();
 
-    let prompt = bead_task_prompt(bead, claimant_caste(cfg));
+    let had_history = !agent.state().messages.is_empty();
+    let prompt = if had_history {
+        format!(
+            "Continue working on bead {} ({}). \
+             Prior conversation is in context. Finish and close the bead when done, \
+             or follow any new [steer] instructions.",
+            bead.id, bead.title
+        )
+    } else {
+        bead_task_prompt(bead, claimant_caste(cfg))
+    };
+
     let result = agent
         .run(&prompt, &mut |ev| {
             sink.handle(&ev);
         })
         .await;
 
-    stop_hb.store(true, Ordering::Relaxed);
-    let _ = hb_task.await;
+    stop_ctrl.store(true, Ordering::Relaxed);
+    stop_lease.store(true, Ordering::Relaxed);
+    let _ = ctrl_task.await;
+    let _ = lease_task.await;
     let _ = beads::heartbeat(None, &bead.id, claimant);
 
-    let store = SessionStore::new();
     persist_session(
         &store,
         &session_id,
@@ -352,10 +548,19 @@ async fn run_one_bead(
     eprintln!(
         "[worker:{claimant}] saved session `{session_id}` (resume with -r {session_id})"
     );
-    fleet::append_log(
-        claimant,
-        &format!("saved session {session_id}"),
-    );
+    fleet::append_log(claimant, &format!("saved session {session_id}"));
+
+    let pausing = control.pause_requested.load(Ordering::SeqCst);
+    if pausing {
+        if let Ok(mut st) = status.lock() {
+            st.session_id = Some(session_id.clone());
+            fleet::set_paused(&mut st, "tui attach");
+            fleet::write_seat_status(&st);
+        }
+        fleet::append_log(claimant, "paused for TUI attach — keeping lease");
+        // Keep claim; do not release.
+        return Ok(());
+    }
 
     match result {
         Ok(()) => {
@@ -378,10 +583,76 @@ async fn run_one_bead(
                 vec![bead.id.clone()],
             );
             handoff::store(notes);
-            let _ = beads::release(None, &bead.id, Some(claimant));
+            if !control.pause_requested.load(Ordering::SeqCst) {
+                let _ = beads::release(None, &bead.id, Some(claimant));
+            }
             Err(e)
         }
     }
+}
+
+/// Block until resume control, pause TTL, or budget deadline.
+async fn wait_while_paused(
+    claimant: &str,
+    _cfg: &WorkerConfig,
+    status: Arc<Mutex<SeatStatus>>,
+    control: Arc<WorkerControl>,
+    deadline: Instant,
+) {
+    control.resume_requested.store(false, Ordering::SeqCst);
+    eprintln!("[worker:{claimant}] paused — waiting for TUI detach/resume");
+    fleet::append_log(claimant, "paused — waiting for resume");
+
+    loop {
+        if Instant::now() >= deadline {
+            fleet::append_log(claimant, "pause ended: budget exhausted");
+            break;
+        }
+        // Drain control.
+        let cmds = fleet::poll_control(claimant);
+        control.apply_commands(&cmds);
+        if control.resume_requested.load(Ordering::SeqCst) {
+            fleet::append_log(claimant, "resume received");
+            break;
+        }
+        let expired = status
+            .lock()
+            .map(|st| fleet::pause_expired(&st))
+            .unwrap_or(false);
+        if expired {
+            fleet::append_log(
+                claimant,
+                &format!("pause TTL ({}s) expired — auto-resume", fleet::PAUSE_TTL_SECS),
+            );
+            break;
+        }
+        // Heartbeat lease so other seats do not steal.
+        if let Some(b) = find_claimed_by(claimant) {
+            let _ = beads::heartbeat(None, &b.id, claimant);
+        }
+        if let Ok(mut st) = status.lock() {
+            if st.state != "paused" && st.state != "attached" {
+                let reason = st
+                    .paused_reason
+                    .clone()
+                    .unwrap_or_else(|| "tui attach".into());
+                fleet::set_paused(&mut st, &reason);
+            }
+            fleet::heartbeat_touch(&mut st, Some("paused (awaiting detach)"));
+            fleet::write_seat_status(&st);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    control.pause_requested.store(false, Ordering::SeqCst);
+    control.resume_requested.store(false, Ordering::SeqCst);
+    control.abort.clear();
+    if let Ok(mut st) = status.lock() {
+        fleet::clear_paused(&mut st);
+        st.state = "idle".into();
+        fleet::write_seat_status(&st);
+    }
+    eprintln!("[worker:{claimant}] resumed");
 }
 
 /// Run worker once or until budget / empty ready queue.
@@ -399,6 +670,7 @@ pub async fn run_worker(
         &claimant,
         Some(&model),
     )));
+    let control = WorkerControl::new();
     {
         let mut st = status.lock().map_err(|e| e.to_string())?;
         st.state = "idle".into();
@@ -414,7 +686,7 @@ pub async fn run_worker(
         ),
     );
     eprintln!(
-        "[worker:{claimant}] caste={} watching: .rs-agent/fleet/{}.status.json + .log",
+        "[worker:{claimant}] caste={} watching: .rs-agent/fleet/{}.status.json + .log + .control.jsonl",
         caste.as_str(),
         fleet::seat_slug(&claimant)
     );
@@ -443,6 +715,108 @@ pub async fn run_worker(
             break;
         }
 
+        // Honor pause before claiming (and after turns).
+        {
+            let cmds = fleet::poll_control(&claimant);
+            control.apply_commands(&cmds);
+        }
+        if control.pause_requested.load(Ordering::SeqCst) {
+            if let Ok(mut st) = status.lock() {
+                fleet::set_paused(&mut st, "tui attach");
+                fleet::write_seat_status(&st);
+            }
+            wait_while_paused(&claimant, &cfg, status.clone(), control.clone(), deadline).await;
+            continue;
+        }
+
+        // If we still hold a claimed bead (paused mid-work / TUI detach), continue it.
+        let resume_session = status
+            .lock()
+            .ok()
+            .and_then(|st| st.session_id.clone());
+        if let Some(existing) = find_claimed_by(&claimant) {
+            eprintln!(
+                "[worker:{claimant}] continuing claimed {} — {}",
+                existing.id, existing.title
+            );
+            fleet::append_log(
+                &claimant,
+                &format!("continuing {} — {}", existing.id, existing.title),
+            );
+            match run_one_bead(
+                provider.clone(),
+                model.clone(),
+                provider_name.clone(),
+                system_prompt.clone(),
+                &cfg,
+                &existing,
+                &claimant,
+                status.clone(),
+                control.clone(),
+                resume_session.clone(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    if control.pause_requested.load(Ordering::SeqCst) {
+                        wait_while_paused(
+                            &claimant,
+                            &cfg,
+                            status.clone(),
+                            control.clone(),
+                            deadline,
+                        )
+                        .await;
+                        continue;
+                    }
+                    if let Ok(Some(b)) = beads::get(None, &existing.id) {
+                        if let Ok(mut st) = status.lock() {
+                            if b.status == beads::BeadStatus::Closed {
+                                st.beads_closed += 1;
+                                fleet::append_log(&claimant, &format!("closed {}", existing.id));
+                            } else if b.status == beads::BeadStatus::Blocked {
+                                st.beads_blocked += 1;
+                            }
+                            st.state = "idle".into();
+                            fleet::write_seat_status(&st);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[worker:{claimant}] bead {} failed: {e}", existing.id);
+                    fleet::append_log(
+                        &claimant,
+                        &format!("bead {} failed: {e}", existing.id),
+                    );
+                    if control.pause_requested.load(Ordering::SeqCst) {
+                        wait_while_paused(
+                            &claimant,
+                            &cfg,
+                            status.clone(),
+                            control.clone(),
+                            deadline,
+                        )
+                        .await;
+                        continue;
+                    }
+                    if let Ok(mut st) = status.lock() {
+                        st.last_error = Some(e.clone());
+                        st.state = "error".into();
+                        fleet::write_seat_status(&st);
+                    }
+                    if !cfg.fail_fast {
+                        tokio::time::sleep(Duration::from_secs(cfg.sleep_secs.max(3))).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+            if !cfg.loop_mode {
+                break;
+            }
+            continue;
+        }
+
         let idle_msg = beads::format_backlog_idle_message();
         let bead = match beads::claim_next_for(None, &claimant, caste) {
             Ok(Some(b)) => b,
@@ -464,7 +838,20 @@ pub async fn run_worker(
                         fleet::heartbeat_touch(&mut st, Some(&caste_idle));
                         fleet::write_seat_status(&st);
                     }
-                    tokio::time::sleep(Duration::from_secs(cfg.sleep_secs)).await;
+                    // Sleep in slices so pause can interrupt.
+                    let mut slept = 0u64;
+                    while slept < cfg.sleep_secs {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        let cmds = fleet::poll_control(&claimant);
+                        control.apply_commands(&cmds);
+                        if control.pause_requested.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        slept += 1;
+                    }
                     let _ = beads::reclaim_stale(None);
                     continue;
                 }
@@ -509,10 +896,17 @@ pub async fn run_worker(
             &bead,
             &claimant,
             status.clone(),
+            control.clone(),
+            None,
         )
         .await
         {
             Ok(()) => {
+                if control.pause_requested.load(Ordering::SeqCst) {
+                    wait_while_paused(&claimant, &cfg, status.clone(), control.clone(), deadline)
+                        .await;
+                    continue;
+                }
                 if let Ok(Some(b)) = beads::get(None, &bead.id) {
                     if let Ok(mut st) = status.lock() {
                         if b.status == beads::BeadStatus::Closed {
@@ -529,6 +923,11 @@ pub async fn run_worker(
             Err(e) => {
                 eprintln!("[worker:{claimant}] bead {} failed: {e}", bead.id);
                 fleet::append_log(&claimant, &format!("bead {} failed: {e}", bead.id));
+                if control.pause_requested.load(Ordering::SeqCst) {
+                    wait_while_paused(&claimant, &cfg, status.clone(), control.clone(), deadline)
+                        .await;
+                    continue;
+                }
                 if let Ok(mut st) = status.lock() {
                     st.last_error = Some(e.clone());
                     st.state = "error".into();

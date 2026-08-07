@@ -94,6 +94,22 @@ Secrets do not overwrite env vars that are already set.
 | `Esc` | **Abort** the in-flight turn (and any running RLM subtree) |
 | `Enter` | **Steer** — queue your typed message as a follow-up once the current turn finishes, without waiting for it to fully complete first |
 
+## Fleet attach (TUI takeover)
+
+While a headless fleet worker runs in the background:
+
+| Slash command | Action |
+|---------------|--------|
+| `/city` | Seat board (all workers) |
+| `/seat follow <seat>` | Live formatted log tail; worker keeps running |
+| `/seat steer <text>` | Steer followed worker without attach |
+| `/seat abort` | Abort followed/attached turn |
+| `/seat open <seat>` | Inspect session read-only (no pause) |
+| `/seat attach <seat>` | Pause worker, load its session, chat as that seat |
+| `/seat detach` or `/detach` | Save session and resume the background worker |
+
+`/fleet …` aliases work for follow/attach/detach/logs. Footer chip shows `FOLLOW` / `ATTACHING` / `ATTACHED` / `INSPECT`. Quitting the TUI while attached auto-resumes the worker. Esc / Enter steer work as in Waiting mode once you are attached and a turn is running.
+
 ## Global (any mode)
 
 | Key | Action |

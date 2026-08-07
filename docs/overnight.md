@@ -101,13 +101,14 @@ Workers write live state under the project:
 .rs-agent/fleet/<seat>.status.json   # bead, tool, heartbeat, session id, pid
 .rs-agent/fleet/<seat>.log           # rolling transcript (tools/text)
 .rs-agent/fleet/<seat>.pid           # launcher / worker pid
+.rs-agent/fleet/<seat>.control.jsonl # TUI → worker pause/resume/abort/steer
 ```
 
 ```fish
 # One command — two workers (Phase B); seals Fleet caste
 $BIN -a fleet up --seats Fleet-1,Fleet-2 --budget-minutes 480
 
-# Watch
+# Watch (CLI)
 $BIN fleet status
 $BIN fleet logs Fleet-1
 $BIN marshal --once
@@ -120,6 +121,25 @@ $BIN role --seat Beadle --once
 # Stop
 $BIN fleet down
 ```
+
+### TUI city cockpit (Phase B)
+
+In an interactive `rs-agent` session (same project cwd as the fleet):
+
+| Command | Behavior |
+|---------|----------|
+| `/city` or `/seat` or `/fleet` | Seat board (state, bead, tool, heartbeat) |
+| `/seat follow Fleet-2` | Live formatted log; worker keeps running |
+| `/seat steer <text>` | Inject steer into followed/attached worker |
+| `/seat abort` | Abort current worker turn (follow) or attached turn |
+| `/seat open Fleet-2` | Inspect session + logs **without** pausing |
+| `/seat attach Fleet-2` | Pause worker, load session, chat as the seat |
+| `/seat detach` or `/detach` | Save + resume background worker |
+| `/fleet up` / `/fleet down` | Launch / stop workers (unchanged) |
+
+`/fleet follow|attach|…` remain aliases. Footer shows `FOLLOW` / `ATTACHING` / `ATTACHED` / `INSPECT`. Quitting while attached sends `resume` (pause also auto-expires ~10 minutes).
+
+Identity commands still work: `/seat Fleet-1`, `/seat caste …`, `/seat model …`.
 
 Or one worker in the foreground:
 
