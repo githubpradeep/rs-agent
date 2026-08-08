@@ -9,7 +9,9 @@ Reference steal UI surfaces to capture after Waves 1–5:
 | Help | `?` in normal mode | Filterable keymap overlay |
 | Settings | `/settings` | Theme / mouse / toast / notify tabs |
 | Palette | `Ctrl+K` | Fuzzy slash command list |
-| Fleet panel | `/fleet` | Attention-sorted seats, follow/expand |
+| Fleet panel | `/fleet` or `c` | Board: ACTIONS / WORKERS / WISHES / READY |
+| Wish modal | City `w` | Compose wish overlay |
+| Seat detail | Enter on worker | Status strip + dedicated log (FOLLOW chip) |
 | Call tree | `/tree` mid-turn | TurnBar + Tree\|Timeline |
 | Theme auto | `theme = "auto"` | Host light/dark via `COLORFGBG` |
 

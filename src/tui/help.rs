@@ -131,9 +131,29 @@ pub fn build_entries(keys: &KeyMap) -> Vec<HelpEntry> {
             group: "slash",
         },
         HelpEntry {
+            keys: keys.binding("toggle_sessions").into(),
+            desc: "toggle sessions panel".into(),
+            group: "normal",
+        },
+        HelpEntry {
+            keys: keys.binding("toggle_city").into(),
+            desc: "toggle city cockpit (wish/spawn/watch)".into(),
+            group: "normal",
+        },
+        HelpEntry {
             keys: "/fleet".into(),
-            desc: "live fleet cockpit panel".into(),
+            desc: "city cockpit panel (alias /city)".into(),
             group: "slash",
+        },
+        HelpEntry {
+            keys: "w/u/d".into(),
+            desc: "city: wish / spawn / stop (panel open)".into(),
+            group: "city",
+        },
+        HelpEntry {
+            keys: "f/a/o/s/b".into(),
+            desc: "seat detail: follow/attach/open/steer/abort".into(),
+            group: "city",
         },
         HelpEntry {
             keys: "/model /provider".into(),

@@ -716,8 +716,12 @@ pub fn fleet_up(opts: FleetUpOpts) -> Result<String, String> {
     }
     let mut out = String::from("Fleet up:\n");
     for seat in &opts.seats {
-        // Seal fleet caste so claim routing only picks implement/task.
-        match crate::agent::seat::ensure_with_caste(seat, crate::agent::SeatCaste::Fleet) {
+        // Infer caste from name (Fleet-* → fleet, Crew-* → crew); default fleet.
+        let mut caste = crate::agent::SeatCaste::infer_from_name(seat);
+        if caste == crate::agent::SeatCaste::Any {
+            caste = crate::agent::SeatCaste::Fleet;
+        }
+        match crate::agent::seat::ensure_with_caste(seat, caste) {
             Ok(s) => out.push_str(&format!(
                 "  seat {} caste={}\n",
                 s.name,

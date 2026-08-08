@@ -118,7 +118,10 @@ While a headless fleet worker runs in the background:
 | `/seat attach <seat>` | Pause worker, load its session, chat as that seat |
 | `/seat detach` or `/detach` | Save session and resume the background worker |
 
-`/fleet …` aliases work for follow/attach/detach/logs. Footer chip shows `FOLLOW` / `ATTACHING` / `ATTACHED` / `INSPECT`. Quitting the TUI while attached auto-resumes the worker. Esc / Enter steer work as in Waiting mode once you are attached and a turn is running.
+`/fleet …` aliases work for follow/attach/detach/logs. Prefer the **City panel** (`c`) seat
+detail for follow/steer so logs stay in the side pane. Footer chip shows `VIEW` / `FOLLOW` /
+`ATTACHING` / `ATTACHED` / `INSPECT`. Quitting the TUI while attached auto-resumes the worker.
+Esc / Enter steer work as in Waiting mode once you are attached and a turn is running.
 
 ## Global (any mode)
 
@@ -170,23 +173,46 @@ status bar shows `[D]` while Deep Context is active.
 
 ## City cockpit (agents / wishes / workers)
 
-Like herdr’s agent sidebar + Conductor’s task board — one side panel for the operator:
+Ops-core side panel: create wishes, spawn fleet/crew, watch progress, steer/attach — without
+dumping follow logs into the operator chat.
 
 ```text
-/city          toggle City side panel
-/fleet         same (panel)
-/city board    text dump of the board
+c / /city / /fleet     toggle City side panel
+w                      compose wish (modal)
+u                      spawn fleet/crew counts (modal)
+d                      stop selected worker (or all from ACTIONS)
+m                      marshal once
+A                      assign READY bead to a seat
+Enter                  open seat/bead detail or run ACTION
+Esc                    back to board / close panel
 ```
 
-Panel sections (↑↓ · Enter · x):
+Board sections (↑↓ · Enter · x expands worker line):
 
 | Section | What you see | Enter |
 |---------|----------------|-------|
-| **WORKERS** | Fleet seats, attention-sorted (● blocked / ◐ working / ○ idle) | Follow seat logs |
-| **WISHES** | Open beads tagged `label:wish` (`/wish …`) | Inspect bead |
-| **READY** | Claimable beads waiting for workers | Inspect bead |
+| **ACTIONS** | New wish · Spawn · Marshal · Stop all | Run action / open modal |
+| **WORKERS** | Seats attention-sorted; caste badge `[F]`/`[C]` | Seat detail + log |
+| **WISHES** | Open beads tagged `label:wish` | Bead detail |
+| **READY** | Claimable beads | Bead detail (`A` assign) |
 
-Spawn workers: `/fleet up`. Intake ambition: `/wish port Softmax`. Marshal fills READY; workers claim.
+Seat detail keys:
+
+| Key | Action |
+|-----|--------|
+| `f` | Follow — live log in panel (not chat) |
+| `a` | Attach — pause worker, chat as that seat |
+| `o` | Open/inspect session read-only |
+| `s` | Steer modal |
+| `b` | Abort turn |
+| `D` | Detach / stop follow |
+| `d` | Stop this worker |
+| PgUp/PgDn | Scroll seat log |
+| Esc | Back to board |
+
+Footer chip: `VIEW seat` / `FOLLOW` / `ATTACHED` / `INSPECT`.
+
+Slash fallbacks still work: `/wish …`, `/fleet up|down`, `/seat follow|attach|steer|abort`.
 
 ## Sessions panel (multi-chat per project)
 
@@ -232,9 +258,10 @@ Capture these for docs / demos (Kitty / iTerm recommended):
 1. **Idle** — header `○ idle`, lean footer, empty chat + input
 2. **Blocked** — permission modal + toast + `● blocked` chip; optional OSC notify when unfocused
 3. **Sessions** — `/sessions` side panel with this-project chats + active ●
-4. **Fleet** — `/fleet` side panel attention-sorted with a blocked seat
-4. **Tree** — `/tree` TurnBar + lazy expand during a Deep Context turn
-5. **Palette** — `Ctrl+K` filtered command list; `?` help overlay
+4. **City** — `/city` board with ACTIONS + wish compose + seat detail log
+5. **Fleet blocked** — City WORKERS with ● blocked seat + FOLLOW chip
+6. **Tree** — `/tree` TurnBar + lazy expand during a Deep Context turn
+7. **Palette** — `Ctrl+K` filtered command list; `?` help overlay
 
 Theme: `/theme auto` follows host `COLORFGBG`. Settings: `/settings`.
 
@@ -248,8 +275,8 @@ Set a persistent default via `theme = "dark"` (or `"light"` / `"forest"`) in
 ## Configurable keybindings
 
 The single-key bindings shown throughout this doc (`insert`, `quit`, `toggle_thinking`,
-`jump_bottom`, `expand_tool`, `toggle_tree`, `perm_once`, `perm_always`, `perm_path`, `perm_deny`) can be
-remapped in `~/.rs-agent/config.toml`:
+`jump_bottom`, `expand_tool`, `toggle_tree`, `toggle_sessions`, `toggle_city`, `perm_once`,
+`perm_always`, `perm_path`, `perm_deny`) can be remapped in `~/.rs-agent/config.toml`:
 
 ```toml
 [keybindings]
@@ -259,6 +286,8 @@ toggle_thinking = "t"
 jump_bottom = "G"
 expand_tool = "e"
 toggle_tree = "T"
+toggle_sessions = "s"
+toggle_city = "c"
 perm_once = "a"
 perm_always = "t"
 perm_path = "p"
