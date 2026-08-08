@@ -60,4 +60,5 @@ Optional / slower (opt-in):
 - CI job `rlm-demo` runs `demo-rlm.sh` + `rlm_escalate` when `ANTHROPIC_API_KEY` /
   `OPENAI_API_KEY` secrets are set (skips otherwise; `continue-on-error`).
 
-See also: [`docs/demo.md`](../docs/demo.md) for the RLM marketing demo.
+See also: [`docs/demo.md`](../docs/demo.md) for the public Deep Context demo
+(`demo-deep-context.sh`). `demo-rlm.sh` remains the scripted CI harness.

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# RLM USP demo — grow a corpus, run a one-shot agent turn that must use `repl`.
+# Internal RLM harness smoke (scripted repl + secret token). For CI / regressions.
+# Public product demo: ./scripts/demo-deep-context.sh  (see docs/demo.md)
 #
 # Usage:
 #   ./scripts/demo-rlm.sh

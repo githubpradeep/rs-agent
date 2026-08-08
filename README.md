@@ -49,8 +49,9 @@ cargo run --release -- --provider anthropic -p "summarize example/rlm_long_doc.m
 # One-shot prompt, JSON event stream (for scripting/tooling)
 cargo run --release -- --provider anthropic --mode json -p "list files with ls"
 
-# USP demo (~100KB corpus → repl → llm_query → FINAL). See docs/demo.md
-./scripts/demo-rlm.sh --provider anthropic
+# Deep Context demo — realistic outage log (~180KB). See docs/demo.md
+./scripts/demo-deep-context.sh --provider anthropic
+# Interactive (best for recording): ./scripts/demo-deep-context.sh --tui
 ```
 
 Requirements: a stable Rust toolchain and `python3` on `PATH` (used by the Deep Context `repl` tool).
