@@ -61,17 +61,30 @@ impl RlmHost {
                     .map(|p| p.as_str().unwrap_or("").to_string())
                     .collect();
                 let mut texts = Vec::new();
-                for batch in prompt_strs.chunks(DEFAULT_CONCURRENCY) {
+                let mut pairs: Vec<(String, String)> = Vec::new();
+                for (i, batch) in prompt_strs.chunks(DEFAULT_CONCURRENCY).enumerate() {
                     let mut futs = Vec::new();
-                    for p in batch {
+                    for (j, p) in batch.iter().enumerate() {
                         let prompt = p.clone();
                         let this = self.clone();
-                        futs.push(async move { this.llm_query(&prompt).await });
+                        let label = format!("batch{i}-{j}");
+                        futs.push(async move {
+                            let t = this.llm_query(&prompt).await?;
+                            Ok::<_, String>((label, t))
+                        });
                     }
                     let results = futures::future::join_all(futs).await;
                     for r in results {
-                        texts.push(Value::String(r?));
+                        let (label, text) = r?;
+                        pairs.push((label, text.clone()));
+                        texts.push(Value::String(text));
                     }
+                }
+                // Conductor JOIN-style compact merge — attach as trailing meta string
+                // without breaking the array return shape Python callers expect.
+                let joined = crate::orchestration::join_summaries(&pairs, 240, 4_000);
+                if !joined.is_empty() {
+                    texts.push(Value::String(format!("__joined__\n{joined}")));
                 }
                 Ok(Value::Array(texts))
             }

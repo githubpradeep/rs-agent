@@ -99,6 +99,11 @@ fn maybe_run_first_launch_wizard(cli: &mut Cli, cfg: &mut Config) -> Result<(), 
             | Some(rs_agent::cli::Commands::Fleet(_))
             | Some(rs_agent::cli::Commands::Wish(_))
             | Some(rs_agent::cli::Commands::Role(_))
+            | Some(rs_agent::cli::Commands::Status(_))
+            | Some(rs_agent::cli::Commands::Api(_))
+            | Some(rs_agent::cli::Commands::Runtime(_))
+            | Some(rs_agent::cli::Commands::Schedule(_))
+            | Some(rs_agent::cli::Commands::PlanExecute { .. })
     ) {
         return Ok(());
     }
@@ -330,6 +335,163 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             return Ok(());
         }
+        Some(rs_agent::cli::Commands::Status(sargs)) => {
+            match sargs.command.unwrap_or(rs_agent::cli::StatusCommand::Show) {
+                rs_agent::cli::StatusCommand::Show => {
+                    let snap = rs_agent::lifecycle::read_snapshot_file()
+                        .unwrap_or_else(rs_agent::lifecycle::snapshot);
+                    println!(
+                        "lifecycle={} detail={} updated={}",
+                        snap.lifecycle.as_str(),
+                        snap.detail,
+                        snap.updated_at
+                    );
+                }
+                rs_agent::cli::StatusCommand::Wait {
+                    until,
+                    timeout_secs,
+                } => {
+                    let until = rs_agent::lifecycle::Lifecycle::parse(&until);
+                    match rs_agent::lifecycle::wait_until(
+                        until,
+                        std::time::Duration::from_secs(timeout_secs),
+                    ) {
+                        Ok(snap) => {
+                            println!(
+                                "ok lifecycle={} detail={}",
+                                snap.lifecycle.as_str(),
+                                snap.detail
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("{e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                rs_agent::cli::StatusCommand::Resume { seat, answer } => {
+                    match rs_agent::fleet::resume_human(&seat, &answer) {
+                        Ok(msg) => println!("{msg}"),
+                        Err(e) => {
+                            eprintln!("{e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+        Some(rs_agent::cli::Commands::Api(aargs)) => {
+            let path = aargs
+                .socket
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(rs_agent::runtime::default_socket_path);
+            let params: serde_json::Value =
+                serde_json::from_str(&aargs.params).unwrap_or_else(|_| serde_json::json!({}));
+            let req = rs_agent::runtime::ApiRequest {
+                method: aargs.method,
+                params,
+                id: Some(serde_json::json!(1)),
+            };
+            match rs_agent::runtime::socket::call(&path, &req) {
+                Ok(resp) => {
+                    println!("{}", serde_json::to_string_pretty(&resp).unwrap_or_default());
+                    if !resp.ok {
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("api call failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return Ok(());
+        }
+        Some(rs_agent::cli::Commands::Runtime(rargs)) => {
+            match rargs.command {
+                rs_agent::cli::RuntimeCommand::Serve { socket } => {
+                    let path = socket
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(rs_agent::runtime::default_socket_path);
+                    let _ = rs_agent::runtime::write_pid(&rs_agent::runtime::pid_path());
+                    eprintln!("rs-agent runtime listening on {}", path.display());
+                    if let Err(e) = rs_agent::runtime::serve_socket(&path) {
+                        eprintln!("runtime error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                rs_agent::cli::RuntimeCommand::Stop { socket } => {
+                    let path = socket
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(rs_agent::runtime::default_socket_path);
+                    let req = rs_agent::runtime::ApiRequest {
+                        method: "server.stop".into(),
+                        params: serde_json::json!({}),
+                        id: Some(serde_json::json!(1)),
+                    };
+                    match rs_agent::runtime::socket::call(&path, &req) {
+                        Ok(resp) => println!("{}", serde_json::to_string_pretty(&resp).unwrap_or_default()),
+                        Err(e) => {
+                            // Fallback: write stop flag even if connect fails mid-shutdown.
+                            let _ = std::fs::write(path.with_extension("stop"), "1\n");
+                            eprintln!("stop signalled ({e})");
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+        Some(rs_agent::cli::Commands::Schedule(sargs)) => {
+            match sargs.command {
+                rs_agent::cli::ScheduleCommand::List => {
+                    for s in rs_agent::schedule::load_all() {
+                        println!(
+                            "{} | {} | {} | paused={} last={:?}",
+                            s.name, s.cron, s.command, s.paused, s.last_run_at
+                        );
+                    }
+                }
+                rs_agent::cli::ScheduleCommand::Add {
+                    name,
+                    cron,
+                    command,
+                } => {
+                    let mut items = rs_agent::schedule::load_all();
+                    items.push(rs_agent::schedule::Schedule {
+                        name,
+                        cron,
+                        command,
+                        paused: false,
+                        catchup: false,
+                        last_run_at: None,
+                    });
+                    rs_agent::schedule::save_all(&items)?;
+                    println!("schedule saved ({} total)", items.len());
+                }
+                rs_agent::cli::ScheduleCommand::Due => {
+                    for s in rs_agent::schedule::due_now(true) {
+                        println!("DUE {} → {}", s.name, s.command);
+                    }
+                }
+            }
+            return Ok(());
+        }
+        Some(rs_agent::cli::Commands::PlanExecute { text }) => {
+            let plan = text.join("\n");
+            match rs_agent::schedule::plan_execute_emit_beads(&plan) {
+                Ok(ids) => {
+                    println!("created {} implement beads:", ids.len());
+                    for id in ids {
+                        println!("  {id}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+            return Ok(());
+        }
         other => {
             // Worker needs a provider; put it back for the later handler.
             cli.command = other;
@@ -477,6 +639,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             sleep_secs: wargs.sleep_secs,
             goal_verify: cfg.goal_verify.unwrap_or(true),
             verbose: wargs.verbose && !wargs.quiet,
+            response_timeout_secs: 600,
         };
         eprintln!(
             "rs-agent worker — loop={} budget={}m seat={:?}",
@@ -665,17 +828,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = SessionStore::new();
 
     if cli.list_sessions {
-        match store.list() {
-            Ok(sessions) => {
+        match store.list_summaries() {
+            Ok(mut sessions) => {
                 if sessions.is_empty() {
                     println!("No saved sessions.");
+                    println!("Tip: chat in the TUI, then quit — you'll see a resume command.");
                 } else {
-                    println!("Saved sessions:");
-                    for id in &sessions {
-                        if let Ok(data) = store.load(id) {
-                            let msgs = data.messages.len();
-                            println!("  {}  ({} messages, {})", id, msgs, data.model);
-                        }
+                    sessions.sort_by(|a, b| b.id.cmp(&a.id));
+                    println!("Saved sessions (newest first):");
+                    println!("  {:<22}  {:>4}  {}", "ID (use with -r)", "msgs", "title");
+                    for s in sessions.iter().take(30) {
+                        let short = SessionStore::short_id(&s.id);
+                        let title = s.title.as_deref().unwrap_or("(untitled)");
+                        println!(
+                            "  {:<22}  {:>4}  {} ({})",
+                            short, s.message_count, title, s.model
+                        );
+                    }
+                    if let Some(latest) = sessions.first() {
+                        println!();
+                        println!(
+                            "Resume latest:  rs-agent -r latest");
+                        println!(
+                            "Resume this:    rs-agent -r {}",
+                            SessionStore::short_id(&latest.id)
+                        );
                     }
                 }
             }
@@ -684,9 +861,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let resume_session = cli.resume.as_ref().and_then(|id| {
-        store.load(id).map_err(|e| eprintln!("{}", e)).ok()
-    });
+    let resume_session = if let Some(ref id) = cli.resume {
+        match store.resolve(id).and_then(|resolved| store.load(&resolved)) {
+            Ok(data) => {
+                eprintln!(
+                    "Resuming {} ({})",
+                    data.id,
+                    data.title.as_deref().unwrap_or("untitled")
+                );
+                Some(data)
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
 
     let thinking_budget = resolve_thinking_budget(&cli, provider.as_ref());
     let mut app = App::new(

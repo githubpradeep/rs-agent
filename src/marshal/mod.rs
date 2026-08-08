@@ -220,6 +220,9 @@ pub fn run_once() -> String {
 }
 
 pub fn run_with_opts(opts: MarshalOpts) -> String {
+    let ungated = beads::ungate_due(None).unwrap_or(0);
+    // Fire due cron schedules (Wave 9); catchup marks last_run to avoid double-fire.
+    let due_schedules = crate::schedule::due_now(true);
     let reclaimed = beads::reclaim_stale(None).unwrap_or(0);
     let dead = release_dead_pid_claims().unwrap_or(0);
     let auto_assigned = if opts.auto_assign {
@@ -234,6 +237,18 @@ pub fn run_with_opts(opts: MarshalOpts) -> String {
     };
 
     let mut out = String::new();
+    if ungated > 0 {
+        out.push_str(&format!("Marshal: ungated {ungated} wait_until bead(s).\n"));
+    }
+    if !due_schedules.is_empty() {
+        out.push_str(&format!(
+            "Marshal: {} schedule(s) due this minute:\n",
+            due_schedules.len()
+        ));
+        for s in &due_schedules {
+            out.push_str(&format!("  {} → {}\n", s.name, s.command));
+        }
+    }
     if reclaimed > 0 {
         out.push_str(&format!("Marshal: reclaimed {reclaimed} stale lease(s).\n"));
     } else {

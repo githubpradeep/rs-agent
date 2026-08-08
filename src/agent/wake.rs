@@ -110,7 +110,10 @@ mod tests {
 
     #[test]
     fn empty_wake_is_none() {
-        assert!(build(&WakeInputs::default()).is_none());
+        // Project cwd may have beads/brain; isolate so Default stays empty.
+        crate::with_temp_cwd(|_| {
+            assert!(build(&WakeInputs::default()).is_none());
+        });
     }
 
     #[test]

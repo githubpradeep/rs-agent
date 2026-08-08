@@ -87,8 +87,12 @@ fn alias_into(map: &mut Map<String, Value>, canonical: &str, aliases: &[&str]) {
 }
 
 pub fn default_tools_list() -> Vec<SharedTool> {
+    default_tools_list_with_abort(crate::agent::AbortFlag::new())
+}
+
+pub fn default_tools_list_with_abort(abort: crate::agent::AbortFlag) -> Vec<SharedTool> {
     vec![
-        Arc::new(BashTool) as SharedTool,
+        Arc::new(BashTool::new(abort)) as SharedTool,
         Arc::new(ReadTool) as SharedTool,
         Arc::new(WriteTool) as SharedTool,
         Arc::new(EditTool) as SharedTool,
@@ -110,7 +114,7 @@ pub fn default_tools_list() -> Vec<SharedTool> {
 }
 
 pub fn register_default_tools(agent: &mut AgentLoop) {
-    for tool in default_tools_list() {
+    for tool in default_tools_list_with_abort(agent.abort_flag()) {
         agent.register_tool(tool);
     }
 }

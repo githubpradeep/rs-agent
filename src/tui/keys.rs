@@ -13,7 +13,8 @@ pub fn default_keybindings() -> HashMap<String, String> {
     m.insert("expand_tool".into(), "e".into());
     m.insert("toggle_tree".into(), "T".into());
     m.insert("perm_once".into(), "a".into());
-    m.insert("perm_always".into(), "t".into());
+    // Keep off `t` — that toggles thinking in normal mode.
+    m.insert("perm_always".into(), "A".into());
     m.insert("perm_path".into(), "p".into());
     m.insert("perm_deny".into(), "d".into());
     m

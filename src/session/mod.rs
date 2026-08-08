@@ -315,6 +315,11 @@ impl SessionStore {
         Local::now().format("session_%Y%m%d_%H%M%S").to_string()
     }
 
+    /// Human-facing id fragment (`20260808_113045` from `session_20260808_113045`).
+    pub fn short_id(id: &str) -> &str {
+        id.strip_prefix("session_").unwrap_or(id)
+    }
+
     pub fn session_path(&self, id: &str) -> String {
         Path::new(&self.dir).join(format!("{}.json", id))
             .to_string_lossy()
@@ -323,6 +328,55 @@ impl SessionStore {
 
     pub fn exists(&self, id: &str) -> bool {
         Path::new(&self.session_path(id)).exists()
+    }
+
+    /// Resolve a resume query: exact id, `latest`/`last`/`-`, date suffix, or unique prefix.
+    pub fn resolve(&self, query: &str) -> Result<String, String> {
+        let q = query.trim();
+        if q.is_empty() || matches!(q, "latest" | "last" | "-") {
+            return self
+                .list()?
+                .into_iter()
+                .next()
+                .ok_or_else(|| "No saved sessions. Start a turn, then exit to create one.".into());
+        }
+        if self.exists(q) {
+            return Ok(q.to_string());
+        }
+        let prefixed = if q.starts_with("session_") {
+            q.to_string()
+        } else {
+            format!("session_{q}")
+        };
+        if self.exists(&prefixed) {
+            return Ok(prefixed);
+        }
+        let ids = self.list()?;
+        let matches: Vec<String> = ids
+            .into_iter()
+            .filter(|id| {
+                id == q
+                    || id.starts_with(q)
+                    || Self::short_id(id).starts_with(q)
+                    || id.contains(q)
+            })
+            .collect();
+        match matches.as_slice() {
+            [one] => Ok(one.clone()),
+            [] => Err(format!(
+                "Session `{q}` not found. Try `rs-agent --list-sessions` or `-r latest`."
+            )),
+            many => Err(format!(
+                "Ambiguous session `{q}` ({} matches). Use a fuller id, e.g. `-r {}`.",
+                many.len(),
+                Self::short_id(&many[0])
+            )),
+        }
+    }
+
+    /// Most recently saved session id (list is newest-first).
+    pub fn latest_id(&self) -> Result<Option<String>, String> {
+        Ok(self.list()?.into_iter().next())
     }
 
     pub fn save(&self, data: &SessionData) -> Result<(), String> {
@@ -582,6 +636,23 @@ mod tests {
         let loaded = store.load("session_roundtrip").expect("load should succeed");
         assert_eq!(loaded.title, data.title);
         assert_eq!(loaded.messages.len(), data.messages.len());
+    }
+
+    #[test]
+    fn resolve_latest_and_short_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::for_dir(tmp.path());
+        let mut older = sample_session("session_20260101_120000");
+        older.ensure_title();
+        store.save(&older).unwrap();
+        let mut newer = sample_session("session_20260808_150000");
+        newer.ensure_title();
+        store.save(&newer).unwrap();
+
+        assert_eq!(SessionStore::short_id("session_20260808_150000"), "20260808_150000");
+        assert_eq!(store.resolve("latest").unwrap(), "session_20260808_150000");
+        assert_eq!(store.resolve("20260808_150000").unwrap(), "session_20260808_150000");
+        assert_eq!(store.resolve("20260808").unwrap(), "session_20260808_150000");
     }
 
     #[test]

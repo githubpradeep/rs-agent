@@ -96,6 +96,9 @@ pub struct Bead {
     pub priority: i32,
     #[serde(default)]
     pub claimant: Option<String>,
+    /// Conductor-style fail classification: retriable | terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fail_kind: Option<String>,
     /// Unix timestamp when the claim lease expires.
     #[serde(default)]
     pub lease_expires: Option<u64>,
@@ -371,6 +374,7 @@ fn push_bead(
         linked,
         priority,
         claimant: None,
+        fail_kind: None,
         lease_expires: None,
         notes: notes.to_string(),
         created_at: t.clone(),
@@ -478,11 +482,31 @@ pub fn claim_next(path: Option<&Path>, claimant: &str) -> Result<Option<Bead>, S
 }
 
 /// Claim next ready bead allowed for this caste.
+///
+/// Prefers a priority/postpone ready-queue item when present (Wave 9).
 pub fn claim_next_for(
     path: Option<&Path>,
     claimant: &str,
     caste: crate::agent::seat::SeatCaste,
 ) -> Result<Option<Bead>, String> {
+    if let Ok(Some(item)) = crate::queue::pop() {
+        // Queue payload is bead id (or id\t…).
+        let id = item.payload.split('\t').next().unwrap_or(&item.id).trim();
+        if !id.is_empty() {
+            if let Ok(Some(b)) = get(path, id) {
+                if b.status == BeadStatus::Open && caste.allows_kind(b.kind) {
+                    return Ok(Some(claim_with_lease_caste(
+                        path,
+                        id,
+                        claimant,
+                        DEFAULT_LEASE_SECS,
+                        Some(caste),
+                    )?));
+                }
+            }
+        }
+        // Fall through if queue item was stale.
+    }
     let ready = list_ready(path)?;
     let Some(first) = ready.into_iter().find(|b| caste.allows_kind(b.kind)) else {
         return Ok(None);
@@ -898,6 +922,100 @@ pub fn block(path: Option<&Path>, id: &str, reason: &str) -> Result<Bead, String
         }
         bead.updated_at = now_str();
         Ok(bead.clone())
+    })
+}
+
+/// Fail a bead with retriable vs terminal outcome (Conductor FAILED_WITH_TERMINAL_ERROR).
+/// Terminal fails stay blocked and must not be auto-reclaimed for retry.
+pub fn fail(
+    path: Option<&Path>,
+    id: &str,
+    reason: &str,
+    kind: crate::orchestration::FailKind,
+) -> Result<Bead, String> {
+    with_lock_path(path, |_p, file| {
+        let bead = file
+            .beads
+            .iter_mut()
+            .find(|b| b.id == id)
+            .ok_or_else(|| format!("bead `{id}` not found"))?;
+        bead.status = BeadStatus::Blocked;
+        bead.claimant = None;
+        bead.lease_expires = None;
+        bead.fail_kind = Some(kind.as_str().to_string());
+        if !bead.notes.is_empty() {
+            bead.notes.push('\n');
+        }
+        bead.notes
+            .push_str(&format!("fail({}): {}", kind.as_str(), reason.trim()));
+        bead.updated_at = now_str();
+        Ok(bead.clone())
+    })
+}
+
+/// True when a blocked bead should not be auto-retried.
+pub fn is_terminal_fail(bead: &Bead) -> bool {
+    bead.fail_kind
+        .as_deref()
+        .map(|k| crate::orchestration::FailKind::parse(k) == crate::orchestration::FailKind::Terminal)
+        .unwrap_or(false)
+}
+
+/// Reopen a blocked bead for retry — refused for terminal fails.
+pub fn reopen_for_retry(path: Option<&Path>, id: &str) -> Result<Bead, String> {
+    with_lock_path(path, |_p, file| {
+        let bead = file
+            .beads
+            .iter_mut()
+            .find(|b| b.id == id)
+            .ok_or_else(|| format!("bead `{id}` not found"))?;
+        if bead.status != BeadStatus::Blocked {
+            return Err(format!("bead `{id}` is not blocked"));
+        }
+        if is_terminal_fail(bead) {
+            return Err(format!(
+                "bead `{id}` has terminal fail — will not auto-retry"
+            ));
+        }
+        bead.status = BeadStatus::Open;
+        bead.claimant = None;
+        bead.lease_expires = None;
+        bead.fail_kind = None;
+        if !bead.notes.is_empty() {
+            bead.notes.push('\n');
+        }
+        bead.notes.push_str("reopened: retriable fail");
+        bead.updated_at = now_str();
+        Ok(bead.clone())
+    })
+}
+
+/// Ungate beads whose notes contain `wait_until:<rfc3339>` in the past (Conductor WAIT sweeper).
+pub fn ungate_due(path: Option<&Path>) -> Result<usize, String> {
+    with_lock_path(path, |_p, file| {
+        let now = chrono::Local::now();
+        let mut n = 0usize;
+        for bead in file.beads.iter_mut() {
+            if bead.status != BeadStatus::Gated {
+                continue;
+            }
+            let Some(marker) = bead.notes.lines().rev().find_map(|l| {
+                l.trim()
+                    .strip_prefix("wait_until:")
+                    .map(|s| s.trim().to_string())
+            }) else {
+                continue;
+            };
+            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&marker) {
+                if ts <= now {
+                    bead.status = BeadStatus::Open;
+                    bead.updated_at = now_str();
+                    bead.notes.push_str("\nungated: wait_until elapsed");
+                    n += 1;
+                }
+            }
+        }
+        Ok(n)
     })
 }
 

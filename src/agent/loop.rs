@@ -340,6 +340,42 @@ impl AgentLoop {
         if self.state.mode != AgentMode::Agent {
             return Ok(false);
         }
+        if goal.iterations_exhausted() {
+            callback(AgentEvent::Status {
+                message: format!(
+                    "goal paused after {} iterations (max) — /goal resume or /goal clear",
+                    goal.max_iterations
+                ),
+            });
+            if let Some(g) = self.state.goal.as_mut() {
+                g.status = GoalStatus::Paused;
+                g.last_reason = Some(format!(
+                    "auto-paused after {} iterations",
+                    goal.max_iterations
+                ));
+            }
+            return Ok(false);
+        }
+        {
+            let hay: String = self
+                .state
+                .messages
+                .iter()
+                .rev()
+                .take(6)
+                .flat_map(|m| {
+                    m.content
+                        .iter()
+                        .filter_map(|c| c.text.as_deref())
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if let Some(true) = goal.eval_cond_dsl(&hay) {
+                return self
+                    .finish_goal_eval(true, "cond_dsl matched".into(), &goal.condition, callback)
+                    .await;
+            }
+        }
         if goal.consecutive_blocks >= MAX_CONSECUTIVE_BLOCKS {
             callback(AgentEvent::Status {
                 message: format!(
@@ -1284,8 +1320,17 @@ impl AgentLoop {
                     let model = String::new();
                     let msg_id: Option<String> = None;
 
-                    while let Some(result) = stream.next().await {
-                        self.check_aborted()?;
+                    loop {
+                        let next = tokio::select! {
+                            biased;
+                            _ = self.abort.wait() => {
+                                return Err("aborted".to_string());
+                            }
+                            item = stream.next() => item,
+                        };
+                        let Some(result) = next else {
+                            break;
+                        };
                         match result {
                             Ok(delta) => {
                                 let idx = delta.content_index as usize;

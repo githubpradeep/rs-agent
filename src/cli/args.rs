@@ -36,9 +36,15 @@ pub struct Cli {
     #[arg(short = 'a', long, default_value = "false")]
     pub approve: bool,
 
-    #[arg(short = 'r', long)]
+    #[arg(
+        short = 'r',
+        long,
+        value_name = "ID",
+        help = "Resume a session: full id, date suffix (20260808_113045), prefix, or latest/last/-"
+    )]
     pub resume: Option<String>,
 
+    /// List saved sessions (ids + titles) for `-r`.
     #[arg(long, default_value = "false")]
     pub list_sessions: bool,
 
@@ -91,6 +97,101 @@ pub enum Commands {
     Wish(WishArgs),
     /// Standing role runner (Beadle, Gargoyle, …).
     Role(RoleArgs),
+    /// Lifecycle status / wait (herdr agent.wait).
+    Status(StatusArgs),
+    /// JSON control-plane client / daemon (herdr socket API).
+    Api(ApiArgs),
+    /// Headless runtime daemon (reattachable control plane).
+    Runtime(RuntimeArgs),
+    /// Cron schedules for marshal/worker wake.
+    Schedule(ScheduleArgs),
+    /// Emit implement beads from a planner bullet list (PLAN_EXECUTE MVP).
+    PlanExecute {
+        /// Plan text (lines become beads).
+        text: Vec<String>,
+    },
+}
+
+#[derive(Parser, Debug)]
+pub struct StatusArgs {
+    #[command(subcommand)]
+    pub command: Option<StatusCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum StatusCommand {
+    /// Print current lifecycle snapshot.
+    Show,
+    /// Block until lifecycle matches.
+    Wait {
+        /// blocked | idle | done | working
+        #[arg(long, default_value = "blocked")]
+        until: String,
+        #[arg(long, default_value_t = 30)]
+        timeout_secs: u64,
+    },
+    /// Resume a seat blocked on human input (headless HUMAN wait).
+    Resume {
+        /// Fleet seat name.
+        #[arg(long)]
+        seat: String,
+        /// Typed answer / approve note written into control.jsonl.
+        #[arg(long, default_value = "approved")]
+        answer: String,
+    },
+}
+
+#[derive(Parser, Debug)]
+pub struct ApiArgs {
+    /// Method name (ping, agent.status, agent.wait, …).
+    pub method: String,
+    /// JSON params object.
+    #[arg(long, default_value = "{}")]
+    pub params: String,
+    /// Socket path (default ~/.rs-agent/rs-agent.sock).
+    #[arg(long)]
+    pub socket: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+pub struct RuntimeArgs {
+    #[command(subcommand)]
+    pub command: RuntimeCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RuntimeCommand {
+    /// Listen on the control socket until stop.
+    Serve {
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Request daemon stop.
+    Stop {
+        #[arg(long)]
+        socket: Option<String>,
+    },
+}
+
+#[derive(Parser, Debug)]
+pub struct ScheduleArgs {
+    #[command(subcommand)]
+    pub command: ScheduleCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ScheduleCommand {
+    /// List schedules.
+    List,
+    /// Add a cron schedule.
+    Add {
+        name: String,
+        /// Five-field cron: min hour dom month dow
+        cron: String,
+        command: String,
+    },
+    /// Show schedules due this minute.
+    Due,
 }
 
 #[derive(Parser, Debug)]

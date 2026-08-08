@@ -91,7 +91,17 @@ Secrets do not overwrite env vars that are already set.
 
 | Key | Action |
 |-----|--------|
-| `Esc` | **Abort** the in-flight turn (and any running RLM subtree) |
+## Live bash console (bottom)
+
+Bash/repl/task output goes to a **fixed bottom console** (does not resize the chat column):
+
+- Tabs in the title: `[●bash#1]  ✓bash#2` — **Tab** / ↑↓ to switch
+- Lines are clipped to console width; ANSI is stripped
+- Chat only shows a short `↗ console · Exit code: N` chip (expand the tool block for full text)
+- `/output` toggles the console
+
+Esc aborts and kills the bash process group.
+
 | `Enter` | **Steer** — queue your typed message as a follow-up once the current turn finishes, without waiting for it to fully complete first |
 
 ## Fleet attach (TUI takeover)
@@ -145,19 +155,67 @@ the tool name and elapsed seconds, e.g. `⠋ bash (2.3s)`, so long-running tools
 `repl`, web fetches) don't look stalled. It clears automatically when the tool result, an error,
 `Done`, or `Aborted` arrives.
 
+## Attention chrome (Wave 1+)
+
+- Header chip: `○ idle` / `◐ working` / `● blocked` / `✓ done`
+- Toasts on blocked/done (config: `toast`, `toast_sound`, `notify = off|terminal|system`)
+- `?` filterable help · `Ctrl+K` command palette · `/settings` modal
+- Permission always-allow key defaults to `A` (not `t`)
+
 ## Live `/tree` side panel
 
-`/tree` (or the `T` key in normal mode) toggles a right-hand side panel showing the full Deep Context
-call tree (root → agent/llm/repl sub-calls, with `…`/`✓`/`✗`/`⊘` status markers), not just the
-one-line breadcrumb in the status bar. The panel auto-opens when `repl` starts; status bar shows
-`[D]` while Deep Context is active. The panel updates live as sub-calls spawn and finish; when
-idle with no active run it falls back to the last saved snapshot for the session, if any.
+`/tree` (or the `T` key in normal mode) toggles a right-hand side panel showing the Deep Context
+call tree with a Conductor-style turn bar, expand markers, and status glyphs. Auto-opens on `repl`;
+status bar shows `[D]` while Deep Context is active.
+
+## City cockpit (agents / wishes / workers)
+
+Like herdr’s agent sidebar + Conductor’s task board — one side panel for the operator:
+
+```text
+/city          toggle City side panel
+/fleet         same (panel)
+/city board    text dump of the board
+```
+
+Panel sections (↑↓ · Enter · x):
+
+| Section | What you see | Enter |
+|---------|----------------|-------|
+| **WORKERS** | Fleet seats, attention-sorted (● blocked / ◐ working / ○ idle) | Follow seat logs |
+| **WISHES** | Open beads tagged `label:wish` (`/wish …`) | Inspect bead |
+| **READY** | Claimable beads waiting for workers | Inspect bead |
+
+Spawn workers: `/fleet up`. Intake ambition: `/wish port Softmax`. Marshal fills READY; workers claim.
+
+## Runtime control plane
+
+```bash
+rs-agent status show
+rs-agent status wait --until blocked --timeout-secs 60
+rs-agent runtime serve
+rs-agent api ping
+```
+
+Lifecycle is written to `~/.rs-agent/lifecycle.json`. Ops skill: `skills/runtime-ops/`.
 
 ## REPL output panel
 
 While the `repl` tool (RLM Python REPL) is executing, a short panel above the input box streams
 its live stdout/stderr (stderr lines prefixed with `!`), capped to the most recent ~8KB, so you
 can watch progress instead of waiting for the final tool result block.
+
+## Screenshots (reference chrome)
+
+Capture these for docs / demos (Kitty / iTerm recommended):
+
+1. **Idle** — header `○ idle`, lean footer, empty chat + input
+2. **Blocked** — permission modal + toast + `● blocked` chip; optional OSC notify when unfocused
+3. **Fleet** — `/fleet` side panel attention-sorted with a blocked seat
+4. **Tree** — `/tree` TurnBar + lazy expand during a Deep Context turn
+5. **Palette** — `Ctrl+K` filtered command list; `?` help overlay
+
+Theme: `/theme auto` follows host `COLORFGBG`. Settings: `/settings`.
 
 ## Soft themes
 

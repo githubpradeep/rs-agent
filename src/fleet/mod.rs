@@ -131,6 +131,54 @@ pub fn set_paused(status: &mut SeatStatus, reason: &str) {
     heartbeat_touch(status, Some(&format!("paused: {reason}")));
 }
 
+/// Mark seat waiting on a human (Conductor HUMAN / headless question).
+pub fn set_awaiting_human(status: &mut SeatStatus, prompt: &str) {
+    status.awaiting_human = Some(true);
+    status.human_prompt = Some(prompt.to_string());
+    status.lifecycle = Some("blocked".into());
+    status.state = "paused".into();
+    heartbeat_touch(status, Some(&format!("awaiting_human: {prompt}")));
+}
+
+/// Clear human-wait and resume idle.
+pub fn clear_awaiting_human(status: &mut SeatStatus) {
+    status.awaiting_human = None;
+    status.human_prompt = None;
+    if status.lifecycle.as_deref() == Some("blocked") {
+        status.lifecycle = Some("idle".into());
+    }
+    if status.state == "paused" {
+        status.state = "idle".into();
+    }
+    heartbeat_touch(status, Some("human resumed"));
+}
+
+/// Headless resume: clear `awaiting_human`, nudge worker via control.jsonl.
+pub fn resume_human(seat: &str, answer: &str) -> Result<String, String> {
+    let path = status_path(seat);
+    let mut status: SeatStatus = if path.exists() {
+        let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        serde_json::from_str(&raw).map_err(|e| e.to_string())?
+    } else {
+        return Err(format!("no status file for seat `{seat}`"));
+    };
+    let prompt = status
+        .human_prompt
+        .clone()
+        .unwrap_or_else(|| "(no prompt)".into());
+    clear_awaiting_human(&mut status);
+    clear_paused(&mut status);
+    write_seat_status(&status);
+    append_control(seat, ControlOp::Resume, Some(answer));
+    if !answer.trim().is_empty() {
+        append_control(seat, ControlOp::Steer, Some(answer));
+    }
+    Ok(format!(
+        "resumed seat `{seat}` (was: {prompt}) answer={}",
+        answer.chars().take(120).collect::<String>()
+    ))
+}
+
 /// Clear pause fields after resume.
 pub fn clear_paused(status: &mut SeatStatus) {
     status.paused_reason = None;
@@ -347,6 +395,15 @@ pub struct SeatStatus {
     /// Unix secs when pause began (for TTL auto-resume).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_at: Option<i64>,
+    /// Herdr-style lifecycle (blocked/working/idle/done).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<String>,
+    /// Headless human-wait (Conductor HUMAN).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awaiting_human: Option<bool>,
+    /// Optional schema/prompt for human resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_prompt: Option<String>,
 }
 
 /// Control-plane ops from TUI → worker (append-only jsonl).

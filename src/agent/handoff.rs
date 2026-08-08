@@ -75,6 +75,72 @@ pub fn handoff_request_message() -> String {
         .into()
 }
 
+/// Routing handoff (Conductor HandoffConfig) — transfer control to another seat/role.
+/// Distinct from [`HandoffNotes`] continuity notes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutingHandoffRecord {
+    pub written_at: String,
+    pub from_seat: Option<String>,
+    pub to_seat: String,
+    pub reason: String,
+}
+
+impl RoutingHandoffRecord {
+    pub fn new(from: Option<&str>, to: &str, reason: &str) -> Self {
+        Self {
+            written_at: chrono::Local::now()
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string(),
+            from_seat: from.map(|s| s.to_string()),
+            to_seat: to.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
+    pub fn format_block(&self) -> String {
+        format!(
+            "## Routing handoff ({})\n\
+             From: {}\n\
+             To: {}\n\
+             Reason: {}\n",
+            self.written_at,
+            self.from_seat.as_deref().unwrap_or("(none)"),
+            self.to_seat,
+            self.reason
+        )
+    }
+}
+
+static LAST_ROUTING: Mutex<Option<RoutingHandoffRecord>> = Mutex::new(None);
+
+/// Attempt a seat/role routing handoff with optional allow-list (`*` or `from->to`).
+pub fn route_to_seat(
+    from: Option<&str>,
+    to: &str,
+    reason: &str,
+    allowed: &[String],
+) -> Result<RoutingHandoffRecord, String> {
+    let decision = crate::orchestration::RoutingHandoff::try_route(from, to, reason, allowed);
+    if !decision.allowed {
+        return Err(format!(
+            "routing handoff to `{to}` denied by allowed_transitions"
+        ));
+    }
+    let rec = RoutingHandoffRecord::new(from, to, reason);
+    if let Ok(mut g) = LAST_ROUTING.lock() {
+        *g = Some(rec.clone());
+    }
+    Ok(rec)
+}
+
+pub fn take_routing() -> Option<RoutingHandoffRecord> {
+    LAST_ROUTING.lock().ok().and_then(|mut g| g.take())
+}
+
+pub fn peek_routing() -> Option<RoutingHandoffRecord> {
+    LAST_ROUTING.lock().ok().and_then(|g| g.clone())
+}
+
 static LAST_HANDOFF: Mutex<Option<HandoffNotes>> = Mutex::new(None);
 
 /// Store the most recent handoff for this process (session save + wake).

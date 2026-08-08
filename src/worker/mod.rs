@@ -28,6 +28,8 @@ pub struct WorkerConfig {
     pub goal_verify: bool,
     /// Print/log tool + text summaries (default true for overnight sanity).
     pub verbose: bool,
+    /// Dual timeout: no heartbeat/response within this many seconds → stuck (retriable).
+    pub response_timeout_secs: u64,
 }
 
 impl Default for WorkerConfig {
@@ -44,7 +46,18 @@ impl Default for WorkerConfig {
             sleep_secs: 5,
             goal_verify: true,
             verbose: true,
+            response_timeout_secs: 600,
         }
+    }
+}
+
+impl WorkerConfig {
+    /// Conductor-style dual timeout: response silence vs wall budget.
+    pub fn dual_timeout(&self) -> crate::orchestration::DualTimeout {
+        crate::orchestration::DualTimeout::from_secs(
+            self.response_timeout_secs,
+            self.budget_minutes.saturating_mul(60),
+        )
     }
 }
 
@@ -268,13 +281,22 @@ struct EventSink {
     verbose: bool,
     status: Arc<Mutex<SeatStatus>>,
     last_status_msg: Arc<Mutex<String>>,
+    /// Agent activity clock (excludes lease heartbeats) for dual-timeout silence.
+    last_activity: Arc<Mutex<Instant>>,
     text_buf: Mutex<String>,
 }
 
 impl EventSink {
+    fn touch_activity(&self) {
+        if let Ok(mut t) = self.last_activity.lock() {
+            *t = Instant::now();
+        }
+    }
+
     fn emit_line(&self, line: &str) {
         eprintln!("[worker:{}] {line}", self.seat);
         fleet::append_log(&self.seat, line);
+        self.touch_activity();
         if let Ok(mut st) = self.status.lock() {
             fleet::heartbeat_touch(&mut st, Some(line));
             fleet::write_seat_status(&st);
@@ -282,6 +304,7 @@ impl EventSink {
     }
 
     fn handle(&self, ev: &AgentEvent) {
+        self.touch_activity();
         match ev {
             AgentEvent::Status { message } => {
                 if let Ok(mut m) = self.last_status_msg.lock() {
@@ -482,24 +505,63 @@ async fn run_one_bead(
         }
     });
 
-    // Lease heartbeat every 45s.
+    // Lease heartbeat every 45s + Conductor dual timeout (silence vs wall).
     let stop_lease = Arc::new(AtomicBool::new(false));
     let stop_lease2 = stop_lease.clone();
     let seat_lease = claimant.to_string();
     let bead_lease = bead.id.clone();
     let status_lease = status.clone();
+    let abort_lease = control.abort.clone();
+    let dual = cfg.dual_timeout();
+    let turn_started = Instant::now();
+    let last_activity = Arc::new(Mutex::new(Instant::now()));
+    let last_activity_lease = last_activity.clone();
     let lease_task = tokio::spawn(async move {
+        let mut ticks: u32 = 0;
         while !stop_lease2.load(Ordering::Relaxed) {
-            tokio::time::sleep(Duration::from_secs(45)).await;
+            tokio::time::sleep(Duration::from_secs(15)).await;
             if stop_lease2.load(Ordering::Relaxed) {
                 break;
             }
-            let _ = beads::heartbeat(None, &bead_lease, &seat_lease);
-            if let Ok(mut st) = status_lease.lock() {
-                fleet::heartbeat_touch(&mut st, Some("lease heartbeat"));
-                fleet::write_seat_status(&st);
+            ticks = ticks.saturating_add(1);
+            if dual.wall_exceeded(turn_started.elapsed()) {
+                fleet::append_log(
+                    &seat_lease,
+                    &format!("wall timeout on {bead_lease} — aborting turn"),
+                );
+                abort_lease.abort();
+                break;
             }
-            fleet::append_log(&seat_lease, &format!("heartbeat lease on {bead_lease}"));
+            let silent = last_activity_lease
+                .lock()
+                .map(|t| t.elapsed())
+                .unwrap_or_default();
+            if dual.response_exceeded(silent) {
+                fleet::append_log(
+                    &seat_lease,
+                    &format!(
+                        "response silence {}s on {bead_lease} — aborting (retriable)",
+                        silent.as_secs()
+                    ),
+                );
+                if let Ok(mut st) = status_lease.lock() {
+                    st.last_error = Some(format!("response_timeout:{}s", silent.as_secs()));
+                    st.lifecycle = Some("blocked".into());
+                    fleet::write_seat_status(&st);
+                }
+                abort_lease.abort();
+                break;
+            }
+            // Renew bead lease every ~45s (every 3rd tick).
+            if ticks % 3 == 0 {
+                let _ = beads::heartbeat(None, &bead_lease, &seat_lease);
+                if let Ok(mut st) = status_lease.lock() {
+                    // Lease renew only — does not reset agent activity clock.
+                    fleet::heartbeat_touch(&mut st, Some("lease heartbeat"));
+                    fleet::write_seat_status(&st);
+                }
+                fleet::append_log(&seat_lease, &format!("heartbeat lease on {bead_lease}"));
+            }
         }
     });
 
@@ -508,6 +570,7 @@ async fn run_one_bead(
         verbose: cfg.verbose,
         status: status.clone(),
         last_status_msg: Arc::new(Mutex::new(String::new())),
+        last_activity: last_activity.clone(),
         text_buf: Mutex::new(String::new()),
     };
     let last_status_msg = sink.last_status_msg.clone();

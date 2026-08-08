@@ -47,7 +47,16 @@ pub struct GoalState {
     /// Consecutive "not met" evaluations (reset when a turn uses tools).
     #[serde(default)]
     pub consecutive_blocks: u8,
+    /// DO_WHILE-style hard cap on auto-continue turns (0 = use MAX_CONSECUTIVE_BLOCKS only).
+    #[serde(default)]
+    pub max_iterations: u32,
+    /// Optional safe condition DSL (Conductor TerminationConfig).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cond_dsl: Option<String>,
 }
+
+/// Default max goal auto-continue iterations (Conductor DO_WHILE).
+pub const DEFAULT_MAX_GOAL_ITERATIONS: u32 = 32;
 
 impl GoalState {
     pub fn new(condition: String, input_tokens: usize, output_tokens: usize) -> Self {
@@ -60,7 +69,20 @@ impl GoalState {
             tokens_baseline_in: input_tokens,
             tokens_baseline_out: output_tokens,
             consecutive_blocks: 0,
+            max_iterations: DEFAULT_MAX_GOAL_ITERATIONS,
+            cond_dsl: None,
         }
+    }
+
+    /// True when hard iteration budget is exhausted.
+    pub fn iterations_exhausted(&self) -> bool {
+        self.max_iterations > 0 && self.turns_evaluated >= self.max_iterations
+    }
+
+    /// Evaluate optional cond_dsl against haystack; None if unset/invalid.
+    pub fn eval_cond_dsl(&self, haystack: &str) -> Option<bool> {
+        let dsl = self.cond_dsl.as_deref()?;
+        crate::orchestration::GoalCond::parse_dsl(dsl).map(|c| c.eval(haystack))
     }
 
     pub fn is_running(&self) -> bool {

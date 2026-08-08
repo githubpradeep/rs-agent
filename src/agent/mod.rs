@@ -17,7 +17,10 @@ pub use control::*;
 pub use mode::*;
 pub use r#loop::*;
 pub use goal::{GoalCommand, GoalState, GoalStatus, parse_goal_arg};
-pub use handoff::{HandoffNotes, handoff_request_message};
+pub use handoff::{
+    HandoffNotes, RoutingHandoffRecord, handoff_request_message, peek_routing, route_to_seat,
+    take_routing,
+};
 pub use seat::{SeatCaste, SeatCommand, SeatProfile, parse_seat_arg};
 pub use repair::{is_weak_model, weak_model_system_note, weak_model_user_warning};
 pub use rlm_escalate::{escalate_chars, set_escalate_chars};

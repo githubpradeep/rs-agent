@@ -6,9 +6,39 @@ use syntect::highlighting::FontStyle;
 use syntect::parsing::SyntaxSet;
 use std::sync::OnceLock;
 
+use super::theme::Palette;
+
 fn syntax_set() -> &'static SyntaxSet {
     static SS: OnceLock<SyntaxSet> = OnceLock::new();
     SS.get_or_init(|| SyntaxSet::load_defaults_newlines())
+}
+
+/// Palette-derived markdown colors (light themes no longer get dark ANSI).
+#[derive(Clone, Copy)]
+pub struct MarkdownStyle {
+    pub heading1: Color,
+    pub heading2: Color,
+    pub heading3: Color,
+    pub blockquote: Color,
+    pub inline_code: Color,
+    pub rule: Color,
+    pub code_gutter: Color,
+    pub text: Color,
+}
+
+impl MarkdownStyle {
+    pub fn from_palette(p: &Palette) -> Self {
+        Self {
+            heading1: p.assistant,
+            heading2: p.accent,
+            heading3: p.text,
+            blockquote: p.overlay0,
+            inline_code: p.tool,
+            rule: p.border,
+            code_gutter: p.overlay0,
+            text: p.text,
+        }
+    }
 }
 
 fn highlight_code(code: &str, lang: &str, syntect_theme: &str) -> Vec<Line<'static>> {
@@ -46,8 +76,12 @@ fn highlight_code(code: &str, lang: &str, syntect_theme: &str) -> Vec<Line<'stat
 }
 
 /// Renders markdown to styled ratatui lines, syntax-highlighting fenced code
-/// blocks using `syntect_theme` (see [`crate::tui::theme::ThemeName::syntect_theme`]).
-pub fn render_markdown(text: &str, syntect_theme: &str) -> Vec<Line<'static>> {
+/// blocks using `syntect_theme`.
+pub fn render_markdown(
+    text: &str,
+    syntect_theme: &str,
+    md: MarkdownStyle,
+) -> Vec<Line<'static>> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TABLES);
@@ -67,6 +101,7 @@ pub fn render_markdown(text: &str, syntect_theme: &str) -> Vec<Line<'static>> {
     let mut is_first_item_line = false;
     let mut emph_bold = false;
     let mut emph_italic = false;
+    let mut strike = false;
     macro_rules! flush_line {
         () => {{
             let taken = std::mem::take(&mut spans);
@@ -112,7 +147,7 @@ pub fn render_markdown(text: &str, syntect_theme: &str) -> Vec<Line<'static>> {
                 Tag::Emphasis => emph_italic = true,
                 Tag::Strong => emph_bold = true,
                 Tag::Link { .. } | Tag::Image { .. } => {}
-                Tag::Strikethrough => {}
+                Tag::Strikethrough => strike = true,
                 _ => {}
             },
             Event::End(tag) => match tag {
@@ -134,7 +169,10 @@ pub fn render_markdown(text: &str, syntect_theme: &str) -> Vec<Line<'static>> {
                         let highlighted = highlight_code(&code_text, &code_lang, syntect_theme);
                         for hl_line in highlighted {
                             let mut s = Vec::with_capacity(hl_line.spans.len() + 1);
-                            s.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+                            s.push(Span::styled(
+                                " │ ",
+                                Style::default().fg(md.code_gutter),
+                            ));
                             s.extend(hl_line.spans);
                             lines.push(Line::from(s));
                         }
@@ -153,30 +191,33 @@ pub fn render_markdown(text: &str, syntect_theme: &str) -> Vec<Line<'static>> {
                 TagEnd::Emphasis => emph_italic = false,
                 TagEnd::Strong => emph_bold = false,
                 TagEnd::Link | TagEnd::Image => {}
-                TagEnd::Strikethrough => {}
+                TagEnd::Strikethrough => strike = false,
                 _ => {}
             },
             Event::Text(text) => {
                 if in_code_block {
                     code_text.push_str(&text);
                 } else {
-                    let mut style = Style::default();
+                    let mut style = Style::default().fg(md.text);
                     if in_heading {
                         let c = match heading_lvl {
-                            1 => Color::Yellow,
-                            2 => Color::LightYellow,
-                            _ => Color::White,
+                            1 => md.heading1,
+                            2 => md.heading2,
+                            _ => md.heading3,
                         };
                         style = style.fg(c).add_modifier(Modifier::BOLD);
                     }
                     if in_blockquote {
-                        style = style.fg(Color::DarkGray);
+                        style = style.fg(md.blockquote);
                     }
                     if emph_bold {
                         style = style.add_modifier(Modifier::BOLD);
                     }
                     if emph_italic {
                         style = style.add_modifier(Modifier::ITALIC);
+                    }
+                    if strike {
+                        style = style.add_modifier(Modifier::CROSSED_OUT);
                     }
                     if is_first_item_line && spans.is_empty() {
                         let indent = "  ".repeat(list_depth.saturating_sub(1));
@@ -188,8 +229,8 @@ pub fn render_markdown(text: &str, syntect_theme: &str) -> Vec<Line<'static>> {
             }
             Event::Code(text) => {
                 spans.push(Span::styled(
-                    text.to_string(),
-                    Style::default().fg(Color::Cyan),
+                    format!(" {} ", text),
+                    Style::default().fg(md.inline_code).bg(Color::Reset),
                 ));
             }
             Event::SoftBreak | Event::HardBreak => {
@@ -201,14 +242,14 @@ pub fn render_markdown(text: &str, syntect_theme: &str) -> Vec<Line<'static>> {
             }
             Event::Rule => {
                 lines.push(Line::from(Span::styled(
-                    "─".repeat(50),
-                    Style::default().fg(Color::DarkGray),
+                    "─".repeat(40),
+                    Style::default().fg(md.rule),
                 )));
             }
             Event::Html(text) => {
                 spans.push(Span::styled(
                     text.to_string(),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(md.blockquote),
                 ));
             }
             _ => {}

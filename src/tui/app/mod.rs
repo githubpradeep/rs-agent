@@ -24,15 +24,26 @@ use crossterm::event::{
 };
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::Frame;
 
+use super::fleet_panel::{self, CityRow, FleetPanelState};
+use super::help::{self, HelpOverlay};
+use super::hit::{HitMap, HitTarget};
 use super::keys::{merge_keybindings, KeyMap};
-use super::renderer::render_markdown;
+use super::layout::{compute_view, LayoutOpts};
+use super::renderer::{render_markdown, MarkdownStyle};
+use super::settings::{self, SettingsState};
+use super::status::{self, SessionUiState};
 use super::theme::{Palette, ThemeName};
+use super::toast::{self, Toast};
+use super::tree_view::{self, SidePanelMode};
+use super::widgets;
+use crate::lifecycle::{self, Lifecycle};
+use crate::notify::{self, NotifyMode};
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -56,6 +67,16 @@ struct ToolBlock {
     full: String,
     expanded: bool,
     is_error: bool,
+}
+
+/// Live bash/repl/task output tab (herdr-style switchable buffers, not a mux).
+#[derive(Clone)]
+struct ToolOutputTab {
+    id: String,
+    name: String,
+    label: String,
+    buffer: String,
+    done: bool,
 }
 
 #[derive(PartialEq)]
@@ -144,6 +165,9 @@ struct FleetAttachState {
     attach_started: Instant,
 }
 
+mod helpers;
+use helpers::*;
+
 pub struct App {
     messages: Vec<ChatMessage>,
     input: String,
@@ -206,11 +230,16 @@ pub struct App {
     tree_panel_text: String,
     show_repl_panel: bool,
     repl_panel: String,
+    /// Switchable live tool outputs (Tab cycles while waiting).
+    tool_output_tabs: Vec<ToolOutputTab>,
+    tool_output_tab: usize,
     tool_in_progress: Option<(String, Instant)>,
     context_enabled: bool,
     provider: Arc<dyn Provider>,
     provider_name: String,
     timeout_secs: u64,
+    /// Auto "continue" attempts after transport/timeout hiccups (Error path).
+    provider_auto_continues: u8,
     /// Cycle list of `provider/model` display strings (pi Ctrl+P).
     model_cycle: Vec<String>,
     model_cycle_index: usize,
@@ -225,6 +254,30 @@ pub struct App {
     lsp_cmd_tx: Option<channel::Sender<LspCmd>>,
     /// Live fleet follow / attach takeover.
     fleet_attach: Option<FleetAttachState>,
+    /// Herdr-style "done but unseen" — cleared when the user interacts.
+    unseen_done: bool,
+    /// Cached beads ready count (avoid disk I/O every frame).
+    beads_ready_cache: (Instant, usize),
+    toast: Option<Toast>,
+    toast_enabled: bool,
+    toast_sound: bool,
+    notify_mode: NotifyMode,
+    help_overlay: Option<HelpOverlay>,
+    settings: Option<SettingsState>,
+    /// Ctrl+K command palette.
+    palette_open: bool,
+    palette_query: String,
+    palette_selection: usize,
+    palette_items: Vec<String>,
+    show_fleet_panel: bool,
+    fleet_panel: FleetPanelState,
+    side_mode: SidePanelMode,
+    tree_nodes: Vec<tree_view::CallTreeNode>,
+    hit_map: HitMap,
+    diagnostic_banner: Option<String>,
+    allowed_transitions: Vec<String>,
+    /// Last fleet refresh.
+    fleet_refresh_at: Instant,
 }
 
 enum LspCmd {
@@ -236,7 +289,10 @@ enum LspCmd {
 impl App {
     pub fn new(provider: Arc<dyn Provider>, model: String, timeout_secs: u64, approve: bool, resume: Option<SessionData>, system_prompt: Option<String>, max_iterations: usize, auto_mode: bool, rlm_depth: u32, thinking_budget: Option<u32>) -> Self {
         let cfg = crate::config::Config::load();
-        let theme_name = ThemeName::parse(cfg.theme.as_deref().unwrap_or("dark"));
+        let theme_name = match cfg.theme.as_deref() {
+            None | Some("auto") => ThemeName::from_host(),
+            Some(s) => ThemeName::parse(s),
+        };
         let palette = Palette::for_theme(theme_name);
         let keys = KeyMap::new(merge_keybindings(&cfg.keybindings));
         let mouse_enabled = !cfg.disable_mouse.unwrap_or(false);
@@ -650,30 +706,60 @@ impl App {
                         }
                         AppCommand::HandoffRequest => {
                             let text = crate::agent::handoff::handoff_request_message();
-                            abort_for_thread.clear();
-                            let event_tx2 = event_tx.clone();
-                            let mut cb = move |event: AgentEvent| {
-                                let _ = event_tx2.send((0, event));
-                            };
-                            let result = tokio::time::timeout(
-                                timeout,
-                                agent_loop.run(&text, &mut cb),
-                            )
-                            .await;
-                            match result {
-                                Ok(Ok(())) => {
-                                    let _ = event_tx.send((0, AgentEvent::TreeUpdate {
-                                        tree: agent_loop.call_tree().clone(),
-                                    }));
-                                }
-                                Ok(Err(e)) => {
-                                    let _ = event_tx.send((0, AgentEvent::Error { message: e }));
-                                }
-                                Err(_) => {
-                                    abort_for_thread.abort();
-                                    let _ = event_tx.send((0, AgentEvent::Error {
-                                        message: format!("Request timed out after {}s", timeout_secs),
-                                    }));
+                            let mut prompt = text;
+                            let mut wall_attempt = 0u32;
+                            const MAX_WALL_RETRIES: u32 = 3;
+                            loop {
+                                abort_for_thread.clear();
+                                let event_tx2 = event_tx.clone();
+                                let mut cb = move |event: AgentEvent| {
+                                    let _ = event_tx2.send((0, event));
+                                };
+                                let result = tokio::time::timeout(
+                                    timeout,
+                                    agent_loop.run(&prompt, &mut cb),
+                                )
+                                .await;
+                                match result {
+                                    Ok(Ok(())) => {
+                                        let _ = event_tx.send((0, AgentEvent::TreeUpdate {
+                                            tree: agent_loop.call_tree().clone(),
+                                        }));
+                                        break;
+                                    }
+                                    Ok(Err(e)) => {
+                                        let _ = event_tx.send((0, AgentEvent::Error { message: e }));
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        abort_for_thread.abort();
+                                        let _ = agent_loop.state_mut().settle_dangling_tools();
+                                        let _ = agent_loop.state_mut().repair_tool_pairing();
+                                        wall_attempt += 1;
+                                        if wall_attempt <= MAX_WALL_RETRIES {
+                                            let delay = crate::orchestration::backoff_delay(
+                                                wall_attempt.saturating_sub(1),
+                                                2_000,
+                                                30_000,
+                                                500,
+                                            );
+                                            let _ = event_tx.send((0, AgentEvent::Status {
+                                                message: format!(
+                                                    "wall timeout after {timeout_secs}s — auto-continuing ({wall_attempt}/{MAX_WALL_RETRIES}) in {}s…",
+                                                    delay.as_secs()
+                                                ),
+                                            }));
+                                            tokio::time::sleep(delay).await;
+                                            prompt = "continue".to_string();
+                                            continue;
+                                        }
+                                        let _ = event_tx.send((0, AgentEvent::Error {
+                                            message: format!(
+                                                "Request timed out after {timeout_secs}s (auto-retry exhausted)"
+                                            ),
+                                        }));
+                                        break;
+                                    }
                                 }
                             }
                             // Persist after handoff turn
@@ -838,31 +924,87 @@ impl App {
                             }));
                         }
                         AppCommand::Submit { text } => {
-                            abort_for_thread.clear();
-                            let result = tokio::time::timeout(
-                                timeout,
-                                agent_loop.run(&text, &mut |event: AgentEvent| {
-                                    let _ = event_tx.send((0, event));
-                                }),
-                            )
-                            .await;
-                            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                            match result {
-                                Ok(Ok(())) => {
-                                    let _ = event_tx.send((0, AgentEvent::TreeUpdate {
-                                        tree: agent_loop.call_tree().clone(),
-                                    }));
-                                }
-                                Ok(Err(e)) => {
-                                    let _ = event_tx.send((0, AgentEvent::Error { message: e }));
-                                }
-                                Err(_) => {
-                                    abort_for_thread.abort();
-                                    let _ = event_tx.send((0, AgentEvent::Error {
-                                        message: format!("Request timed out after {}s", timeout_secs),
-                                    }));
+                            // Wall-clock timeout on the whole turn: auto-continue a few
+                            // times instead of wedging the user on "type continue".
+                            const MAX_WALL_RETRIES: u32 = 3;
+                            let mut prompt = text;
+                            let mut wall_attempt = 0u32;
+                            loop {
+                                abort_for_thread.clear();
+                                let result = tokio::time::timeout(
+                                    timeout,
+                                    agent_loop.run(&prompt, &mut |event: AgentEvent| {
+                                        let _ = event_tx.send((0, event));
+                                    }),
+                                )
+                                .await;
+                                match result {
+                                    Ok(Ok(())) => {
+                                        let _ = event_tx.send((0, AgentEvent::TreeUpdate {
+                                            tree: agent_loop.call_tree().clone(),
+                                        }));
+                                        break;
+                                    }
+                                    Ok(Err(e)) => {
+                                        let transport =
+                                            crate::agent::AgentLoop::is_transport_failure_msg(&e);
+                                        if transport && wall_attempt < MAX_WALL_RETRIES {
+                                            wall_attempt += 1;
+                                            let _ = agent_loop.state_mut().settle_dangling_tools();
+                                            let _ = agent_loop.state_mut().repair_tool_pairing();
+                                            let delay = crate::orchestration::backoff_delay(
+                                                wall_attempt.saturating_sub(1),
+                                                2_000,
+                                                30_000,
+                                                500,
+                                            );
+                                            let _ = event_tx.send((0, AgentEvent::Status {
+                                                message: format!(
+                                                    "provider error — auto-continuing ({wall_attempt}/{MAX_WALL_RETRIES}) in {}s… ({e})",
+                                                    delay.as_secs()
+                                                ),
+                                            }));
+                                            tokio::time::sleep(delay).await;
+                                            prompt = "continue".to_string();
+                                            continue;
+                                        }
+                                        let _ = event_tx.send((0, AgentEvent::Error {
+                                            message: format!("{e} (auto-retry exhausted)"),
+                                        }));
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        abort_for_thread.abort();
+                                        let _ = agent_loop.state_mut().settle_dangling_tools();
+                                        let _ = agent_loop.state_mut().repair_tool_pairing();
+                                        wall_attempt += 1;
+                                        if wall_attempt <= MAX_WALL_RETRIES {
+                                            let delay = crate::orchestration::backoff_delay(
+                                                wall_attempt.saturating_sub(1),
+                                                2_000,
+                                                30_000,
+                                                500,
+                                            );
+                                            let _ = event_tx.send((0, AgentEvent::Status {
+                                                message: format!(
+                                                    "wall timeout after {timeout_secs}s — auto-continuing ({wall_attempt}/{MAX_WALL_RETRIES}) in {}s…",
+                                                    delay.as_secs()
+                                                ),
+                                            }));
+                                            tokio::time::sleep(delay).await;
+                                            prompt = "continue".to_string();
+                                            continue;
+                                        }
+                                        let _ = event_tx.send((0, AgentEvent::Error {
+                                            message: format!(
+                                                "Request timed out after {timeout_secs}s (auto-retry exhausted)"
+                                            ),
+                                        }));
+                                        break;
+                                    }
                                 }
                             }
+                            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
                             let s = agent_loop.state();
                             let tree_snapshot =
                                 serde_json::to_value(agent_loop.call_tree().snapshot()).ok();
@@ -908,14 +1050,14 @@ impl App {
         let mut initial_msgs = vec![ChatMessage {
             role: "system".to_string(),
             text: format!(
-                "Rs Agent — everyday coding with Deep Context\n\
-                 Deep Context: load big files once, query them 100 times, never hit a limit.\n\
-                 Provider: {}\nModel: {}\nSession: {}\n\n\
-                 Type a message to start.\n\
-                 i: insert | Esc: normal | t: toggle thinking | G: bottom\n\
-                 Enter while waiting: steer | Esc while waiting: abort\n\
-                 /help for commands | ^C: quit",
-                provider_banner, model, session_id
+                "**rs-agent** · Deep Context coding agent\n\
+                 `{provider}` / `{model}` · session `{session}`\n\n\
+                 Type to start · `/` commands · `@` files · `#` dirs\n\
+                 Header chip: ○ idle · ◐ working · ● blocked · ✓ done\n\
+                     Esc abort (kills bash) · Tab cycle tool outputs · Enter steer while working · `/tree` call graph",
+                provider = provider_banner,
+                model = model,
+                session = SessionStore::short_id(&session_id),
             ),
             thinking: None,
             show_thinking: false,
@@ -1078,11 +1220,14 @@ impl App {
             tree_panel_text: "(no call tree yet)".to_string(),
             show_repl_panel: false,
             repl_panel: String::new(),
+            tool_output_tabs: Vec::new(),
+            tool_output_tab: 0,
             tool_in_progress: None,
             context_enabled: true,
             provider: provider_for_app,
             provider_name: provider_name_for_banner.clone(),
             timeout_secs,
+            provider_auto_continues: 0,
             model_cycle: {
                 let mut cycle: Vec<String> = crate::ai::registry::available_model_refs()
                     .into_iter()
@@ -1109,6 +1254,90 @@ impl App {
             lsp_summary: String::new(),
             lsp_cmd_tx: Some(lsp_cmd_tx),
             fleet_attach: None,
+            unseen_done: false,
+            beads_ready_cache: (Instant::now() - Duration::from_secs(60), 0),
+            toast: None,
+            toast_enabled: cfg.toast.unwrap_or(true),
+            toast_sound: cfg.toast_sound.unwrap_or(false),
+            notify_mode: NotifyMode::parse(cfg.notify.as_deref().unwrap_or("off")),
+            help_overlay: None,
+            settings: None,
+            palette_open: false,
+            palette_query: String::new(),
+            palette_selection: 0,
+            palette_items: Vec::new(),
+            show_fleet_panel: false,
+            fleet_panel: FleetPanelState::default(),
+            side_mode: SidePanelMode::Tree,
+            tree_nodes: Vec::new(),
+            hit_map: HitMap::default(),
+            diagnostic_banner: {
+                let mut notes: Vec<String> = Vec::new();
+                if !crate::rlm::python3_available() {
+                    notes.push("python3 missing — Deep Context repl disabled".into());
+                }
+                if notes.is_empty() {
+                    None
+                } else {
+                    Some(notes.join(" · "))
+                }
+            },
+            allowed_transitions: cfg.allowed_transitions.clone(),
+            fleet_refresh_at: Instant::now() - Duration::from_secs(60),
+        }
+    }
+
+    fn push_toast(&mut self, toast: Toast) {
+        if !self.toast_enabled {
+            return;
+        }
+        if self.toast_sound {
+            toast::play_sound(toast.kind);
+        }
+        let life = match toast.kind {
+            toast::ToastKind::NeedsAttention => Lifecycle::Blocked,
+            toast::ToastKind::Finished => Lifecycle::Done,
+        };
+        notify::on_lifecycle(self.notify_mode, life, &toast.body);
+        self.toast = Some(toast);
+    }
+
+    fn dismiss_overlays(&mut self) {
+        self.help_overlay = None;
+        self.settings = None;
+        self.palette_open = false;
+        self.palette_query.clear();
+    }
+
+    fn open_command_palette(&mut self) {
+        self.palette_open = true;
+        self.palette_query.clear();
+        self.palette_selection = 0;
+        self.refresh_palette_items();
+    }
+
+    fn refresh_palette_items(&mut self) {
+        self.palette_items = super::command_catalog::filter_commands(&self.palette_query);
+        if self.palette_selection >= self.palette_items.len() {
+            self.palette_selection = self.palette_items.len().saturating_sub(1);
+        }
+    }
+
+    fn publish_lifecycle(&mut self, life: Lifecycle, detail: &str) {
+        let changed = lifecycle::publish(life, detail);
+        lifecycle::set_session(Some(self.session_id.clone()), None);
+        if changed {
+            match life {
+                Lifecycle::Blocked => {
+                    self.push_toast(Toast::blocked("needs attention", detail));
+                }
+                Lifecycle::Done => {
+                    if self.unseen_done {
+                        self.push_toast(Toast::finished("done", detail));
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -1154,7 +1383,9 @@ impl App {
                 if is_trusted || path_ok || self.auto_allow(&pending.request.tool_name) {
                     let _ = pending.reply_tx.send(PermissionReply::AllowOnce);
                 } else {
+                    let tool = pending.request.tool_name.clone();
                     self.pending_permission = Some(pending);
+                    self.publish_lifecycle(Lifecycle::Blocked, &format!("permission: {tool}"));
                 }
             }
 
@@ -1162,7 +1393,19 @@ impl App {
                 self.input.clear();
                 self.input_mode = InputMode::Question;
                 self.status = "awaiting answer...".to_string();
+                let q = pending.request.question.clone();
                 self.pending_question = Some(pending);
+                self.publish_lifecycle(Lifecycle::Blocked, &format!("question: {q}"));
+            }
+
+            if let Some(t) = self.toast.as_ref() {
+                if t.expired() {
+                    self.toast = None;
+                }
+            }
+            if self.show_fleet_panel && self.fleet_refresh_at.elapsed() >= Duration::from_secs(1) {
+                self.fleet_panel.refresh();
+                self.fleet_refresh_at = Instant::now();
             }
 
             if self.should_exit {
@@ -1179,6 +1422,16 @@ impl App {
         if self.mouse_enabled {
             crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture)?;
         }
+        // Alternate screen is gone — print a durable resume hint.
+        let short = SessionStore::short_id(&self.session_id);
+        let title = self
+            .session_title
+            .as_deref()
+            .unwrap_or("untitled");
+        eprintln!("Session saved: {} ({title})", self.session_id);
+        eprintln!("Resume:  rs-agent -r {short}");
+        eprintln!("Or:      rs-agent -r latest");
+        eprintln!("List:    rs-agent --list-sessions");
         Ok(())
     }
 
@@ -1224,23 +1477,35 @@ impl App {
                 }
                 self.status = "thinking...".to_string();
                 self.follow_bottom = true;
+                self.publish_lifecycle(Lifecycle::Working, "thinking");
             }
-            AgentEvent::ToolUseStart { id: _, name } => {
+            AgentEvent::ToolUseStart { id, name } => {
                 self.status = format!("using {}...", name);
                 self.follow_bottom = true;
+                self.publish_lifecycle(Lifecycle::Working, &format!("tool:{name}"));
                 if name == "repl" || name == "bash" || name == "task" {
-                    if name == "repl" {
-                        self.repl_panel.clear();
-                    }
+                    let n = self.tool_output_tabs.len() + 1;
+                    self.tool_output_tabs.push(ToolOutputTab {
+                        id: id.clone(),
+                        name: name.clone(),
+                        label: format!("{name}#{n}"),
+                        buffer: String::new(),
+                        done: false,
+                    });
+                    self.tool_output_tab = self.tool_output_tabs.len().saturating_sub(1);
+                    // Bottom console only — never steal chat width mid-turn.
                     self.show_repl_panel = true;
-                    if name == "repl" || name == "task" {
-                        self.show_tree_panel = true;
-                    }
                 }
                 self.tool_in_progress = Some((name, Instant::now()));
             }
-            AgentEvent::ToolResult { id: _, name, result } => {
+            AgentEvent::ToolResult { id, name, result } => {
                 self.tool_in_progress = None;
+                if let Some(tab) = self.tool_output_tabs.iter_mut().find(|t| t.id == id) {
+                    tab.done = true;
+                    if !result.content.is_empty() && tab.buffer.is_empty() {
+                        tab.buffer = result.content.chars().take(4000).collect();
+                    }
+                }
                 let mut full = result.content.clone();
                 if full.starts_with("Exit code: ") {
                     if let Some(rest) = full.splitn(2, '\n').nth(1) {
@@ -1276,6 +1541,14 @@ impl App {
                         .find(|l| l.contains(crate::tools::truncate_store::SPILL_MARKER))
                         .unwrap_or("full output spilled");
                     format!("… {}", path_line.chars().take(90).collect::<String>())
+                } else if matches!(name.as_str(), "bash" | "repl" | "task") {
+                    // Keep chat clean — live stream lives in the bottom console.
+                    let exit = full
+                        .lines()
+                        .rev()
+                        .find(|l| l.starts_with("Exit code:"))
+                        .unwrap_or("done");
+                    format!("↗ console · {exit}")
                 } else if matches!(name.as_str(), "write" | "edit" | "apply_patch") {
                     let head: String = full.lines().next().unwrap_or("").chars().take(80).collect();
                     let lsp = if full.contains("<diagnostics") {
@@ -1318,32 +1591,57 @@ impl App {
                 let transport = message.to_lowercase().contains("stream error")
                     || message.to_lowercase().contains("error sending request")
                     || message.to_lowercase().contains("timed out")
+                    || message.to_lowercase().contains("timeout")
                     || message.to_lowercase().contains("connection");
-                if transport {
+                let exhausted = message.to_lowercase().contains("auto-retry exhausted");
+                if transport && !exhausted && self.provider_auto_continues < 3 {
+                    self.provider_auto_continues =
+                        self.provider_auto_continues.saturating_add(1);
+                    let n = self.provider_auto_continues;
+                    self.push_system(format!(
+                        "Provider hiccup: {message}\nAuto-continuing ({n}/3)…"
+                    ));
+                    self.status = "thinking...".to_string();
+                    self.tool_in_progress = None;
+                    self.input_mode = InputMode::Waiting;
+                    let _ = self.command_tx.send(AppCommand::Submit {
+                        text: "continue".into(),
+                    });
+                } else if transport {
+                    self.provider_auto_continues = 0;
                     self.push_system(format!(
                         "Provider hiccup: {message}\n\
-                         Type continue or /handoff — session stayed open."
+                         Auto-retry exhausted — type continue or /handoff (session stayed open)."
                     ));
                     self.status = "recover".to_string();
+                    self.input_mode = InputMode::Insert;
+                    self.tool_in_progress = None;
                 } else if let Some(last) = self.messages.last_mut() {
                     last.text.push_str(&format!("\n❌ Error: {}", message));
                     self.status = "error".to_string();
+                    self.input_mode = InputMode::Insert;
+                    self.tool_in_progress = None;
                 } else {
                     self.status = "error".to_string();
+                    self.input_mode = InputMode::Insert;
+                    self.tool_in_progress = None;
                 }
-                self.input_mode = InputMode::Insert;
-                self.tool_in_progress = None;
             }
             AgentEvent::TurnEnd { stop_reason: _ } => {
                 self.status = "ready".to_string();
+                self.unseen_done = true;
+                self.publish_lifecycle(Lifecycle::Done, "turn end");
             }
             AgentEvent::Done => {
+                self.provider_auto_continues = 0;
                 self.status = "ready".to_string();
+                self.unseen_done = true;
                 self.input_mode = InputMode::Insert;
                 self.input.clear();
                 self.near_limit = false;
                 self.queued_steers = 0;
                 self.tool_in_progress = None;
+                self.publish_lifecycle(Lifecycle::Done, "ready");
             }
             AgentEvent::GoalUpdate { summary } => {
                 if summary.starts_with("STATUS\n") {
@@ -1363,27 +1661,29 @@ impl App {
             }
             AgentEvent::ToolUseDelta { input: _ } => {}
             AgentEvent::ReplOutput { stream, text } => {
-                let prefix = if stream == "stderr" { "! " } else { "" };
-                for line in text.lines() {
-                    self.repl_panel.push_str(prefix);
-                    self.repl_panel.push_str(line);
-                    self.repl_panel.push('\n');
+                let cleaned = Self::sanitize_console_text(&text);
+                let mut chunk = String::new();
+                for line in cleaned.lines() {
+                    if stream == "stderr" {
+                        chunk.push_str("! ");
+                    }
+                    chunk.push_str(line);
+                    chunk.push('\n');
                 }
-                Self::trim_panel_utf8(&mut self.repl_panel, 8000);
+                self.append_tool_tab_output("repl", &chunk);
                 self.show_repl_panel = true;
             }
             AgentEvent::ToolOutput { name, stream, text } => {
-                let prefix = if stream == "stderr" {
-                    format!("[{name}/err] ")
-                } else {
-                    format!("[{name}] ")
-                };
-                for line in text.lines() {
-                    self.repl_panel.push_str(&prefix);
-                    self.repl_panel.push_str(line);
-                    self.repl_panel.push('\n');
+                let cleaned = Self::sanitize_console_text(&text);
+                let mut chunk = String::new();
+                for line in cleaned.lines() {
+                    if stream == "stderr" {
+                        chunk.push_str("! ");
+                    }
+                    chunk.push_str(line);
+                    chunk.push('\n');
                 }
-                Self::trim_panel_utf8(&mut self.repl_panel, 8000);
+                self.append_tool_tab_output(&name, &chunk);
                 self.show_repl_panel = true;
             }
             AgentEvent::ContextWarning { fraction: _, used, limit } => {
@@ -1412,12 +1712,31 @@ impl App {
             AgentEvent::Status { message } => {
                 if message.contains("stream failed") || message.contains("recovering") {
                     if message.contains("stream failed") && message.contains("session ready") {
-                        self.push_system(
-                            "stream failed — type continue or /handoff (tools settled; files restored if possible)",
-                        );
+                        if self.provider_auto_continues < 3 {
+                            self.provider_auto_continues =
+                                self.provider_auto_continues.saturating_add(1);
+                            let n = self.provider_auto_continues;
+                            self.push_system(format!(
+                                "stream failed — auto-continuing ({n}/3)…"
+                            ));
+                            self.input_mode = InputMode::Waiting;
+                            self.tool_in_progress = None;
+                            self.status = "thinking...".to_string();
+                            let _ = self.command_tx.send(AppCommand::Submit {
+                                text: "continue".into(),
+                            });
+                        } else {
+                            self.provider_auto_continues = 0;
+                            self.push_system(
+                                "stream failed — auto-retry exhausted; type continue or /handoff",
+                            );
+                            self.input_mode = InputMode::Insert;
+                            self.tool_in_progress = None;
+                        }
+                    } else {
+                        self.input_mode = InputMode::Waiting;
+                        self.tool_in_progress = None;
                     }
-                    self.input_mode = InputMode::Insert;
-                    self.tool_in_progress = None;
                 }
                 self.status = message;
             }
@@ -1432,6 +1751,7 @@ impl App {
             AgentEvent::TreeUpdate { tree } => {
                 self.tree_breadcrumb = tree.breadcrumb();
                 self.tree_panel_text = tree.render();
+                self.tree_nodes = tree_view::parse_text_tree(&self.tree_panel_text);
             }
             AgentEvent::TitleUpdate { title } => {
                 if title.is_empty() {
@@ -1488,6 +1808,50 @@ impl App {
                         self.scroll_offset = self.scroll_offset.saturating_sub(3);
                     }
                     MouseEventKind::Down(button) if button == crossterm::event::MouseButton::Left => {
+                        if let Some(target) = self.hit_map.hit_at(mouse.column, mouse.row).cloned() {
+                            match target {
+                                HitTarget::Thinking { msg_idx } => {
+                                    if let Some(msg) = self.messages.get_mut(msg_idx) {
+                                        msg.show_thinking = !msg.show_thinking;
+                                    }
+                                }
+                                HitTarget::Tool { msg_idx, tool_idx } => {
+                                    if let Some(block) = self
+                                        .messages
+                                        .get_mut(msg_idx)
+                                        .and_then(|m| m.tool_blocks.get_mut(tool_idx))
+                                    {
+                                        block.expanded = !block.expanded;
+                                    }
+                                }
+                                HitTarget::Toast => self.toast = None,
+                                HitTarget::ModalDismiss => {
+                                    if self.help_overlay.is_some()
+                                        || self.settings.is_some()
+                                        || self.palette_open
+                                    {
+                                        self.dismiss_overlays();
+                                    }
+                                }
+                                HitTarget::FleetRow { index } => {
+                                    if index < self.fleet_panel.rows.len()
+                                        && self.fleet_panel.rows[index].selectable()
+                                    {
+                                        self.fleet_panel.selection = index;
+                                        self.fleet_panel.expanded = true;
+                                        self.activate_city_selection();
+                                    }
+                                }
+                                HitTarget::OutputTab { index } => {
+                                    if index < self.tool_output_tabs.len() {
+                                        self.tool_output_tab = index;
+                                        self.show_repl_panel = true;
+                                    }
+                                }
+                                HitTarget::Help | HitTarget::PaletteItem { .. } => {}
+                            }
+                            return Ok(());
+                        }
                         let screen_row = mouse.row as usize;
                         let visible_start = (self.chat_area_y + 1) as usize;
                         if screen_row >= visible_start {
@@ -1525,6 +1889,20 @@ impl App {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     self.should_exit = true;
+                } else if key.code == KeyCode::Char('k')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    if self.palette_open {
+                        self.dismiss_overlays();
+                    } else {
+                        self.open_command_palette();
+                    }
+                } else if self.help_overlay.is_some() {
+                    self.handle_help_key(key);
+                } else if self.settings.is_some() {
+                    self.handle_settings_key(key);
+                } else if self.palette_open {
+                    self.handle_palette_key(key);
                 } else if self.pending_permission.is_some() {
                     self.handle_permission_key(key);
                 } else if self.pending_question.is_some() {
@@ -1533,6 +1911,9 @@ impl App {
                     match key.code {
                         KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             self.cycle_model();
+                        }
+                        KeyCode::Char('?') if self.input_mode == InputMode::Normal => {
+                            self.help_overlay = Some(HelpOverlay::default());
                         }
                         _ => match self.input_mode {
                             InputMode::Waiting => self.handle_waiting_key(key),
@@ -1575,6 +1956,18 @@ impl App {
                 let _ = self.command_tx.send(AppCommand::Abort);
                 self.status = "aborting...".to_string();
             }
+            KeyCode::Tab => {
+                self.cycle_tool_output_tab(1);
+            }
+            KeyCode::BackTab => {
+                self.cycle_tool_output_tab(-1);
+            }
+            KeyCode::Up | KeyCode::Char('k') if self.show_repl_panel => {
+                self.cycle_tool_output_tab(-1);
+            }
+            KeyCode::Down | KeyCode::Char('j') if self.show_repl_panel => {
+                self.cycle_tool_output_tab(1);
+            }
             KeyCode::Enter => {
                 if !self.input.trim().is_empty() {
                     let text = std::mem::take(&mut self.input);
@@ -1597,6 +1990,94 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn cycle_tool_output_tab(&mut self, delta: i32) {
+        if self.tool_output_tabs.is_empty() {
+            self.show_repl_panel = true;
+            self.status = "no tool outputs yet".into();
+            return;
+        }
+        self.show_repl_panel = true;
+        let n = self.tool_output_tabs.len() as i32;
+        let cur = self.tool_output_tab as i32;
+        self.tool_output_tab = ((cur + delta).rem_euclid(n)) as usize;
+        self.status = format!(
+            "console {}/{} · {}",
+            self.tool_output_tab + 1,
+            self.tool_output_tabs.len(),
+            self.tool_output_tabs[self.tool_output_tab].label
+        );
+    }
+
+    fn append_tool_tab_output(&mut self, name: &str, chunk: &str) {
+        if let Some(idx) = self
+            .tool_output_tabs
+            .iter()
+            .rposition(|t| t.name == name && !t.done)
+            .or_else(|| self.tool_output_tabs.iter().rposition(|t| t.name == name))
+        {
+            self.tool_output_tabs[idx].buffer.push_str(chunk);
+            Self::trim_panel_utf8(&mut self.tool_output_tabs[idx].buffer, 16_000);
+            self.tool_output_tab = idx;
+            self.show_repl_panel = true;
+        } else {
+            // Fallback single buffer if a tab was not opened.
+            self.repl_panel.push_str(chunk);
+            Self::trim_panel_utf8(&mut self.repl_panel, 16_000);
+            self.show_repl_panel = true;
+        }
+    }
+
+    /// Strip ANSI / control chars so ratatui never paints mid-escape garbage.
+    fn sanitize_console_text(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                // CSI / OSC-ish sequences: skip until letter or BEL
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    for d in chars.by_ref() {
+                        if d.is_ascii_alphabetic() || d == 'm' {
+                            break;
+                        }
+                    }
+                } else if chars.peek() == Some(&']') {
+                    chars.next();
+                    for d in chars.by_ref() {
+                        if d == '\u{7}' || d == '\n' {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            if c == '\r' {
+                continue;
+            }
+            if c == '\t' {
+                out.push_str("    ");
+                continue;
+            }
+            if c == '\n' || (c >= ' ' && c != '\u{7f}') {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    fn clip_console_line(s: &str, max_cols: usize) -> String {
+        if max_cols == 0 {
+            return String::new();
+        }
+        let count = s.chars().count();
+        if count <= max_cols {
+            return s.to_string();
+        }
+        let mut out: String = s.chars().take(max_cols.saturating_sub(1)).collect();
+        out.push('…');
+        out
     }
 
     fn push_system(&mut self, text: impl Into<String>) {
@@ -1941,6 +2422,43 @@ impl App {
         self.push_system(crate::fleet::format_city_board(highlight.as_deref()));
     }
 
+    fn toggle_city_panel(&mut self) {
+        self.show_fleet_panel = !self.show_fleet_panel;
+        if self.show_fleet_panel {
+            self.show_timeline_panel = false;
+            self.show_tree_panel = false;
+            self.fleet_panel.refresh();
+            self.push_system(
+                "City panel — WORKERS / WISHES / READY\n\
+                 ↑↓ select · Enter follow worker or inspect bead · x expand · /fleet up to spawn",
+            );
+        } else {
+            self.push_system("City panel hidden");
+        }
+    }
+
+    fn activate_city_selection(&mut self) {
+        match self.fleet_panel.selected_row().cloned() {
+            Some(CityRow::Worker { seat }) => {
+                let _ = self.handle_slash_command(&format!("/seat follow {}", seat.seat));
+            }
+            Some(CityRow::Wish { bead }) | Some(CityRow::Ready { bead }) => {
+                self.push_system(format!(
+                    "Bead {} [{}] {}\nstatus={} priority={}\n{}",
+                    bead.id,
+                    bead.kind.as_str(),
+                    bead.title,
+                    bead.status.as_str(),
+                    bead.priority,
+                    bead.notes.chars().take(240).collect::<String>()
+                ));
+            }
+            _ => {
+                self.push_system("Nothing selected — ↑↓ to a worker, wish, or ready bead.");
+            }
+        }
+    }
+
     /// Handle `/seat …` and shared fleet aliases. Returns true if handled.
     fn handle_seat_ops(&mut self, raw: &str) -> bool {
         let raw = raw.trim();
@@ -2041,12 +2559,12 @@ impl App {
             "/help" => {
                 self.push_system(format!(
                     "Commands:\n\
-                     /help /keys /clear /context [on|off] /commands /tree\n\
+                     /help /keys /settings /clear /context [on|off] /commands /tree\n\
                      /skills  /skill <name>  /prompt|/p <name> [args]  /reload\n\
                      /mode plan|ask|agent  /model [provider/model]  /provider|/login [name]\n\
                      /goal [condition|clear|pause|resume]  /theme [dark|light|forest]\n\
-                     /handoff  /seat [name|clear|list|caste|…]  /beads [ready]  /laurel <text>  /laurels\n\
-                     /worker [seat]  /marshal [assign …]  /city  /seat [follow|attach|…]  /fleet …\n\
+                     /handoff  /route <seat>  /seat […]  /beads [ready]  /laurel <text>\n\
+                     /worker [seat]  /marshal  /city  /fleet [panel|status|up|down]\n\
                      /detach  /mail [send|ack]  /wish …  /moot …  /brain remember|falsify <…>\n\
                      /compact  /new  /fork [@N] [label]  /timeline  /sessions\n\
                      /export [md|json|html]  /image [path]  /lsp [start|stop|status]  /skill-pack export|import\n\
@@ -2089,13 +2607,41 @@ impl App {
             "/theme" => {
                 if arg.is_empty() {
                     self.push_system(format!(
-                        "Current theme: {}\nUsage: /theme dark|light|forest",
+                        "Current theme: {}\nUsage: /theme dark|light|forest|auto",
                         self.theme_name.as_str()
                     ));
                 } else {
                     self.theme_name = ThemeName::parse(arg);
                     self.palette = Palette::for_theme(self.theme_name);
                     self.push_system(format!("Theme set to {}", self.theme_name.as_str()));
+                }
+            }
+            "/settings" => {
+                self.settings = Some(SettingsState::from_app(
+                    self.theme_name,
+                    self.mouse_enabled,
+                    self.toast_enabled,
+                    self.toast_sound,
+                    self.notify_mode.as_str(),
+                ));
+            }
+            "/route" | "/handoff-route" => {
+                // Continuity notes stay on /handoff; this routes control to another seat.
+                let mut parts = arg.split_whitespace();
+                let to = parts.next().unwrap_or("");
+                let reason = parts.collect::<Vec<_>>().join(" ");
+                if to.is_empty() {
+                    self.push_system("Usage: /route <seat> [reason]");
+                } else {
+                    match crate::agent::handoff::route_to_seat(
+                        None,
+                        to,
+                        if reason.is_empty() { "routed from TUI" } else { &reason },
+                        &self.allowed_transitions,
+                    ) {
+                        Ok(rec) => self.push_system(rec.format_block()),
+                        Err(e) => self.push_system(e),
+                    }
                 }
             }
             "/history" => {
@@ -2564,12 +3110,19 @@ impl App {
                 }
             }
             "/city" => {
-                self.show_city_board();
+                let raw = arg.trim().to_lowercase();
+                if raw == "board" || raw == "status" || raw == "text" {
+                    self.show_city_board();
+                } else {
+                    self.toggle_city_panel();
+                }
             }
             "/fleet" => {
                 let raw = arg.trim();
                 let lower = raw.to_lowercase();
-                if lower.is_empty() || lower == "status" {
+                if lower.is_empty() || lower == "panel" {
+                    self.toggle_city_panel();
+                } else if lower == "status" {
                     self.show_city_board();
                 } else if lower == "down" {
                     self.push_system(crate::fleet::fleet_down(None));
@@ -2867,16 +3420,26 @@ impl App {
                         for s in summaries.iter().take(20) {
                             let title = s.title.clone().unwrap_or_else(|| "(untitled)".to_string());
                             let fork = match (&s.parent_id, &s.branch_label) {
-                                (Some(p), Some(l)) => format!(" ↩{} [{}]", p, l),
-                                (Some(p), None) => format!(" ↩{}", p),
+                                (Some(p), Some(l)) => {
+                                    format!(" ↩{} [{}]", SessionStore::short_id(p), l)
+                                }
+                                (Some(p), None) => {
+                                    format!(" ↩{}", SessionStore::short_id(p))
+                                }
                                 _ => String::new(),
                             };
                             out.push_str(&format!(
                                 "  {}  {} msgs  {}  — {}{}\n",
-                                s.id, s.message_count, s.model, title, fork
+                                SessionStore::short_id(&s.id),
+                                s.message_count,
+                                s.model,
+                                title,
+                                fork
                             ));
                         }
-                        out.push_str("Resume: rs-agent -r <id> · Fork: /fork [label]");
+                        out.push_str(
+                            "Resume: rs-agent -r <id> · rs-agent -r latest · Fork: /fork [label]",
+                        );
                         self.push_system(out);
                     }
                 }
@@ -3166,7 +3729,14 @@ impl App {
                 }
             }
             "/tree" => {
-                self.show_tree_panel = !self.show_tree_panel;
+                self.show_fleet_panel = false;
+                self.show_timeline_panel = false;
+                if self.show_tree_panel && self.side_mode == SidePanelMode::Tree {
+                    self.show_tree_panel = false;
+                } else {
+                    self.show_tree_panel = true;
+                    self.side_mode = SidePanelMode::Tree;
+                }
                 let panel_note = if self.show_tree_panel { "shown" } else { "hidden" };
                 if self.tree_breadcrumb != "idle" {
                     self.push_system(format!(
@@ -3195,6 +3765,14 @@ impl App {
                     }
                 }
             }
+            "/output" => {
+                self.show_repl_panel = !self.show_repl_panel;
+                let n = self.tool_output_tabs.len();
+                self.push_system(format!(
+                    "Bottom console {} — {n} run(s). Tab / ↑↓ switch while waiting.",
+                    if self.show_repl_panel { "shown" } else { "hidden" }
+                ));
+            }
             _ => {
                 self.push_system(format!("Unknown command: {} (try /help)", cmd));
             }
@@ -3202,9 +3780,151 @@ impl App {
         true
     }
 
+    fn handle_help_key(&mut self, key: crossterm::event::KeyEvent) {
+        let Some(overlay) = self.help_overlay.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.help_overlay = None,
+            KeyCode::Backspace => {
+                overlay.query.pop();
+                overlay.selection = 0;
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                overlay.query.clear();
+                overlay.selection = 0;
+            }
+            KeyCode::Up => {
+                overlay.selection = overlay.selection.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                overlay.selection = overlay.selection.saturating_add(1);
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                overlay.query.push(c);
+                overlay.selection = 0;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_settings_key(&mut self, key: crossterm::event::KeyEvent) {
+        let Some(st) = self.settings.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.settings = None;
+            }
+            KeyCode::Enter => {
+                self.theme_name = st.theme;
+                self.palette = Palette::for_theme(self.theme_name);
+                self.toast_enabled = st.toast;
+                self.toast_sound = st.toast_sound;
+                self.notify_mode = NotifyMode::parse(&st.notify);
+                self.mouse_enabled = st.mouse_enabled;
+                self.settings = None;
+                self.push_system("Settings applied");
+            }
+            KeyCode::Left | KeyCode::BackTab => st.tab = st.tab.prev(),
+            KeyCode::Right | KeyCode::Tab => st.tab = st.tab.next(),
+            KeyCode::Char('1') if st.tab == settings::SettingsTab::Theme => {
+                st.theme = ThemeName::Dark;
+            }
+            KeyCode::Char('2') if st.tab == settings::SettingsTab::Theme => {
+                st.theme = ThemeName::Light;
+            }
+            KeyCode::Char('3') if st.tab == settings::SettingsTab::Theme => {
+                st.theme = ThemeName::Forest;
+            }
+            KeyCode::Char('m') if st.tab == settings::SettingsTab::Input => {
+                st.mouse_enabled = !st.mouse_enabled;
+            }
+            KeyCode::Char('t') if st.tab == settings::SettingsTab::Alerts => {
+                st.toast = !st.toast;
+            }
+            KeyCode::Char('s') if st.tab == settings::SettingsTab::Alerts => {
+                st.toast_sound = !st.toast_sound;
+            }
+            KeyCode::Char('n') if st.tab == settings::SettingsTab::Alerts => {
+                st.notify = match NotifyMode::parse(&st.notify) {
+                    NotifyMode::Off => "terminal".into(),
+                    NotifyMode::Terminal => "system".into(),
+                    NotifyMode::System => "off".into(),
+                };
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_palette_key(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.dismiss_overlays(),
+            KeyCode::Up => {
+                self.palette_selection = self.palette_selection.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                self.palette_selection = self.palette_selection.saturating_add(1);
+                if !self.palette_items.is_empty() {
+                    self.palette_selection = self
+                        .palette_selection
+                        .min(self.palette_items.len() - 1);
+                }
+            }
+            KeyCode::Backspace => {
+                self.palette_query.pop();
+                self.refresh_palette_items();
+            }
+            KeyCode::Enter => {
+                if let Some(cmd) = self.palette_items.get(self.palette_selection).cloned() {
+                    self.dismiss_overlays();
+                    let _ = self.handle_slash_command(&cmd);
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.palette_query.push(c);
+                self.refresh_palette_items();
+            }
+            _ => {}
+        }
+    }
+
     fn handle_normal_key(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Tab if !self.tool_output_tabs.is_empty() => {
+                self.cycle_tool_output_tab(1);
+                return;
+            }
+            KeyCode::BackTab if !self.tool_output_tabs.is_empty() => {
+                self.cycle_tool_output_tab(-1);
+                return;
+            }
+            _ => {}
+        }
+        if self.show_fleet_panel {
+            match key.code {
+                KeyCode::Up => {
+                    self.fleet_panel.move_sel(-1);
+                    return;
+                }
+                KeyCode::Down => {
+                    self.fleet_panel.move_sel(1);
+                    return;
+                }
+                KeyCode::Enter => {
+                    self.activate_city_selection();
+                    return;
+                }
+                KeyCode::Char('x') => {
+                    self.fleet_panel.expanded = !self.fleet_panel.expanded;
+                    return;
+                }
+                _ => {}
+            }
+        }
         if self.key_matches("insert", key) {
             self.input_mode = InputMode::Insert;
+            self.unseen_done = false;
             return;
         }
         if self.key_matches("quit", key) {
@@ -3231,7 +3951,15 @@ impl App {
             return;
         }
         if self.key_matches("toggle_tree", key) {
-            self.show_tree_panel = !self.show_tree_panel;
+            if self.show_tree_panel && !self.show_fleet_panel {
+                self.side_mode = self.side_mode.toggle();
+                self.status = format!("side · {}", self.side_mode.label());
+            } else {
+                self.show_fleet_panel = false;
+                self.show_timeline_panel = false;
+                self.show_tree_panel = true;
+                self.side_mode = SidePanelMode::Tree;
+            }
             return;
         }
         if self.show_timeline_panel {
@@ -3265,6 +3993,7 @@ impl App {
         }
         if self.key_matches("jump_bottom", key) {
             self.follow_bottom = true;
+            self.unseen_done = false;
             return;
         }
         // @ / # also work from normal mode (enter insert + open picker).
@@ -3417,6 +4146,11 @@ impl App {
 
         self.input_mode = InputMode::Waiting;
         self.queued_steers = 0;
+        if self.tool_in_progress.is_none() {
+            self.tool_output_tabs.clear();
+            self.tool_output_tab = 0;
+            self.repl_panel.clear();
+        }
 
         self.messages.push(ChatMessage {
             role: "user".to_string(),
@@ -3434,6 +4168,7 @@ impl App {
         });
 
         self.follow_bottom = true;
+        self.unseen_done = false;
         self.status = "thinking...".to_string();
         let _ = self.command_tx.send(AppCommand::Submit { text: expanded });
     }
@@ -4311,53 +5046,112 @@ impl App {
 
     fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
-        let mut constraints = vec![Constraint::Min(3)];
-        if self.show_repl_panel {
-            constraints.push(Constraint::Length(6));
-        }
-        constraints.push(Constraint::Length(3));
-        constraints.push(Constraint::Length(1));
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(constraints)
-            .split(area);
+        self.hit_map.clear();
+        lifecycle::set_focused(true);
 
-        let mut idx = 0;
-        let chat_area = chunks[idx];
-        idx += 1;
-        let repl_area = if self.show_repl_panel {
-            let a = chunks[idx];
-            idx += 1;
-            Some(a)
-        } else {
-            None
-        };
-        let input_area = chunks[idx];
-        idx += 1;
-        let status_area = chunks[idx];
+        let show_side =
+            self.show_fleet_panel || self.show_timeline_panel || self.show_tree_panel;
+        let show_repl = self.show_repl_panel || !self.tool_output_tabs.is_empty();
+        let view = compute_view(
+            area,
+            LayoutOpts {
+                show_repl,
+                show_side,
+                side_pct: if self.show_fleet_panel {
+                    34
+                } else if self.show_timeline_panel {
+                    32
+                } else {
+                    28
+                },
+                repl_height: if self.tool_output_tabs.len() > 1 { 9 } else { 7 },
+            },
+        );
 
-        if self.show_timeline_panel {
-            let hchunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-                .split(chat_area);
-            self.render_messages(frame, hchunks[0]);
-            self.render_timeline_panel(frame, hchunks[1]);
-        } else if self.show_tree_panel {
-            let hchunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-                .split(chat_area);
-            self.render_messages(frame, hchunks[0]);
-            self.render_tree_panel(frame, hchunks[1]);
-        } else {
-            self.render_messages(frame, chat_area);
+        self.render_header(frame, view.header);
+        if let Some(ref banner) = self.diagnostic_banner.clone() {
+            // Non-modal top strip under header
+            let y = view.header.y.saturating_add(view.header.height);
+            if y < area.bottom() {
+                let rect = Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: 1,
+                };
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        format!(" ! {banner}"),
+                        Style::default().fg(self.palette.warn).bg(self.palette.surface0),
+                    )),
+                    rect,
+                );
+            }
         }
-        if let Some(repl_area) = repl_area {
-            self.render_repl_panel(frame, repl_area);
+        // Turn bar when Deep Context active
+        if self.tree_breadcrumb != "idle" && !self.show_fleet_panel {
+            let bar = tree_view::turn_bar_line(&self.tree_breadcrumb, &self.palette);
+            // Drawn into chat top via messages; keep side tree rich.
+            let _ = bar;
         }
-        self.render_input(frame, input_area);
-        self.render_status(frame, status_area);
+        self.render_messages(frame, view.chat);
+        if let Some(side) = view.side {
+            if self.show_fleet_panel {
+                fleet_panel::render_city_panel(frame, side, &self.fleet_panel, &self.palette);
+                // Map selectable rows to click targets (rough 1-line-per-row after chrome).
+                let mut y = side.y.saturating_add(3);
+                for (i, row) in self.fleet_panel.rows.iter().enumerate() {
+                    match row {
+                        CityRow::Header { .. } => {
+                            y = y.saturating_add(2);
+                        }
+                        CityRow::Hint { .. } => {
+                            y = y.saturating_add(1);
+                        }
+                        CityRow::Worker { .. }
+                        | CityRow::Wish { .. }
+                        | CityRow::Ready { .. } => {
+                            self.hit_map.push_line(
+                                side.x,
+                                y,
+                                side.width,
+                                HitTarget::FleetRow { index: i },
+                            );
+                            y = y.saturating_add(1);
+                            if self.fleet_panel.expanded && i == self.fleet_panel.selection {
+                                y = y.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+            } else if self.show_timeline_panel || self.side_mode == SidePanelMode::Timeline {
+                self.render_timeline_panel(frame, side);
+            } else {
+                self.render_tree_panel(frame, side);
+            }
+        }
+        if let Some(repl) = view.repl {
+            self.render_repl_panel(frame, repl);
+        }
+        self.render_input(frame, view.input);
+        self.render_footer(frame, view.footer);
+
+        if let Some(ref t) = self.toast {
+            let ta = toast::toast_area(area);
+            toast::render_toast(frame, ta, t, &self.palette);
+            self.hit_map.push(ta, HitTarget::Toast);
+        }
+
+        let overlay = self.picker_active
+            || self.pending_permission.is_some()
+            || self.pending_question.is_some()
+            || self.help_overlay.is_some()
+            || self.settings.is_some()
+            || self.palette_open;
+        if overlay {
+            widgets::dim_background(frame, area);
+            self.hit_map.push(area, HitTarget::ModalDismiss);
+        }
         if self.picker_active {
             self.render_picker(frame, area);
         }
@@ -4367,32 +5161,216 @@ impl App {
         if self.pending_question.is_some() {
             self.render_question_prompt(frame, area);
         }
+        if let Some(ref ho) = self.help_overlay {
+            let entries = help::build_entries(&self.keys);
+            help::render_help(frame, area, ho, &entries, &self.palette);
+        }
+        if let Some(ref st) = self.settings {
+            settings::render_settings(frame, area, st, &self.palette);
+        }
+        if self.palette_open {
+            let height = (self.palette_items.len() as u16).clamp(3, 12).saturating_add(2);
+            let prect = widgets::centered_rect(area, 56, height);
+            help::render_palette_list(
+                frame,
+                prect,
+                "commands · Ctrl+K",
+                &self.palette_items,
+                self.palette_selection,
+                &self.palette,
+            );
+        }
+    }
+
+    fn session_ui_state(&self) -> SessionUiState {
+        SessionUiState::from_app(
+            self.pending_permission.is_some(),
+            self.pending_question.is_some(),
+            self.input_mode == InputMode::Waiting,
+            self.tool_in_progress.is_some(),
+            &self.status,
+            self.unseen_done,
+        )
+    }
+
+    fn render_header(&mut self, frame: &mut Frame, area: Rect) {
+        let state = self.session_ui_state();
+        let yolo = if self.approved {
+            "YOLO"
+        } else if self.auto_mode {
+            "AUTO"
+        } else if self.pending_permission.is_some() {
+            "ASK"
+        } else {
+            ""
+        };
+        let deep = self.tree_breadcrumb != "idle";
+        let session_short = SessionStore::short_id(&self.session_id).to_string();
+        let attach = self
+            .fleet_attach
+            .as_ref()
+            .map(|a| match a.phase {
+                FleetAttachPhase::Follow => format!("FOLLOW {}", a.seat),
+                FleetAttachPhase::Attaching => format!("ATTACHING {}", a.seat),
+                FleetAttachPhase::Attached => format!("ATTACHED {}", a.seat),
+                FleetAttachPhase::Inspect => format!("INSPECT {}", a.seat),
+            })
+            .unwrap_or_default();
+        let token_str = if self.token_limit > 0 {
+            let pct = self.token_used as f64 / self.token_limit as f64 * 100.0;
+            if self.near_limit {
+                format!(" ⚠{:.0}%", pct)
+            } else {
+                format!(
+                    " {:.1}K/{}K",
+                    self.token_used as f64 / 1000.0,
+                    self.token_limit / 1000
+                )
+            }
+        } else {
+            String::new()
+        };
+        let cost_str = crate::ai::token_count::format_cost_usd(
+            &self.model_name,
+            self.session_input_tokens,
+            self.session_output_tokens,
+        );
+        let line = status::render_header_line(
+            state,
+            &self.provider_name,
+            &self.model_name,
+            self.agent_mode.as_str(),
+            self.rlm_depth,
+            deep,
+            yolo,
+            &session_short,
+            self.session_title.as_deref(),
+            &self.goal_indicator,
+            &attach,
+            &token_str,
+            &cost_str,
+            area.width as usize,
+            &self.palette,
+        );
+        frame.render_widget(
+            Paragraph::new(line).style(Style::default().bg(self.palette.surface_dim)),
+            area,
+        );
+    }
+
+    fn render_footer(&mut self, frame: &mut Frame, area: Rect) {
+        let mut hints = format!(
+            " ^C quit · {} insert · /help · /keys",
+            self.keys.binding("insert")
+        );
+        if self.input_mode == InputMode::Waiting {
+            hints = " Esc abort · Tab console · Enter steer".to_string();
+            if self.queued_steers > 0 {
+                hints.push_str(&format!(" · queued:{}", self.queued_steers));
+            }
+            if self.tool_output_tabs.len() > 1 {
+                hints.push_str(&format!(
+                    " · out:{}/{}",
+                    self.tool_output_tab + 1,
+                    self.tool_output_tabs.len()
+                ));
+            }
+        } else if self.input_mode == InputMode::Question {
+            hints = " Enter answer · Esc cancel".to_string();
+        } else if self.pending_permission.is_some() {
+            hints = format!(
+                " [{}] once · [{}] path · [{}] always · [{}] deny",
+                self.keys.binding("perm_once"),
+                self.keys.binding("perm_path"),
+                self.keys.binding("perm_always"),
+                self.keys.binding("perm_deny"),
+            );
+        } else if self.input_mode == InputMode::Normal {
+            hints = self.keys.hint_line();
+        }
+
+        // Refresh beads at most every 2s (was every frame).
+        if self.beads_ready_cache.0.elapsed() >= Duration::from_secs(2) {
+            let n = crate::beads::list_ready(None)
+                .ok()
+                .map(|r| r.len())
+                .unwrap_or(0);
+            self.beads_ready_cache = (Instant::now(), n);
+        }
+        if self.beads_ready_cache.1 > 0 {
+            hints.push_str(&format!(" · beads:{} ready", self.beads_ready_cache.1));
+        }
+        if !self.lsp_summary.is_empty() {
+            hints.push(' ');
+            hints.push_str(&self.lsp_summary);
+        }
+
+        let status_color = if self.near_limit {
+            self.palette.danger
+        } else if self.status == "ready" {
+            self.palette.ok
+        } else {
+            self.palette.warn
+        };
+        let spinner = self
+            .tool_in_progress
+            .as_ref()
+            .map(|(name, started)| {
+                const FRAMES: [char; 4] = ['◐', '◓', '◑', '◒'];
+                let elapsed = started.elapsed();
+                let frame = FRAMES[(elapsed.as_millis() / 120) as usize % FRAMES.len()];
+                format!(" {frame} {name} ({:.1}s)", elapsed.as_secs_f64())
+            })
+            .unwrap_or_default();
+
+        let line = status::render_footer_line(
+            &hints,
+            &self.status,
+            &spinner,
+            status_color,
+            &self.palette,
+        );
+        frame.render_widget(Paragraph::new(line), area);
     }
 
     fn render_tree_panel(&mut self, frame: &mut Frame, area: Rect) {
-        let style = Style::default().fg(self.palette.tool);
-        let max_w = (area.width as usize).saturating_sub(2).max(8);
-        let lines: Vec<Line> = self
-            .tree_panel_text
-            .lines()
-            .map(|l| {
-                let one: String = l.chars().take(max_w).collect();
-                Line::from(Span::styled(one, style))
-            })
-            .collect();
-        let panel = Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Call Tree ")
-                .border_style(style),
-        );
+        let max_w = (area.width as usize).saturating_sub(4).max(8);
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(tree_view::turn_bar_line(&self.tree_breadcrumb, &self.palette));
+        lines.push(Line::from(Span::styled(
+            format!(
+                " [{}|{}] ",
+                SidePanelMode::Tree.label(),
+                SidePanelMode::Timeline.label()
+            ),
+            Style::default().fg(self.palette.overlay0),
+        )));
+        lines.push(Line::from(Span::styled(
+            "─".repeat(max_w.min(40)),
+            Style::default().fg(self.palette.border),
+        )));
+        if self.tree_nodes.is_empty() {
+            self.tree_nodes = tree_view::parse_text_tree(&self.tree_panel_text);
+        }
+        lines.extend(tree_view::render_nodes(
+            &self.tree_nodes,
+            &self.palette,
+            max_w,
+            None,
+        ));
+        let panel = Paragraph::new(lines).block(widgets::panel_block(
+            "Call Tree",
+            &self.palette,
+            true,
+        ));
         frame.render_widget(panel, area);
     }
 
     fn render_timeline_panel(&mut self, frame: &mut Frame, area: Rect) {
         let style = Style::default().fg(self.palette.muted);
         let sel = Style::default()
-            .fg(self.palette.user)
+            .fg(self.palette.highlight_fg)
+            .bg(self.palette.highlight_bg)
             .add_modifier(Modifier::BOLD);
         let items: Vec<ListItem> = if self.timeline_entries.is_empty() {
             vec![ListItem::new(Line::from(Span::styled(
@@ -4411,12 +5389,11 @@ impl App {
                 })
                 .collect()
         };
-        let list = List::new(items).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Timeline (Enter=fork) ")
-                .border_style(Style::default().fg(self.palette.tool)),
-        );
+        let list = List::new(items).block(widgets::panel_block(
+            "Timeline · Enter fork",
+            &self.palette,
+            true,
+        ));
         frame.render_widget(list, area);
     }
 
@@ -4438,20 +5415,73 @@ impl App {
     }
 
     fn render_repl_panel(&mut self, frame: &mut Frame, area: Rect) {
-        let style = Style::default().fg(self.palette.muted);
+        use ratatui::widgets::Clear;
+
+        // Erase previous frame so long lines / side-panel thrash cannot bleed.
+        frame.render_widget(Clear, area);
+
+        let inner_w = (area.width as usize).saturating_sub(2).max(8);
         let visible_rows = (area.height as usize).saturating_sub(2).max(1);
-        let all_lines: Vec<&str> = self.repl_panel.lines().collect();
+
+        let title = if self.tool_output_tabs.is_empty() {
+            "Console".to_string()
+        } else {
+            let mut parts = Vec::new();
+            for (i, tab) in self.tool_output_tabs.iter().enumerate().take(6) {
+                let on = i == self.tool_output_tab;
+                let state = if tab.done { "✓" } else { "●" };
+                if on {
+                    parts.push(format!("[{state}{}]", tab.label));
+                } else {
+                    parts.push(format!(" {state}{} ", tab.label));
+                }
+            }
+            if self.tool_output_tabs.len() > 6 {
+                parts.push("…".into());
+            }
+            format!("Console · Tab {}", parts.join(""))
+        };
+        // Cap title so the border never overflows the terminal width.
+        let title = Self::clip_console_line(&title, inner_w.saturating_sub(2));
+
+        let body = self
+            .tool_output_tabs
+            .get(self.tool_output_tab)
+            .map(|t| t.buffer.as_str())
+            .filter(|b| !b.is_empty())
+            .unwrap_or(self.repl_panel.as_str());
+
+        let all_lines: Vec<&str> = body.lines().collect();
         let start = all_lines.len().saturating_sub(visible_rows);
+        let style = Style::default()
+            .fg(self.palette.overlay1)
+            .bg(self.palette.panel_bg);
         let lines: Vec<Line> = all_lines[start..]
             .iter()
-            .map(|l| Line::from(Span::styled(l.to_string(), style)))
+            .map(|l| {
+                Line::from(Span::styled(
+                    Self::clip_console_line(l, inner_w),
+                    style,
+                ))
+            })
             .collect();
-        let panel = Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" REPL ")
-                .border_style(Style::default().fg(self.palette.tool)),
-        );
+
+        // Tab hit targets on the title row (approx).
+        for i in 0..self.tool_output_tabs.len().min(6) {
+            self.hit_map.push_line(
+                area.x.saturating_add(2 + (i as u16).saturating_mul(10)),
+                area.y,
+                10,
+                HitTarget::OutputTab { index: i },
+            );
+        }
+
+        let panel = Paragraph::new(lines)
+            .style(Style::default().bg(self.palette.panel_bg))
+            .block(
+                widgets::panel_block(&title, &self.palette, true)
+                    .style(Style::default().bg(self.palette.panel_bg).fg(self.palette.text)),
+            );
         frame.render_widget(panel, area);
     }
 
@@ -4492,112 +5522,178 @@ impl App {
 
     fn render_messages(&mut self, frame: &mut Frame, area: Rect) {
         self.chat_area_y = area.y;
-        let max_width = (area.width as usize).saturating_sub(2).max(20);
+        let max_width = (area.width as usize).saturating_sub(3).max(20);
+        let md = MarkdownStyle::from_palette(&self.palette);
+        let syn = self.theme_name.syntect_theme();
         let mut lines: Vec<Line> = Vec::new();
         self.thinking_targets.clear();
         self.tool_targets.clear();
         for (msg_idx, msg) in self.messages.iter().enumerate() {
-            let (prefix, color) = match msg.role.as_str() {
-                "system" => ("◆ ", self.palette.system),
-                "user" => ("▶ ", self.palette.user),
-                "assistant" => ("▸ ", self.palette.assistant),
-                "tool" => ("⚙ ", self.palette.tool),
-                _ => ("  ", self.palette.text),
+            // Conductor EventRow-style role rail
+            let (rail, label, color) = match msg.role.as_str() {
+                "system" => ("│", "system", self.palette.system),
+                "user" => ("┃", "you", self.palette.user),
+                "assistant" => ("┃", "agent", self.palette.assistant),
+                "tool" => ("│", "tool", self.palette.tool),
+                _ => ("│", "", self.palette.text),
             };
-            let bold_prefix = Style::default().fg(color).add_modifier(Modifier::BOLD);
+            let rail_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
 
-            // Render order: thinking → tools → response text, so the
-            // final answer sits at the bottom of the turn (tools above).
+            if msg.role == "user" || msg.role == "system" {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{rail} "), rail_style),
+                    Span::styled(
+                        format!("{label} "),
+                        Style::default()
+                            .fg(color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
+
+            // Render order: thinking → tools → response text
             if let Some(ref thinking) = msg.thinking {
                 if !thinking.is_empty() {
                     if msg.show_thinking {
                         let think_style = Style::default()
-                            .fg(self.palette.muted)
+                            .fg(self.palette.overlay0)
                             .add_modifier(Modifier::ITALIC | Modifier::UNDERLINED);
                         let line_idx = lines.len();
                         self.thinking_targets.push((line_idx, msg_idx));
-                        let header = Line::from(Span::styled(
-                            "🧠 thinking (click to hide)",
-                            think_style,
-                        ));
+                        let header = Line::from(vec![
+                            Span::styled("│ ".to_string(), Style::default().fg(self.palette.overlay0)),
+                            Span::styled("thinking · click to hide".to_string(), think_style),
+                        ]);
                         lines.extend(Self::wrap_line(&header, max_width));
-                        let body_style = Style::default().fg(self.palette.muted).add_modifier(Modifier::ITALIC);
-                        for raw_line in render_markdown(thinking, self.theme_name.syntect_theme()) {
-                            let mut styled_spans = Vec::new();
+                        let body_style = Style::default()
+                            .fg(self.palette.overlay1)
+                            .add_modifier(Modifier::ITALIC);
+                        for raw_line in render_markdown(thinking, syn, md) {
+                            let mut styled_spans = vec![Span::styled(
+                                "│ ".to_string(),
+                                Style::default().fg(self.palette.overlay0),
+                            )];
                             for span in raw_line.spans {
                                 styled_spans.push(Span::styled(span.content, body_style));
                             }
                             lines.extend(Self::wrap_line(&Line::from(styled_spans), max_width));
                         }
                     } else {
-                        let clickable = Style::default().fg(self.palette.muted).add_modifier(Modifier::UNDERLINED);
+                        let clickable = Style::default()
+                            .fg(self.palette.overlay0)
+                            .add_modifier(Modifier::UNDERLINED);
                         let line_idx = lines.len();
                         self.thinking_targets.push((line_idx, msg_idx));
-                        let preview_budget = max_width.saturating_sub(4).max(8);
+                        let preview_budget = max_width.saturating_sub(14).max(8);
                         let preview: String = thinking.chars().take(preview_budget).collect();
-                        let header = Line::from(vec![Span::styled(
-                            format!("💭 {}", preview),
-                            clickable,
-                        )]);
+                        let header = Line::from(vec![
+                            Span::styled("│ ".to_string(), Style::default().fg(self.palette.overlay0)),
+                            Span::styled(format!("💭 {preview}"), clickable),
+                        ]);
                         lines.extend(Self::wrap_line(&header, max_width));
                     }
                 }
             }
 
             for (tool_idx, block) in msg.tool_blocks.iter().enumerate() {
-                let icon = if block.is_error { "⚠" } else { "⚙" };
-                let color = if block.is_error { self.palette.danger } else { self.palette.tool };
+                let (icon, color) = if block.is_error {
+                    ("×", self.palette.state_blocked)
+                } else {
+                    ("✓", self.palette.tool)
+                };
                 if block.expanded {
-                    let header_style = Style::default().fg(color).add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+                    let header_style = Style::default()
+                        .fg(color)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
                     let line_idx = lines.len();
                     self.tool_targets.push((line_idx, msg_idx, tool_idx));
-                    let header = Line::from(Span::styled(
-                        format!("{} {} (click/e to collapse)", icon, block.name),
-                        header_style,
-                    ));
+                    let header = Line::from(vec![
+                        Span::styled(format!("{icon} "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            format!("{} · collapse", block.name),
+                            header_style,
+                        ),
+                    ]);
                     lines.extend(Self::wrap_line(&header, max_width));
-                    let body_style = Style::default().fg(if block.is_error { self.palette.danger } else { self.palette.muted });
-                    for raw_line in render_markdown(&block.full, self.theme_name.syntect_theme()) {
-                        let mut styled_spans = Vec::new();
-                        for span in raw_line.spans {
-                            styled_spans.push(Span::styled(span.content, body_style));
+                    for raw_line in render_markdown(&block.full, syn, md) {
+                        // Keep syntax highlight (don't wipe to muted).
+                        let mut styled = vec![Span::styled(
+                            "  ",
+                            Style::default(),
+                        )];
+                        if block.is_error {
+                            for span in raw_line.spans {
+                                styled.push(Span::styled(
+                                    span.content,
+                                    Style::default().fg(self.palette.danger),
+                                ));
+                            }
+                        } else {
+                            styled.extend(raw_line.spans);
                         }
-                        lines.extend(Self::wrap_line(&Line::from(styled_spans), max_width));
+                        lines.extend(Self::wrap_line(&Line::from(styled), max_width));
                     }
                 } else {
-                    let clickable = Style::default().fg(color).add_modifier(Modifier::UNDERLINED);
+                    let clickable = Style::default().fg(color);
                     let line_idx = lines.len();
                     self.tool_targets.push((line_idx, msg_idx, tool_idx));
-                    // Keep the collapsed summary within the chat width so it
-                    // cannot bleed into the input/status bars below.
-                    let suffix = "… (click/e to expand)";
-                    let fixed = icon.chars().count() + 1 + block.name.chars().count() + 3 + suffix.chars().count();
+                    let suffix = " …";
+                    let fixed = icon.chars().count()
+                        + 1
+                        + block.name.chars().count()
+                        + 3
+                        + suffix.chars().count();
                     let preview_budget = max_width.saturating_sub(fixed).max(8);
                     let preview: String = block.preview.chars().take(preview_budget).collect();
-                    let header = Line::from(vec![Span::styled(
-                        format!("{} {} — {}{}", icon, block.name, preview, suffix),
-                        clickable,
-                    )]);
+                    let header = Line::from(vec![
+                        Span::styled(
+                            format!("{icon} "),
+                            Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!("{}  ", block.name),
+                            Style::default()
+                                .fg(color)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!("{preview}{suffix}"),
+                            clickable.add_modifier(Modifier::DIM),
+                        ),
+                    ]);
                     lines.extend(Self::wrap_line(&header, max_width));
                 }
             }
 
             if !msg.text.is_empty() {
-                let rendered = render_markdown(&msg.text, self.theme_name.syntect_theme());
+                let rendered = render_markdown(&msg.text, syn, md);
                 for (i, raw_line) in rendered.into_iter().enumerate() {
                     let mut line = raw_line;
-                    if i == 0 {
-                        line.spans.insert(0, Span::styled(prefix, bold_prefix));
+                    if i == 0 && msg.role == "assistant" {
+                        line.spans.insert(
+                            0,
+                            Span::styled(format!("{rail} "), rail_style),
+                        );
+                    } else if msg.role == "user" || msg.role == "system" {
+                        line.spans.insert(
+                            0,
+                            Span::styled(format!("{rail} "), rail_style),
+                        );
                     }
                     lines.extend(Self::wrap_line(&line, max_width));
                 }
-            } else if msg.role != "assistant"
-                || (msg.thinking.as_ref().map(|t| t.is_empty()).unwrap_or(true)
-                    && msg.tool_blocks.is_empty())
+            } else if msg.role == "assistant"
+                && msg.thinking.as_ref().map(|t| t.is_empty()).unwrap_or(true)
+                && msg.tool_blocks.is_empty()
+                && self.input_mode == InputMode::Waiting
             {
-                // Preserve empty non-assistant rows / placeholder assistant rows
-                // that have neither thinking nor tools yet.
-                lines.push(Line::from(Span::styled(prefix, bold_prefix)));
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{rail} "), rail_style),
+                    Span::styled(
+                        "…".to_string(),
+                        Style::default().fg(self.palette.overlay0),
+                    ),
+                ]));
             }
 
             lines.push(Line::from(""));
@@ -4611,36 +5707,25 @@ impl App {
         let start = self.scroll_offset.min(total.saturating_sub(inner_height));
         let visible_lines: Vec<Line> = lines.into_iter().skip(start).collect();
 
-        let chat = Paragraph::new(visible_lines)
-            .block(
-                Block::default()
-                    .borders(Borders::TOP)
-                    .title(" Chat ")
-                    .title_alignment(ratatui::layout::Alignment::Center),
-            );
+        let chat = Paragraph::new(visible_lines).block(
+            Block::default()
+                .borders(Borders::NONE)
+                .style(Style::default().fg(self.palette.text)),
+        );
 
         frame.render_widget(chat, area);
     }
 
     fn render_input(&mut self, frame: &mut Frame, area: Rect) {
-        let mode_indicator = match self.input_mode {
-            InputMode::Normal => " NORMAL ",
-            InputMode::Insert => " INSERT ",
-            InputMode::Waiting => " WAITING ",
-            InputMode::ApiKey => " API KEY ",
-            InputMode::Question => " QUESTION ",
-        };
-
-        let border_style = match self.input_mode {
-            InputMode::Insert => Style::default().fg(self.palette.user),
-            InputMode::Waiting | InputMode::ApiKey | InputMode::Question => {
-                Style::default().fg(self.palette.warn)
-            }
-            _ => Style::default().fg(self.palette.border),
+        let (mode_label, border_color) = match self.input_mode {
+            InputMode::Normal => ("normal", self.palette.border),
+            InputMode::Insert => ("▸", self.palette.accent),
+            InputMode::Waiting => ("working", self.palette.state_working),
+            InputMode::ApiKey => ("api key", self.palette.warn),
+            InputMode::Question => ("answer", self.palette.state_blocked),
         };
 
         let display_text = if self.input_mode == InputMode::ApiKey {
-            // Mask the key in the input bar (dots), keep length for cursor.
             "•".repeat(self.input.chars().count())
         } else if self.picker_active {
             match self.picker_mode {
@@ -4657,20 +5742,22 @@ impl App {
             self.input.clone()
         };
 
-        let input = Paragraph::new(display_text.as_str())
-            .style(match self.input_mode {
-                InputMode::Waiting | InputMode::ApiKey | InputMode::Question => {
-                    Style::default().fg(self.palette.warn)
-                }
-                _ => Style::default().fg(self.palette.text),
-            })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(mode_indicator)
-                    .border_style(border_style),
+        let placeholder = if display_text.is_empty() && self.input_mode == InputMode::Insert {
+            Span::styled(
+                " message, /command, @file, #dir…",
+                Style::default().fg(self.palette.overlay0),
             )
-            ;
+        } else {
+            Span::styled(display_text.clone(), Style::default().fg(self.palette.text))
+        };
+
+        let input = Paragraph::new(Line::from(placeholder)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {mode_label} "))
+                .border_style(Style::default().fg(border_color))
+                .style(Style::default().bg(self.palette.surface_dim)),
+        );
 
         frame.render_widget(input, area);
 
@@ -4681,177 +5768,21 @@ impl App {
             let cursor_len = if self.picker_active {
                 match self.picker_mode {
                     PickerMode::File | PickerMode::Dir => {
-                        self.picker_prefix.len() + 1 + self.picker_query.len()
+                        self.picker_prefix.chars().count() + 1 + self.picker_query.chars().count()
                     }
                     PickerMode::Skill
                     | PickerMode::Prompt
                     | PickerMode::Model
                     | PickerMode::Provider => {
-                        self.picker_prefix.len() + self.picker_query.len()
+                        self.picker_prefix.chars().count() + self.picker_query.chars().count()
                     }
                 }
             } else {
-                self.input.len()
+                self.input.chars().count()
             };
             let x = (cursor_len as u16 + 1).min(area.width.max(1).saturating_sub(2));
             frame.set_cursor_position(ratatui::layout::Position::new(area.x + x, area.y + 1));
         }
-    }
-
-    fn render_status(&mut self, frame: &mut Frame, area: Rect) {
-        let status_color = if self.near_limit {
-            self.palette.danger
-        } else if self.status == "ready" {
-            self.palette.ok
-        } else {
-            self.palette.warn
-        };
-
-        let token_str = if self.token_limit > 0 {
-            let pct = self.token_used as f64 / self.token_limit as f64 * 100.0;
-            if self.near_limit {
-                format!(" ⚠ {:.0}%", pct)
-            } else {
-                format!(" {:.1}K/{}K", self.token_used as f64 / 1000.0, self.token_limit / 1000)
-            }
-        } else {
-            String::new()
-        };
-        let cost_str = crate::ai::token_count::format_cost_usd(
-            &self.model_name,
-            self.session_input_tokens,
-            self.session_output_tokens,
-        );
-
-        let mut hints = String::from(" ^C quit");
-        if self.input_mode == InputMode::Waiting {
-            hints.push_str(" · Esc abort · Enter steer");
-            if self.queued_steers > 0 {
-                hints.push_str(&format!(" · queued:{}", self.queued_steers));
-            }
-        } else if self.input_mode == InputMode::Question {
-            hints.push_str(" · Enter answer · Esc cancel");
-        } else if self.pending_permission.is_some() {
-            hints.push_str(" · ASK: a once · p path · t always · d deny");
-        }
-        let yolo = if self.approved {
-            " YOLO"
-        } else if self.auto_mode {
-            " AUTO"
-        } else if self.pending_permission.is_some() {
-            " ASK"
-        } else {
-            ""
-        };
-        let deep = if self.tree_breadcrumb != "idle" {
-            " [D]"
-        } else {
-            ""
-        };
-        let lsp = if self.lsp_summary.is_empty() {
-            String::new()
-        } else {
-            self.lsp_summary.clone()
-        };
-        let title_str = self
-            .session_title
-            .as_ref()
-            .map(|t| format!(" \"{}\"", t.chars().take(40).collect::<String>()))
-            .unwrap_or_default();
-        let goal_chip = if self.goal_indicator.is_empty() {
-            String::new()
-        } else {
-            format!(" {}", self.goal_indicator)
-        };
-        let beads_chip = crate::beads::list_ready(None)
-            .ok()
-            .filter(|r| !r.is_empty())
-            .map(|r| format!(" beads:{} ready", r.len()))
-            .unwrap_or_default();
-        let attach_chip = self
-            .fleet_attach
-            .as_ref()
-            .map(|a| match a.phase {
-                FleetAttachPhase::Follow => format!(" FOLLOW {}", a.seat),
-                FleetAttachPhase::Attaching => format!(" ATTACHING {}", a.seat),
-                FleetAttachPhase::Attached => format!(" ATTACHED {}", a.seat),
-                FleetAttachPhase::Inspect => format!(" INSPECT {}", a.seat),
-            })
-            .unwrap_or_default();
-        let meta = format!(
-            " {}/{} · {} · d{}{}{}{} [{}]{}{}{}{} | {}",
-            self.provider_name,
-            self.model_name,
-            self.agent_mode.as_str(),
-            self.rlm_depth,
-            yolo,
-            deep,
-            lsp,
-            self.session_id,
-            title_str,
-            goal_chip,
-            beads_chip,
-            attach_chip,
-            self.tree_breadcrumb
-        );
-
-        let spinner = self
-            .tool_in_progress
-            .as_ref()
-            .map(|(name, started)| {
-                const FRAMES: [char; 4] = ['|', '/', '-', '\\'];
-                let elapsed = started.elapsed();
-                let frame = FRAMES[(elapsed.as_millis() / 120) as usize % FRAMES.len()];
-                format!(" {} {} ({:.1}s)", frame, name, elapsed.as_secs_f64())
-            })
-            .unwrap_or_default();
-
-        // Prefer truncating the middle meta (provider/session/title) so hints
-        // and the live status/tokens stay visible within `area.width`.
-        let max_w = area.width as usize;
-        let sep = " | ";
-        let right = format!("{}{}{}{}", self.status, spinner, token_str, cost_str);
-        let right_w = right.chars().count();
-        let hints_w = hints.chars().count();
-        let budget_for_meta = max_w
-            .saturating_sub(hints_w)
-            .saturating_sub(sep.chars().count())
-            .saturating_sub(right_w);
-        let meta_display = if budget_for_meta == 0 {
-            String::new()
-        } else if meta.chars().count() > budget_for_meta {
-            let keep = budget_for_meta.saturating_sub(1);
-            let truncated: String = meta.chars().take(keep).collect();
-            format!("{truncated}…")
-        } else {
-            meta
-        };
-        let sep_display = if meta_display.is_empty() {
-            String::new()
-        } else {
-            sep.to_string()
-        };
-
-        let status = Line::from(vec![
-            Span::styled(hints, Style::default().fg(self.palette.muted)),
-            Span::styled(meta_display, Style::default().fg(self.palette.accent)),
-            Span::styled(sep_display, Style::default().fg(self.palette.muted)),
-            Span::styled(&self.status, Style::default().fg(status_color)),
-            Span::styled(
-                spinner,
-                Style::default().fg(self.palette.warn).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                token_str,
-                Style::default().fg(if self.near_limit {
-                    self.palette.danger
-                } else {
-                    self.palette.muted
-                }),
-            ),
-            Span::styled(cost_str, Style::default().fg(self.palette.muted)),
-        ]);
-        frame.render_widget(Paragraph::new(status), area);
     }
 
     fn handle_permission_key(&mut self, key: crossterm::event::KeyEvent) {
@@ -4900,16 +5831,21 @@ impl App {
         } else {
             (self.picker_results.len() as u16).min(10).max(1)
         };
-        let picker_y = area.height.saturating_sub(4 + picker_height + 1);
+        let width = if self.picker_mode == PickerMode::Provider {
+            96
+        } else {
+            72
+        }
+        .min(area.width.saturating_sub(2));
+        let height = picker_height + 2;
+        // Anchor near input (bottom) like a command palette
         let picker_area = Rect {
             x: area.x + 1,
-            y: area.y + picker_y,
-            width: area.width.saturating_sub(2).min(if self.picker_mode == PickerMode::Provider {
-                96
-            } else {
-                72
-            }),
-            height: picker_height + 2,
+            y: area
+                .y
+                .saturating_add(area.height.saturating_sub(height + 4)),
+            width,
+            height,
         };
 
         let items: Vec<ListItem> = if empty {
@@ -4933,7 +5869,7 @@ impl App {
                             .bg(self.palette.highlight_bg)
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(self.palette.accent)
+                        Style::default().fg(self.palette.subtext)
                     };
                     ListItem::new(path.as_str()).style(style)
                 })
@@ -4941,20 +5877,25 @@ impl App {
         };
 
         let title = match self.picker_mode {
-            PickerMode::File => " Files (@)  type to filter · Enter select · Esc cancel ",
-            PickerMode::Dir => " Directories (#)  type to filter · Enter select · Esc cancel ",
-            PickerMode::Skill => " Skills ",
-            PickerMode::Prompt => " Templates ",
-            PickerMode::Model => " Models ",
-            PickerMode::Provider => {
-                " Providers  Enter = switch or connect · paste key if needed · Esc cancel "
-            }
+            PickerMode::File => "Files · Enter · Esc",
+            PickerMode::Dir => "Directories · Enter · Esc",
+            PickerMode::Skill => "Skills",
+            PickerMode::Prompt => "Templates",
+            PickerMode::Model => "Models",
+            PickerMode::Provider => "Providers · Enter connect · Esc",
         };
+        use ratatui::widgets::Clear;
+        frame.render_widget(Clear, picker_area);
         let list = List::new(items).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(title)
-                .border_style(Style::default().fg(self.palette.accent)),
+                .title(format!(" {title} "))
+                .border_style(
+                    Style::default()
+                        .fg(self.palette.accent)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .style(Style::default().bg(self.palette.panel_bg)),
         );
 
         frame.render_widget(list, picker_area);
@@ -5002,22 +5943,24 @@ impl App {
         let input_lines = Self::format_permission_input(&pending.request.tool_input, 10, 100);
 
         let (border_color, title) = if is_dangerous {
-            (self.palette.danger, " ⚠ DANGEROUS — Permission ")
+            (self.palette.state_blocked, "blocked · dangerous")
         } else {
-            (self.palette.warn, " Permission ")
+            (self.palette.state_working, "blocked · permission")
         };
 
         let mut text = vec![Line::from(Span::styled(
-            format!(" ⚠  {} requires approval", tool_name),
+            format!(" {} needs approval", tool_name),
             Style::default()
-                .fg(if is_dangerous { self.palette.danger } else { self.palette.warn })
+                .fg(border_color)
                 .add_modifier(Modifier::BOLD),
         ))];
 
         if let Some(reason) = danger_reason {
             text.push(Line::from(Span::styled(
-                format!(" ⚠ DANGEROUS: {}", reason),
-                Style::default().fg(self.palette.danger).add_modifier(Modifier::BOLD),
+                format!(" {}", reason),
+                Style::default()
+                    .fg(self.palette.state_blocked)
+                    .add_modifier(Modifier::BOLD),
             )));
         }
 
@@ -5025,14 +5968,14 @@ impl App {
         for line in &input_lines {
             text.push(Line::from(Span::styled(
                 format!(" {}", line),
-                Style::default().fg(self.palette.text),
+                Style::default().fg(self.palette.subtext),
             )));
         }
 
         if let Some(diff) = pending.request.diff_preview.as_deref() {
             text.push(Line::from(""));
             text.push(Line::from(Span::styled(
-                " Diff preview:",
+                " Diff",
                 Style::default()
                     .fg(self.palette.accent)
                     .add_modifier(Modifier::BOLD),
@@ -5052,48 +5995,34 @@ impl App {
             }
         }
 
-        text.push(Line::from(Span::styled(
-            " Snapshot will track this file — /revert restores the last turn.",
-            Style::default().fg(self.palette.muted),
-        )));
-
         text.push(Line::from(""));
-        text.push(Line::from(Span::styled(
-            format!(
-                " [{}] once   [{}] path allow   [{}] always (project)   [{}] deny ",
-                self.keys.binding("perm_once"),
-                self.keys.binding("perm_path"),
-                self.keys.binding("perm_always"),
-                self.keys.binding("perm_deny"),
-            ),
-            Style::default().fg(self.palette.muted),
-        )));
+        text.push(widgets::action_hints(
+            &[
+                (self.keys.binding("perm_once"), "once"),
+                (self.keys.binding("perm_path"), "path"),
+                (self.keys.binding("perm_always"), "always"),
+                (self.keys.binding("perm_deny"), "deny"),
+            ],
+            &self.palette,
+        ));
         if let Some(path) = extract_tool_path(&pending.request.tool_input) {
             let prefix = path_allow_prefix(&path);
             text.push(Line::from(Span::styled(
-                format!(" path allow → {} under {}", pending.request.tool_name, prefix),
-                Style::default().fg(self.palette.muted),
+                format!(" path → {} under {}", pending.request.tool_name, prefix),
+                Style::default().fg(self.palette.overlay0),
             )));
         }
 
         let prompt_height = (text.len() as u16 + 2).min(area.height.saturating_sub(4).max(3));
-        let prompt_y = area.height.saturating_sub(4 + prompt_height + 2);
-        let prompt_area = Rect {
-            x: area.x + 2,
-            y: area.y + prompt_y,
-            width: area.width.saturating_sub(4).min(90),
-            height: prompt_height,
-        };
-
-        let paragraph = Paragraph::new(text)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .border_style(Style::default().fg(border_color)),
-            );
-
-        frame.render_widget(paragraph, prompt_area);
+        let prompt_area = widgets::centered_rect(area, 90, prompt_height);
+        widgets::render_modal_shell(
+            frame,
+            prompt_area,
+            title,
+            border_color,
+            &self.palette,
+            text,
+        );
     }
 
     fn handle_question_key(&mut self, key: crossterm::event::KeyEvent) {
@@ -5142,48 +6071,46 @@ impl App {
 
         let mut text = vec![
             Line::from(Span::styled(
-                " Question ",
-                Style::default()
-                    .fg(self.palette.warn)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
                 format!(" {}", pending.request.question),
-                Style::default().fg(self.palette.text),
+                Style::default()
+                    .fg(self.palette.text)
+                    .add_modifier(Modifier::BOLD),
             )),
         ];
         if !pending.request.options.is_empty() {
             text.push(Line::from(""));
             for (i, opt) in pending.request.options.iter().enumerate() {
-                text.push(Line::from(Span::styled(
-                    format!("  {}) {}", i + 1, opt),
-                    Style::default().fg(self.palette.accent),
-                )));
+                text.push(Line::from(vec![
+                    Span::styled(
+                        format!(" {} ", i + 1),
+                        Style::default()
+                            .fg(self.palette.contrast_on_accent())
+                            .bg(self.palette.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(" {opt}"),
+                        Style::default().fg(self.palette.subtext),
+                    ),
+                ]));
             }
         }
         text.push(Line::from(""));
-        text.push(Line::from(Span::styled(
-            " Type answer (or option number) · Enter submit · Esc cancel",
-            Style::default().fg(self.palette.muted),
-        )));
+        text.push(widgets::action_hints(
+            &[("↵", "submit"), ("esc", "cancel")],
+            &self.palette,
+        ));
 
         let prompt_height = (text.len() as u16 + 2).min(area.height.saturating_sub(4).max(3));
-        let prompt_y = area.height.saturating_sub(4 + prompt_height + 2);
-        let prompt_area = Rect {
-            x: area.x + 2,
-            y: area.y + prompt_y,
-            width: area.width.saturating_sub(4).min(90),
-            height: prompt_height,
-        };
-
-        let paragraph = Paragraph::new(text).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Ask user ")
-                .border_style(Style::default().fg(self.palette.warn)),
+        let prompt_area = widgets::centered_rect(area, 80, prompt_height);
+        widgets::render_modal_shell(
+            frame,
+            prompt_area,
+            "question",
+            self.palette.state_blocked,
+            &self.palette,
+            text,
         );
-        frame.render_widget(paragraph, prompt_area);
     }
 
     fn flush_pending_kitty_images(&mut self) {
@@ -5202,199 +6129,5 @@ impl App {
         for path in paths {
             let _ = super::kitty::write_kitty_image(&mut out, &path, 80);
         }
-    }
-}
-
-fn summarize_api_messages(messages: &[Message]) -> Vec<(usize, String)> {
-    messages
-        .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            let role = match m.role {
-                crate::ai::types::Role::System => "system",
-                crate::ai::types::Role::User => "user",
-                crate::ai::types::Role::Assistant => "assistant",
-                crate::ai::types::Role::Tool => "tool",
-            };
-            let preview = m
-                .content
-                .first()
-                .and_then(|c| {
-                    c.text
-                        .as_deref()
-                        .or(c.name.as_deref())
-                        .or(c.thinking.as_deref())
-                })
-                .unwrap_or("");
-            let preview: String = preview.chars().take(48).collect();
-            let preview = preview.replace('\n', " ");
-            (i, format!("{role}: {preview}"))
-        })
-        .collect()
-}
-
-fn api_messages_to_chat(messages: &[Message]) -> Vec<ChatMessage> {
-    let mut out = Vec::new();
-    for msg in messages {
-        match &msg.role {
-            crate::ai::types::Role::User => {
-                let text = msg
-                    .content
-                    .first()
-                    .and_then(|c| c.text.as_deref())
-                    .unwrap_or("");
-                if !text.is_empty() {
-                    out.push(ChatMessage {
-                        role: "user".into(),
-                        text: text.to_string(),
-                        thinking: None,
-                        show_thinking: false,
-                        tool_blocks: Vec::new(),
-                    });
-                }
-            }
-            crate::ai::types::Role::Assistant => {
-                let mut text = String::new();
-                let mut thinking: Option<String> = None;
-                for c in &msg.content {
-                    match c.content_type {
-                        crate::ai::types::ContentType::Text => {
-                            if let Some(ref t) = c.text {
-                                text.push_str(t);
-                            }
-                        }
-                        crate::ai::types::ContentType::ToolUse => {
-                            let name = c.name.as_deref().unwrap_or("tool");
-                            let input = c.input.as_ref().map(|v| v.to_string()).unwrap_or_default();
-                            let preview: String = input.chars().take(120).collect();
-                            text.push_str(&format!("\n🛠 {} {}\n", name, preview));
-                        }
-                        crate::ai::types::ContentType::Thinking => {
-                            if let Some(ref t) = c.thinking {
-                                thinking = Some(t.clone());
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                if !text.is_empty() || thinking.as_ref().is_some_and(|t| !t.is_empty()) {
-                    out.push(ChatMessage {
-                        role: "assistant".into(),
-                        text,
-                        thinking: thinking.clone(),
-                        show_thinking: thinking.as_ref().map(|t| !t.is_empty()).unwrap_or(false),
-                        tool_blocks: Vec::new(),
-                    });
-                }
-            }
-            crate::ai::types::Role::Tool => {
-                let name = msg
-                    .content
-                    .first()
-                    .and_then(|c| c.name.as_deref())
-                    .unwrap_or("tool");
-                let result = msg
-                    .content
-                    .first()
-                    .and_then(|c| c.text.as_deref())
-                    .unwrap_or("");
-                let preview: String = result.chars().take(200).collect();
-                if !preview.is_empty() {
-                    out.push(ChatMessage {
-                        role: "tool".into(),
-                        text: format!("✅ [{name}] {preview}"),
-                        thinking: None,
-                        show_thinking: false,
-                        tool_blocks: Vec::new(),
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
-/// Parse `/fork [@N] [label…]` → (at, label).
-fn parse_fork_args(arg: &str) -> (Option<usize>, Option<String>) {
-    let arg = arg.trim();
-    if arg.is_empty() {
-        return (None, None);
-    }
-    let mut parts = arg.split_whitespace();
-    let first = parts.next().unwrap_or("");
-    if let Some(rest) = first.strip_prefix('@') {
-        if let Ok(n) = rest.parse::<usize>() {
-            let label = {
-                let joined: String = parts.collect::<Vec<_>>().join(" ");
-                if joined.is_empty() {
-                    None
-                } else {
-                    Some(joined)
-                }
-            };
-            return (Some(n), label);
-        }
-    }
-    (None, Some(arg.to_string()))
-}
-
-fn extract_saved_file_path(tool_result: &str) -> Option<String> {
-    for token in tool_result.split_whitespace() {
-        let cleaned = token.trim_matches(|c: char| {
-            matches!(c, '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}')
-        });
-        if cleaned.contains('/') || cleaned.contains('.') {
-            let p = std::path::Path::new(cleaned);
-            if p.is_file() {
-                return Some(cleaned.to_string());
-            }
-        }
-    }
-    None
-}
-
-#[cfg(test)]
-mod fuzzy_tests {
-    use super::App;
-
-    #[test]
-    fn fuzzy_matches_subsequence() {
-        let items = vec![
-            "opencode-cli/opencode/claude-sonnet-4-6".into(),
-            "opencode-cli/opencode/deepseek-v4-flash-free".into(),
-            "anthropic/claude-haiku-4-5".into(),
-        ];
-        let hit = App::rank_and_filter(&items, "sonnet", 10);
-        assert!(hit.iter().any(|s| s.contains("sonnet")));
-        let hit = App::rank_and_filter(&items, "ocs4", 10);
-        assert!(
-            hit.iter().any(|s| s.contains("claude-sonnet")),
-            "expected subsequence match, got {:?}",
-            hit
-        );
-        let hit = App::rank_and_filter(&items, "deep flash", 10);
-        assert!(hit.iter().any(|s| s.contains("deepseek")));
-    }
-
-    #[test]
-    fn fuzzy_prefers_prefix() {
-        let items = vec![
-            "claude-sonnet-4".into(),
-            "x-claude-extra".into(),
-        ];
-        let hit = App::rank_and_filter(&items, "claude", 10);
-        assert_eq!(hit[0], "claude-sonnet-4");
-    }
-
-    #[test]
-    fn parse_fork_at_and_label() {
-        assert_eq!(super::parse_fork_args(""), (None, None));
-        assert_eq!(super::parse_fork_args("hotfix"), (None, Some("hotfix".into())));
-        assert_eq!(super::parse_fork_args("@3"), (Some(3), None));
-        assert_eq!(
-            super::parse_fork_args("@3 try again"),
-            (Some(3), Some("try again".into()))
-        );
     }
 }

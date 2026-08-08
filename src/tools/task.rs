@@ -191,7 +191,10 @@ impl AgentTool for TaskTool {
             depth: self.depth,
             max_depth: self.max_depth,
             max_iterations: self.max_iterations,
-            tool_factory: Arc::new(|| crate::tools::default_tools_list()),
+            tool_factory: {
+                let abort = self.abort.clone();
+                Arc::new(move || crate::tools::default_tools_list_with_abort(abort.clone()))
+            },
         };
 
         match host.agent_query(&task, tools).await {
