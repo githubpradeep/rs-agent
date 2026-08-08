@@ -9,6 +9,7 @@ pub enum HitTarget {
     Toast,
     Help,
     FleetRow { index: usize },
+    SessionRow { index: usize },
     OutputTab { index: usize },
     ModalDismiss,
     PaletteItem { index: usize },

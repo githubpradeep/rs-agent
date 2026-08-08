@@ -218,12 +218,17 @@ fn persist_session(
         goal: s.goal.clone(),
         seat: Some(seat.to_string()),
         handoff: s.handoff.clone().or_else(crate::agent::handoff::snapshot),
+        project_root: SessionStore::current_project_root(),
     };
     // Preserve created_at if reloading.
     if let Ok(prev) = store.load(session_id) {
         data.created_at = prev.created_at;
+        if data.project_root.is_none() {
+            data.project_root = prev.project_root;
+        }
     }
     data.ensure_title();
+    data.stamp_project();
     if let Err(e) = store.save(&data) {
         eprintln!("[worker:{seat}] session save failed: {e}");
         fleet::append_log(seat, &format!("session save failed: {e}"));
@@ -266,6 +271,7 @@ fn seed_session_file(
         goal: state.goal.clone(),
         seat: Some(seat.to_string()),
         handoff: state.handoff.clone().or_else(crate::agent::handoff::snapshot),
+        project_root: SessionStore::current_project_root(),
     };
     data.ensure_title();
     if let Err(e) = store.save(&data) {

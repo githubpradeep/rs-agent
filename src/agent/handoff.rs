@@ -4,7 +4,7 @@
 //! compaction. Notes survive in the session and (when bound) the seat diary.
 
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use std::cell::RefCell;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct HandoffNotes {
@@ -111,7 +111,7 @@ impl RoutingHandoffRecord {
     }
 }
 
-static LAST_ROUTING: Mutex<Option<RoutingHandoffRecord>> = Mutex::new(None);
+static LAST_ROUTING: std::sync::Mutex<Option<RoutingHandoffRecord>> = std::sync::Mutex::new(None);
 
 /// Attempt a seat/role routing handoff with optional allow-list (`*` or `from->to`).
 pub fn route_to_seat(
@@ -141,29 +141,25 @@ pub fn peek_routing() -> Option<RoutingHandoffRecord> {
     LAST_ROUTING.lock().ok().and_then(|g| g.clone())
 }
 
-static LAST_HANDOFF: Mutex<Option<HandoffNotes>> = Mutex::new(None);
+thread_local! {
+    static LAST_HANDOFF: RefCell<Option<HandoffNotes>> = const { RefCell::new(None) };
+}
 
 /// Store the most recent handoff for this process (session save + wake).
 pub fn store(notes: HandoffNotes) {
-    if let Ok(mut g) = LAST_HANDOFF.lock() {
-        *g = Some(notes);
-    }
+    LAST_HANDOFF.with(|h| *h.borrow_mut() = Some(notes));
 }
 
 pub fn snapshot() -> Option<HandoffNotes> {
-    LAST_HANDOFF.lock().ok().and_then(|g| g.clone())
+    LAST_HANDOFF.with(|h| h.borrow().clone())
 }
 
 pub fn restore(notes: Option<HandoffNotes>) {
-    if let Ok(mut g) = LAST_HANDOFF.lock() {
-        *g = notes;
-    }
+    LAST_HANDOFF.with(|h| *h.borrow_mut() = notes);
 }
 
 pub fn clear() {
-    if let Ok(mut g) = LAST_HANDOFF.lock() {
-        *g = None;
-    }
+    LAST_HANDOFF.with(|h| *h.borrow_mut() = None);
 }
 
 #[cfg(test)]

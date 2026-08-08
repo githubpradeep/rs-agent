@@ -1,6 +1,5 @@
 use crate::agent::r#loop::AgentEvent;
-use crate::agent::state::AgentState;
-use crate::agent::{AgentLoop, AgentMode};
+use crate::agent::AgentMode;
 use crate::ai::provider::Provider;
 use crate::ai::types::Message;
 use crate::context::{
@@ -31,6 +30,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::Frame;
 
 use super::fleet_panel::{self, CityRow, FleetPanelState};
+use super::sessions_panel::{self, SessionRow, SessionsPanelState};
 use super::help::{self, HelpOverlay};
 use super::hit::{HitMap, HitTarget};
 use super::keys::{merge_keybindings, KeyMap};
@@ -44,10 +44,16 @@ use super::tree_view::{self, SidePanelMode};
 use super::widgets;
 use crate::lifecycle::{self, Lifecycle};
 use crate::notify::{self, NotifyMode};
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
+
+mod session_runtime;
+use session_runtime::{
+    spawn_session_runtime, turn_active_from_event, SessionRuntime, SessionRuntimeConfig,
+};
 
 #[derive(Clone)]
 struct ChatMessage {
@@ -101,7 +107,7 @@ enum PickerMode {
 }
 
 #[allow(dead_code)]
-enum AppCommand {
+pub(super) enum AppCommand {
     Submit { text: String },
     Steer { text: String },
     Abort,
@@ -136,6 +142,8 @@ enum AppCommand {
     SetSeat { name: Option<String> },
     /// Replace agent state with a worker/TUI session (fleet attach).
     LoadSession { data: SessionData },
+    /// Persist the current session, then load another (atomic session switch).
+    SwitchSession { data: SessionData },
     /// Force-save current session to disk (fleet detach).
     PersistSession,
     Exit,
@@ -174,8 +182,14 @@ pub struct App {
     input_mode: InputMode,
     should_exit: bool,
     status: String,
+    /// Clones of the focused session runtime's command channel / abort.
     command_tx: channel::Sender<AppCommand>,
-    event_rx: channel::Receiver<(usize, AgentEvent)>,
+    /// One OS-thread agent loop per session id.
+    runtimes: HashMap<String, SessionRuntime>,
+    /// Shared permission requests from every runtime (cloned Sender at spawn).
+    permission_tx: channel::Sender<PendingPermission>,
+    /// LSP diagnostics / status (not tied to a session runtime).
+    lsp_event_rx: channel::Receiver<(usize, AgentEvent)>,
     scroll_offset: usize,
     follow_bottom: bool,
     picker_active: bool,
@@ -271,6 +285,8 @@ pub struct App {
     palette_items: Vec<String>,
     show_fleet_panel: bool,
     fleet_panel: FleetPanelState,
+    show_sessions_panel: bool,
+    sessions_panel: SessionsPanelState,
     side_mode: SidePanelMode,
     tree_nodes: Vec<tree_view::CallTreeNode>,
     hit_map: HitMap,
@@ -278,6 +294,18 @@ pub struct App {
     allowed_transitions: Vec<String>,
     /// Last fleet refresh.
     fleet_refresh_at: Instant,
+    /// Session id the focused runtime is bound to (kept equal to `session_id`).
+    agent_session_id: String,
+    /// Focused runtime is mid-turn.
+    agent_turn_active: bool,
+    /// Another runtime still running after UI focused elsewhere.
+    bg_running_session: Option<String>,
+    /// Live chat per session (includes user bubbles) — survives switch better than disk reload.
+    ui_snapshots: HashMap<String, Vec<ChatMessage>>,
+    /// Spawn knobs for additional parallel runtimes.
+    max_iterations: usize,
+    thinking_budget: Option<u32>,
+    system_prompt_opt: Option<String>,
 }
 
 enum LspCmd {
@@ -298,14 +326,13 @@ impl App {
         let mouse_enabled = !cfg.disable_mouse.unwrap_or(false);
         let provider_for_app = provider.clone();
 
-        let (command_tx, command_rx) = channel::unbounded::<AppCommand>();
-        let (event_tx, event_rx) = channel::unbounded::<(usize, AgentEvent)>();
         let (permission_tx, permission_rx) = channel::unbounded::<PendingPermission>();
         let (question_tx, question_rx) = channel::unbounded::<PendingQuestion>();
         crate::tools::question::set_question_channel(question_tx);
 
+        let (lsp_event_tx, lsp_event_rx) = channel::unbounded::<(usize, AgentEvent)>();
         let (lsp_cmd_tx, lsp_cmd_rx) = channel::unbounded::<LspCmd>();
-        let event_tx_lsp = event_tx.clone();
+        let event_tx_lsp = lsp_event_tx;
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,
@@ -383,661 +410,58 @@ impl App {
             });
         });
 
-        let abort_flag = crate::agent::AbortFlag::new();
-        let steer_queue = crate::agent::SteerQueue::new();
-        let abort_for_thread = abort_flag.clone();
-        let steer_for_thread = steer_queue.clone();
-
         let provider_name = provider.name().to_string();
         let provider_name_for_banner = provider_name.clone();
-        let provider2 = provider.clone();
-        let model2 = model.clone();
-        let timeout = std::time::Duration::from_secs(timeout_secs);
         let session_id =
             resume.as_ref().map(|s| s.id.clone()).unwrap_or_else(SessionStore::generate_id);
         crate::tools::turn_snapshot::set_session(&session_id);
         let created_at = resume.as_ref().map(|s| s.created_at.clone()).unwrap_or_else(|| {
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
         });
-        let resume_msgs = resume.as_ref().map(|s| s.messages.clone()).unwrap_or_default();
-        let resume_goal = resume.as_ref().and_then(|s| s.goal.clone()).filter(|g| {
-            matches!(
-                g.status,
-                crate::agent::goal::GoalStatus::Active | crate::agent::goal::GoalStatus::Paused
-            )
-        });
-        let resume_seat = resume.as_ref().and_then(|s| s.seat.clone());
-        let resume_handoff = resume.as_ref().and_then(|s| s.handoff.clone());
         let title = resume.as_ref().and_then(|s| s.title.clone());
-        let parent_id_resume = resume.as_ref().and_then(|s| s.parent_id.clone());
-        let branch_label_resume = resume.as_ref().and_then(|s| s.branch_label.clone());
-        let session_id_for_thread = session_id.clone();
-        let created_at_for_thread = created_at.clone();
-        let title_for_thread = title.clone();
-        let parent_for_thread = parent_id_resume;
-        let branch_for_thread = branch_label_resume;
-        let system_prompt_for_thread = system_prompt.clone();
-        let max_rlm_depth = rlm_depth;
 
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async move {
-                let sp = system_prompt_for_thread.unwrap_or_else(|| {
-                    crate::agent::default_system_prompt()
-                });
-
-                let mut state = AgentState::new(model2, provider_name)
-                    .with_system_prompt(sp)
-                    .with_thinking_budget(thinking_budget);
-                state.goal = resume_goal;
-                state.seat = resume_seat.clone();
-                state.handoff = resume_handoff.clone();
-                crate::agent::handoff::restore(resume_handoff);
-                if let Some(ref seat_name) = resume_seat {
-                    crate::tools::handoff::set_active_seat(Some(seat_name.clone()));
-                }
-                // Wake with purpose after resume (or when seat/handoff present).
-                state.pending_wake = state.seat.is_some()
-                    || state.handoff.is_some()
-                    || state.goal.is_some();
-
-                for msg in &resume_msgs {
-                    state.add_message(msg.clone());
-                }
-
-                let goal_verify = crate::config::Config::load()
-                    .goal_verify
-                    .unwrap_or(true);
-                let mut agent_loop = AgentLoop::new(provider2, state)
-                    .with_max_iterations(max_iterations)
-                    .with_abort(abort_for_thread.clone())
-                    .with_steer(steer_for_thread.clone())
-                    .with_rlm_depth(0, max_rlm_depth)
-                    .with_goal_verify(goal_verify);
-                if !approve {
-                    agent_loop.set_permission_channel(permission_tx);
-                }
-                // Bridge tool-emitted events (REPL stdout / bash stream) onto the TUI event channel.
-                let (sink_tx, sink_rx) = channel::unbounded::<AgentEvent>();
-                crate::tools::output_sink::set_tool_output_sink(sink_tx.clone());
-                let event_tx_bridge = event_tx.clone();
-                std::thread::spawn(move || {
-                    while let Ok(ev) = sink_rx.recv() {
-                        let _ = event_tx_bridge.send((0, ev));
-                    }
-                });
-                agent_loop = agent_loop.with_event_sink(sink_tx);
-                crate::tools::register_default_tools_with_rlm(&mut agent_loop, max_rlm_depth);
-                {
-                    let mcp_cfg = crate::config::Config::load().mcp;
-                    if !mcp_cfg.servers.is_empty() {
-                        let lines =
-                            crate::mcp::attach_mcp_from_config(&mut agent_loop, &mcp_cfg).await;
-                        for line in lines {
-                            let _ = event_tx.send((0, AgentEvent::Status { message: line }));
-                        }
-                    }
-                }
-
-                let store = SessionStore::new();
-                let mut session_id_local = session_id_for_thread.clone();
-                let mut created_at_local = created_at_for_thread.clone();
-                let mut title_local = title_for_thread.clone();
-                let mut parent_id_local = parent_for_thread.clone();
-                let mut branch_label_local = branch_for_thread.clone();
-
-                loop {
-                    let cmd = command_rx.recv().unwrap_or(AppCommand::Exit);
-                    match cmd {
-                        AppCommand::Exit => break,
-                        AppCommand::Init { messages } => {
-                            for msg in messages {
-                                agent_loop.state_mut().add_message(msg);
-                            }
-                        }
-                        AppCommand::Abort => {
-                            abort_for_thread.abort();
-                        }
-                        AppCommand::Steer { text } => {
-                            steer_for_thread.push(text);
-                            let _ = event_tx.send((0, AgentEvent::Status {
-                                message: "steer queued".to_string(),
-                            }));
-                        }
-                        AppCommand::Compact => {
-                            let _ = agent_loop.compact_now(&mut |event: AgentEvent| {
-                                let _ = event_tx.send((0, event));
-                            }).await;
-                        }
-                        AppCommand::NewSession => {
-                            agent_loop.clear_messages();
-                            agent_loop.clear_goal();
-                            agent_loop.state_mut().seat = None;
-                            agent_loop.state_mut().handoff = None;
-                            agent_loop.state_mut().pending_wake = false;
-                            crate::agent::handoff::clear();
-                            crate::tools::handoff::set_active_seat(None);
-                            abort_for_thread.clear();
-                            steer_for_thread.clear();
-                            crate::tools::todowrite::clear();
-                            session_id_local = SessionStore::generate_id();
-                            created_at_local = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                            title_local = None;
-                            parent_id_local = None;
-                            branch_label_local = None;
-                            let _ = event_tx.send((0, AgentEvent::SessionMeta {
-                                id: session_id_local.clone(),
-                                title: None,
-                            }));
-                            let _ = event_tx.send((0, AgentEvent::GoalUpdate {
-                                summary: String::new(),
-                            }));
-                            let _ = event_tx.send((0, AgentEvent::Status {
-                                message: format!("new session {}", session_id_local),
-                            }));
-                        }
-                        AppCommand::ForkSession { label, at } => {
-                            // Persist current tip, then fork into a new id.
-                            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                            let s = agent_loop.state();
-                            let tree_snapshot =
-                                serde_json::to_value(agent_loop.call_tree().snapshot()).ok();
-                            let mut current = SessionData {
-                                id: session_id_local.clone(),
-                                title: title_local.clone(),
-                                parent_id: parent_id_local.clone(),
-                                branch_label: branch_label_local.clone(),
-                                created_at: created_at_local.clone(),
-                                updated_at: now,
-                                model: s.model.clone(),
-                                provider: s.provider.clone(),
-                                system_prompt: s.system_prompt.clone(),
-                                messages: s.messages.clone(),
-                                total_input_tokens: s.total_input_tokens,
-                                total_output_tokens: s.total_output_tokens,
-                                call_tree: tree_snapshot,
-                                todos: Some(crate::tools::todowrite::snapshot()),
-                                goal: s.goal.clone(),
-                                seat: s.seat.clone(),
-                                handoff: s.handoff.clone().or_else(crate::agent::handoff::snapshot),
-                            };
-                            current.ensure_title();
-                            let _ = store.save(&current);
-                            match store.fork_at(&session_id_local, at, label) {
-                                Ok(forked) => {
-                                    session_id_local = forked.id.clone();
-                                    created_at_local = forked.created_at.clone();
-                                    title_local = forked.title.clone();
-                                    parent_id_local = forked.parent_id.clone();
-                                    branch_label_local = forked.branch_label.clone();
-                                    agent_loop.state_mut().messages = forked.messages.clone();
-                                    agent_loop.state_mut().goal = forked.goal.clone();
-                                    agent_loop.state_mut().seat = forked.seat.clone();
-                                    agent_loop.state_mut().handoff = forked.handoff.clone();
-                                    crate::agent::handoff::restore(forked.handoff.clone());
-                                    crate::tools::handoff::set_active_seat(forked.seat.clone());
-                                    agent_loop.state_mut().pending_wake = true;
-                                    let _ = event_tx.send((0, AgentEvent::SessionMeta {
-                                        id: session_id_local.clone(),
-                                        title: title_local.clone(),
-                                    }));
-                                    if let Some(ref g) = forked.goal {
-                                        let _ = event_tx.send((0, AgentEvent::GoalUpdate {
-                                            summary: format!("{}: {}", g.status.as_str(), g.condition),
-                                        }));
-                                    }
-                                    let _ = event_tx.send((0, AgentEvent::ReloadTranscript {
-                                        messages: forked.messages.clone(),
-                                    }));
-                                    let _ = event_tx.send((0, AgentEvent::TimelineSnapshot {
-                                        entries: summarize_api_messages(&forked.messages),
-                                    }));
-                                    let _ = event_tx.send((0, AgentEvent::Status {
-                                        message: format!(
-                                            "forked → {} (parent {}){}",
-                                            session_id_local,
-                                            parent_id_local.as_deref().unwrap_or("?"),
-                                            at.map(|n| format!(" @{}", n)).unwrap_or_default()
-                                        ),
-                                    }));
-                                }
-                                Err(e) => {
-                                    let _ = event_tx.send((0, AgentEvent::Error {
-                                        message: format!("fork failed: {e}"),
-                                    }));
-                                }
-                            }
-                        }
-                        AppCommand::RequestTimeline => {
-                            let entries = summarize_api_messages(&agent_loop.state().messages);
-                            let _ = event_tx.send((0, AgentEvent::TimelineSnapshot { entries }));
-                        }
-                        AppCommand::SetModel { model } => {
-                            agent_loop.set_model(model.clone());
-                            let _ = event_tx.send((0, AgentEvent::Status {
-                                message: format!("model set to {}", model),
-                            }));
-                        }
-                        AppCommand::SetProvider { provider, model } => {
-                            let pname = provider.name().to_string();
-                            agent_loop.set_provider_and_model(provider, model.clone());
-                            let _ = event_tx.send((0, AgentEvent::Status {
-                                message: format!("provider {} · model {}", pname, model),
-                            }));
-                        }
-                        AppCommand::SetMode { mode } => {
-                            agent_loop.state_mut().set_mode(mode);
-                            let _ = event_tx.send((0, AgentEvent::Status {
-                                message: format!("mode set to {}", mode.as_str()),
-                            }));
-                        }
-                        AppCommand::SetSkillTools { tools } => {
-                            let note = if tools.is_empty() {
-                                agent_loop.state_mut().clear_skill_tools();
-                                "skill tools cleared".to_string()
-                            } else {
-                                let joined = tools.join(", ");
-                                agent_loop.state_mut().set_skill_tools(tools);
-                                format!("skill tools: [{joined}]")
-                            };
-                            let _ = event_tx.send((0, AgentEvent::Status { message: note }));
-                        }
-                        AppCommand::SetSystemPrompt { prompt } => {
-                            agent_loop.state_mut().system_prompt = prompt;
-                            let _ = event_tx.send((0, AgentEvent::Status {
-                                message: "system prompt rebuilt".to_string(),
-                            }));
-                        }
-                        AppCommand::GoalSet { condition } => {
-                            agent_loop.set_goal(condition.clone());
-                            let _ = event_tx.send((0, AgentEvent::GoalUpdate {
-                                summary: format!("active: {condition}"),
-                            }));
-                            let _ = event_tx.send((0, AgentEvent::Status {
-                                message: "◎ /goal set — starting turn".into(),
-                            }));
-                        }
-                        AppCommand::GoalClear => {
-                            let msg = match agent_loop.clear_goal() {
-                                Some(g) => format!("Goal cleared: {}", g.condition),
-                                None => "No goal set".into(),
-                            };
-                            let _ = event_tx.send((0, AgentEvent::GoalUpdate {
-                                summary: String::new(),
-                            }));
-                            let _ = event_tx.send((0, AgentEvent::Status { message: msg }));
-                        }
-                        AppCommand::GoalPause => {
-                            let msg = if agent_loop.pause_goal() {
-                                "Goal paused".into()
-                            } else {
-                                "No active goal to pause".into()
-                            };
-                            let _ = event_tx.send((0, AgentEvent::GoalUpdate {
-                                summary: "paused".into(),
-                            }));
-                            let _ = event_tx.send((0, AgentEvent::Status { message: msg }));
-                        }
-                        AppCommand::GoalResume => {
-                            let msg = if agent_loop.resume_goal() {
-                                "Goal resumed".into()
-                            } else {
-                                "No paused goal to resume".into()
-                            };
-                            let summary = agent_loop
-                                .state()
-                                .goal
-                                .as_ref()
-                                .map(|g| format!("{}: {}", g.status.as_str(), g.condition))
-                                .unwrap_or_default();
-                            let _ = event_tx.send((0, AgentEvent::GoalUpdate { summary }));
-                            let _ = event_tx.send((0, AgentEvent::Status { message: msg }));
-                        }
-                        AppCommand::GoalStatus => {
-                            let s = agent_loop.state();
-                            let msg = match &s.goal {
-                                Some(g) => g.status_line(s.total_input_tokens, s.total_output_tokens),
-                                None => "No goal set. Usage: /goal <condition>".into(),
-                            };
-                            let _ = event_tx.send((0, AgentEvent::Status { message: msg.clone() }));
-                            let _ = event_tx.send((0, AgentEvent::GoalUpdate {
-                                summary: format!("STATUS\n{msg}"),
-                            }));
-                        }
-                        AppCommand::HandoffRequest => {
-                            let text = crate::agent::handoff::handoff_request_message();
-                            let mut prompt = text;
-                            let mut wall_attempt = 0u32;
-                            const MAX_WALL_RETRIES: u32 = 3;
-                            loop {
-                                abort_for_thread.clear();
-                                let event_tx2 = event_tx.clone();
-                                let mut cb = move |event: AgentEvent| {
-                                    let _ = event_tx2.send((0, event));
-                                };
-                                let result = tokio::time::timeout(
-                                    timeout,
-                                    agent_loop.run(&prompt, &mut cb),
-                                )
-                                .await;
-                                match result {
-                                    Ok(Ok(())) => {
-                                        let _ = event_tx.send((0, AgentEvent::TreeUpdate {
-                                            tree: agent_loop.call_tree().clone(),
-                                        }));
-                                        break;
-                                    }
-                                    Ok(Err(e)) => {
-                                        let _ = event_tx.send((0, AgentEvent::Error { message: e }));
-                                        break;
-                                    }
-                                    Err(_) => {
-                                        abort_for_thread.abort();
-                                        let _ = agent_loop.state_mut().settle_dangling_tools();
-                                        let _ = agent_loop.state_mut().repair_tool_pairing();
-                                        wall_attempt += 1;
-                                        if wall_attempt <= MAX_WALL_RETRIES {
-                                            let delay = crate::orchestration::backoff_delay(
-                                                wall_attempt.saturating_sub(1),
-                                                2_000,
-                                                30_000,
-                                                500,
-                                            );
-                                            let _ = event_tx.send((0, AgentEvent::Status {
-                                                message: format!(
-                                                    "wall timeout after {timeout_secs}s — auto-continuing ({wall_attempt}/{MAX_WALL_RETRIES}) in {}s…",
-                                                    delay.as_secs()
-                                                ),
-                                            }));
-                                            tokio::time::sleep(delay).await;
-                                            prompt = "continue".to_string();
-                                            continue;
-                                        }
-                                        let _ = event_tx.send((0, AgentEvent::Error {
-                                            message: format!(
-                                                "Request timed out after {timeout_secs}s (auto-retry exhausted)"
-                                            ),
-                                        }));
-                                        break;
-                                    }
-                                }
-                            }
-                            // Persist after handoff turn
-                            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                            let s = agent_loop.state();
-                            let tree_snapshot =
-                                serde_json::to_value(agent_loop.call_tree().snapshot()).ok();
-                            let mut session_data = SessionData {
-                                id: session_id_local.clone(),
-                                title: title_local.clone(),
-                                parent_id: parent_id_local.clone(),
-                                branch_label: branch_label_local.clone(),
-                                created_at: created_at_local.clone(),
-                                updated_at: now,
-                                model: s.model.clone(),
-                                provider: s.provider.clone(),
-                                system_prompt: s.system_prompt.clone(),
-                                messages: s.messages.clone(),
-                                total_input_tokens: s.total_input_tokens,
-                                total_output_tokens: s.total_output_tokens,
-                                call_tree: tree_snapshot,
-                                todos: Some(crate::tools::todowrite::snapshot()),
-                                goal: s.goal.clone(),
-                                seat: s.seat.clone(),
-                                handoff: s.handoff.clone().or_else(crate::agent::handoff::snapshot),
-                            };
-                            session_data.ensure_title();
-                            title_local = session_data.title.clone();
-                            let _ = store.save(&session_data);
-                        }
-                        AppCommand::SetSeat { name } => {
-                            agent_loop.state_mut().seat = name.clone();
-                            crate::tools::handoff::set_active_seat(name.clone());
-                            agent_loop.state_mut().pending_wake = true;
-                            let msg = match name {
-                                Some(n) => format!("Seat bound: {n} — wake packet armed"),
-                                None => "Seat cleared".to_string(),
-                            };
-                            let _ = event_tx.send((0, AgentEvent::Status { message: msg }));
-                        }
-                        AppCommand::LoadSession { data } => {
-                            abort_for_thread.clear();
-                            steer_for_thread.clear();
-                            agent_loop.clear_messages();
-                            session_id_local = data.id.clone();
-                            created_at_local = data.created_at.clone();
-                            title_local = data.title.clone();
-                            parent_id_local = data.parent_id.clone();
-                            branch_label_local = data.branch_label.clone();
-                            if !data.system_prompt.trim().is_empty() {
-                                agent_loop.state_mut().system_prompt = data.system_prompt.clone();
-                            }
-                            agent_loop.state_mut().seat = data.seat.clone();
-                            agent_loop.state_mut().handoff = data.handoff.clone();
-                            agent_loop.state_mut().goal = data.goal.clone();
-                            agent_loop.state_mut().pending_wake = true;
-                            crate::agent::handoff::restore(data.handoff.clone());
-                            crate::tools::handoff::set_active_seat(data.seat.clone());
-                            if let Some(todos) = data.todos.clone() {
-                                crate::tools::todowrite::restore(todos);
-                            } else {
-                                crate::tools::todowrite::clear();
-                            }
-                            for msg in &data.messages {
-                                agent_loop.state_mut().add_message(msg.clone());
-                            }
-                            let _ = event_tx.send((
-                                0,
-                                AgentEvent::SessionMeta {
-                                    id: data.id.clone(),
-                                    title: data.title.clone(),
-                                },
-                            ));
-                            let _ = event_tx.send((
-                                0,
-                                AgentEvent::ReloadTranscript {
-                                    messages: data.messages.clone(),
-                                },
-                            ));
-                            if let Some(ref g) = data.goal {
-                                let _ = event_tx.send((
-                                    0,
-                                    AgentEvent::GoalUpdate {
-                                        summary: format!("◎ /goal {}", g.status.as_str()),
-                                    },
-                                ));
-                            }
-                            let _ = event_tx.send((
-                                0,
-                                AgentEvent::Status {
-                                    message: format!(
-                                        "loaded session {} ({} msgs) seat={:?}",
-                                        data.id,
-                                        data.messages.len(),
-                                        data.seat
-                                    ),
-                                },
-                            ));
-                        }
-                        AppCommand::PersistSession => {
-                            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                            let s = agent_loop.state();
-                            let tree_snapshot =
-                                serde_json::to_value(agent_loop.call_tree().snapshot()).ok();
-                            let mut session_data = SessionData {
-                                id: session_id_local.clone(),
-                                title: title_local.clone(),
-                                parent_id: parent_id_local.clone(),
-                                branch_label: branch_label_local.clone(),
-                                created_at: created_at_local.clone(),
-                                updated_at: now,
-                                model: s.model.clone(),
-                                provider: s.provider.clone(),
-                                system_prompt: s.system_prompt.clone(),
-                                messages: s.messages.clone(),
-                                total_input_tokens: s.total_input_tokens,
-                                total_output_tokens: s.total_output_tokens,
-                                call_tree: tree_snapshot,
-                                todos: Some(crate::tools::todowrite::snapshot()),
-                                goal: s.goal.clone(),
-                                seat: s.seat.clone(),
-                                handoff: s.handoff.clone().or_else(crate::agent::handoff::snapshot),
-                            };
-                            session_data.ensure_title();
-                            title_local = session_data.title.clone();
-                            let _ = store.save(&session_data);
-                            let _ = event_tx.send((
-                                0,
-                                AgentEvent::Status {
-                                    message: format!("persisted session {}", session_id_local),
-                                },
-                            ));
-                        }
-                        AppCommand::SetTitle { title } => {
-                            title_local = Some(title.clone());
-                            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                            let s = agent_loop.state();
-                            let tree_snapshot =
-                                serde_json::to_value(agent_loop.call_tree().snapshot()).ok();
-                            let session_data = SessionData {
-                                id: session_id_local.clone(),
-                                title: title_local.clone(),
-                                parent_id: parent_id_local.clone(),
-                                branch_label: branch_label_local.clone(),
-                                created_at: created_at_local.clone(),
-                                updated_at: now,
-                                model: s.model.clone(),
-                                provider: s.provider.clone(),
-                                system_prompt: s.system_prompt.clone(),
-                                messages: s.messages.clone(),
-                                total_input_tokens: s.total_input_tokens,
-                                total_output_tokens: s.total_output_tokens,
-                                call_tree: tree_snapshot,
-                                todos: Some(crate::tools::todowrite::snapshot()),
-                                goal: s.goal.clone(),
-                                seat: s.seat.clone(),
-                                handoff: s.handoff.clone().or_else(crate::agent::handoff::snapshot),
-                            };
-                            let _ = store.save(&session_data);
-                            let _ = event_tx.send((0, AgentEvent::Status {
-                                message: format!("renamed to \"{}\"", title),
-                            }));
-                        }
-                        AppCommand::Submit { text } => {
-                            // Wall-clock timeout on the whole turn: auto-continue a few
-                            // times instead of wedging the user on "type continue".
-                            const MAX_WALL_RETRIES: u32 = 3;
-                            let mut prompt = text;
-                            let mut wall_attempt = 0u32;
-                            loop {
-                                abort_for_thread.clear();
-                                let result = tokio::time::timeout(
-                                    timeout,
-                                    agent_loop.run(&prompt, &mut |event: AgentEvent| {
-                                        let _ = event_tx.send((0, event));
-                                    }),
-                                )
-                                .await;
-                                match result {
-                                    Ok(Ok(())) => {
-                                        let _ = event_tx.send((0, AgentEvent::TreeUpdate {
-                                            tree: agent_loop.call_tree().clone(),
-                                        }));
-                                        break;
-                                    }
-                                    Ok(Err(e)) => {
-                                        let transport =
-                                            crate::agent::AgentLoop::is_transport_failure_msg(&e);
-                                        if transport && wall_attempt < MAX_WALL_RETRIES {
-                                            wall_attempt += 1;
-                                            let _ = agent_loop.state_mut().settle_dangling_tools();
-                                            let _ = agent_loop.state_mut().repair_tool_pairing();
-                                            let delay = crate::orchestration::backoff_delay(
-                                                wall_attempt.saturating_sub(1),
-                                                2_000,
-                                                30_000,
-                                                500,
-                                            );
-                                            let _ = event_tx.send((0, AgentEvent::Status {
-                                                message: format!(
-                                                    "provider error — auto-continuing ({wall_attempt}/{MAX_WALL_RETRIES}) in {}s… ({e})",
-                                                    delay.as_secs()
-                                                ),
-                                            }));
-                                            tokio::time::sleep(delay).await;
-                                            prompt = "continue".to_string();
-                                            continue;
-                                        }
-                                        let _ = event_tx.send((0, AgentEvent::Error {
-                                            message: format!("{e} (auto-retry exhausted)"),
-                                        }));
-                                        break;
-                                    }
-                                    Err(_) => {
-                                        abort_for_thread.abort();
-                                        let _ = agent_loop.state_mut().settle_dangling_tools();
-                                        let _ = agent_loop.state_mut().repair_tool_pairing();
-                                        wall_attempt += 1;
-                                        if wall_attempt <= MAX_WALL_RETRIES {
-                                            let delay = crate::orchestration::backoff_delay(
-                                                wall_attempt.saturating_sub(1),
-                                                2_000,
-                                                30_000,
-                                                500,
-                                            );
-                                            let _ = event_tx.send((0, AgentEvent::Status {
-                                                message: format!(
-                                                    "wall timeout after {timeout_secs}s — auto-continuing ({wall_attempt}/{MAX_WALL_RETRIES}) in {}s…",
-                                                    delay.as_secs()
-                                                ),
-                                            }));
-                                            tokio::time::sleep(delay).await;
-                                            prompt = "continue".to_string();
-                                            continue;
-                                        }
-                                        let _ = event_tx.send((0, AgentEvent::Error {
-                                            message: format!(
-                                                "Request timed out after {timeout_secs}s (auto-retry exhausted)"
-                                            ),
-                                        }));
-                                        break;
-                                    }
-                                }
-                            }
-                            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                            let s = agent_loop.state();
-                            let tree_snapshot =
-                                serde_json::to_value(agent_loop.call_tree().snapshot()).ok();
-                            let mut session_data = SessionData {
-                                id: session_id_local.clone(),
-                                title: title_local.clone(),
-                                parent_id: parent_id_local.clone(),
-                                branch_label: branch_label_local.clone(),
-                                created_at: created_at_local.clone(),
-                                updated_at: now,
-                                model: s.model.clone(),
-                                provider: s.provider.clone(),
-                                system_prompt: s.system_prompt.clone(),
-                                messages: s.messages.clone(),
-                                total_input_tokens: s.total_input_tokens,
-                                total_output_tokens: s.total_output_tokens,
-                                call_tree: tree_snapshot,
-                                todos: Some(crate::tools::todowrite::snapshot()),
-                                goal: s.goal.clone(),
-                                seat: s.seat.clone(),
-                                handoff: s.handoff.clone().or_else(crate::agent::handoff::snapshot),
-                            };
-                            session_data.ensure_title();
-                            title_local = session_data.title.clone();
-                            if let Some(ref t) = title_local {
-                                let _ = event_tx.send((0, AgentEvent::TitleUpdate { title: t.clone() }));
-                            }
-                            let _ = store.save(&session_data);
-                        }
-                    }
-                }
-            });
-        });
+        let runtime_cfg = if let Some(ref data) = resume {
+            SessionRuntimeConfig::from_session_data(
+                data,
+                provider.clone(),
+                model.clone(),
+                timeout_secs,
+                approve,
+                max_iterations,
+                rlm_depth,
+                thinking_budget,
+                system_prompt.clone(),
+                permission_tx.clone(),
+            )
+        } else {
+            SessionRuntimeConfig {
+                provider: provider.clone(),
+                model: model.clone(),
+                timeout_secs,
+                approve,
+                max_iterations,
+                rlm_depth,
+                thinking_budget,
+                system_prompt: system_prompt.clone(),
+                permission_tx: permission_tx.clone(),
+                id: session_id.clone(),
+                created_at: created_at.clone(),
+                title: title.clone(),
+                parent_id: None,
+                branch_label: None,
+                messages: Vec::new(),
+                goal: None,
+                seat: None,
+                handoff: None,
+                todos: None,
+            }
+        };
+        let first_runtime = spawn_session_runtime(runtime_cfg);
+        let command_tx = first_runtime.command_tx.clone();
+        let abort_flag = first_runtime.abort_flag.clone();
+        let steer_queue = first_runtime.steer_queue.clone();
+        let mut runtimes = HashMap::new();
+        runtimes.insert(session_id.clone(), first_runtime);
 
         let trust_store = TrustStore::new();
         let path_allows = PathAllowStore::new();
@@ -1144,6 +568,7 @@ impl App {
             crate::tools::todowrite::clear();
         }
 
+        let agent_session_id = session_id.clone();
         Self {
             messages: initial_msgs,
             input: String::new(),
@@ -1151,7 +576,9 @@ impl App {
             should_exit: false,
             status: "ready".to_string(),
             command_tx,
-            event_rx,
+            runtimes,
+            permission_tx,
+            lsp_event_rx,
             scroll_offset: 0,
             follow_bottom: true,
             picker_active: false,
@@ -1268,6 +695,8 @@ impl App {
             palette_items: Vec::new(),
             show_fleet_panel: false,
             fleet_panel: FleetPanelState::default(),
+            show_sessions_panel: false,
+            sessions_panel: SessionsPanelState::default(),
             side_mode: SidePanelMode::Tree,
             tree_nodes: Vec::new(),
             hit_map: HitMap::default(),
@@ -1284,6 +713,13 @@ impl App {
             },
             allowed_transitions: cfg.allowed_transitions.clone(),
             fleet_refresh_at: Instant::now() - Duration::from_secs(60),
+            agent_session_id,
+            agent_turn_active: false,
+            bg_running_session: None,
+            ui_snapshots: HashMap::new(),
+            max_iterations,
+            thinking_budget,
+            system_prompt_opt: system_prompt,
         }
     }
 
@@ -1359,7 +795,12 @@ impl App {
                 self.handle_event(event::read()?)?;
             }
 
-            while let Ok((_idx, event)) = self.event_rx.try_recv() {
+            // Drain every session runtime; only paint events for the focused one.
+            for ev in self.pump_runtime_events() {
+                self.handle_agent_event(ev);
+            }
+
+            while let Ok((_idx, event)) = self.lsp_event_rx.try_recv() {
                 self.handle_agent_event(event);
             }
 
@@ -1407,6 +848,10 @@ impl App {
                 self.fleet_panel.refresh();
                 self.fleet_refresh_at = Instant::now();
             }
+            if self.show_sessions_panel && self.fleet_refresh_at.elapsed() >= Duration::from_secs(2) {
+                self.sessions_panel.refresh(&self.session_id, self.bg_running_session.as_deref());
+                self.fleet_refresh_at = Instant::now();
+            }
 
             if self.should_exit {
                 break;
@@ -1416,7 +861,9 @@ impl App {
         // Resume any paused fleet seat so workers are not wedged.
         self.fleet_detach(true);
 
-        let _ = self.command_tx.send(AppCommand::Exit);
+        for rt in self.runtimes.values() {
+            let _ = rt.command_tx.send(AppCommand::Exit);
+        }
         terminal::disable_raw_mode()?;
         crossterm::execute!(io::stdout(), LeaveAlternateScreen, DisableBracketedPaste)?;
         if self.mouse_enabled {
@@ -1436,8 +883,28 @@ impl App {
     }
 
     fn handle_agent_event(&mut self, event: AgentEvent) {
+        // Drop stale stream chunks when we are not in an active turn (e.g. idle after switch).
+        // Never drop Done/Aborted/Error — those clear agent_turn_active.
+        let streaming = matches!(
+            event,
+            AgentEvent::TextDelta { .. }
+                | AgentEvent::ThinkingDelta { .. }
+                | AgentEvent::ToolUseStart { .. }
+                | AgentEvent::ToolUseDelta { .. }
+                | AgentEvent::ToolResult { .. }
+                | AgentEvent::ToolOutput { .. }
+                | AgentEvent::ReplOutput { .. }
+                | AgentEvent::TurnEnd { .. }
+        );
+        if streaming
+            && self.input_mode != InputMode::Waiting
+            && self.tool_in_progress.is_none()
+        {
+            return;
+        }
         match event {
             AgentEvent::TextDelta { text } => {
+                self.agent_turn_active = true;
                 if self.messages.is_empty()
                     || self.messages.last().map(|m| m.role.as_str()) != Some("assistant")
                 {
@@ -1609,6 +1076,8 @@ impl App {
                     });
                 } else if transport {
                     self.provider_auto_continues = 0;
+                    self.agent_turn_active = false;
+                    self.refresh_bg_running();
                     self.push_system(format!(
                         "Provider hiccup: {message}\n\
                          Auto-retry exhausted — type continue or /handoff (session stayed open)."
@@ -1618,10 +1087,14 @@ impl App {
                     self.tool_in_progress = None;
                 } else if let Some(last) = self.messages.last_mut() {
                     last.text.push_str(&format!("\n❌ Error: {}", message));
+                    self.agent_turn_active = false;
+                    self.refresh_bg_running();
                     self.status = "error".to_string();
                     self.input_mode = InputMode::Insert;
                     self.tool_in_progress = None;
                 } else {
+                    self.agent_turn_active = false;
+                    self.refresh_bg_running();
                     self.status = "error".to_string();
                     self.input_mode = InputMode::Insert;
                     self.tool_in_progress = None;
@@ -1634,6 +1107,8 @@ impl App {
             }
             AgentEvent::Done => {
                 self.provider_auto_continues = 0;
+                self.agent_turn_active = false;
+                self.refresh_bg_running();
                 self.status = "ready".to_string();
                 self.unseen_done = true;
                 self.input_mode = InputMode::Insert;
@@ -1642,6 +1117,10 @@ impl App {
                 self.queued_steers = 0;
                 self.tool_in_progress = None;
                 self.publish_lifecycle(Lifecycle::Done, "ready");
+                if self.show_sessions_panel {
+                    self.sessions_panel
+                        .refresh(&self.session_id, self.bg_running_session.as_deref());
+                }
             }
             AgentEvent::GoalUpdate { summary } => {
                 if summary.starts_with("STATUS\n") {
@@ -1744,6 +1223,8 @@ impl App {
                 if let Some(last) = self.messages.last_mut() {
                     last.text.push_str("\n⊘ aborted");
                 }
+                self.agent_turn_active = false;
+                self.refresh_bg_running();
                 self.status = "aborted".to_string();
                 self.input_mode = InputMode::Insert;
                 self.tool_in_progress = None;
@@ -1761,28 +1242,42 @@ impl App {
                 }
             }
             AgentEvent::SessionMeta { id, title } => {
+                // Rekey the runtime map when fork/load changes the session id.
+                if id != self.agent_session_id {
+                    if let Some(mut rt) = self.runtimes.remove(&self.agent_session_id) {
+                        rt.id = id.clone();
+                        self.runtimes.insert(id.clone(), rt);
+                    }
+                }
+                self.agent_session_id = id.clone();
                 self.session_id = id;
                 self.session_title = title.filter(|t| !t.is_empty());
-                self.session_input_tokens = 0;
-                self.session_output_tokens = 0;
+                crate::tools::turn_snapshot::set_session(&self.session_id);
+                lifecycle::set_session(Some(self.session_id.clone()), None);
+                if self.show_sessions_panel {
+                    self.sessions_panel
+                        .refresh(&self.session_id, self.bg_running_session.as_deref());
+                }
             }
             AgentEvent::ReloadTranscript { messages } => {
-                let opener = self
-                    .messages
-                    .first()
-                    .filter(|m| m.role == "system")
-                    .cloned();
-                let mut rebuilt = Vec::new();
-                if let Some(sys) = opener {
-                    rebuilt.push(sys);
+                let has_chat = self.messages.iter().any(|m| m.role != "system");
+                // Drop stale empty reload that would wipe a painted chat.
+                if messages.is_empty() && has_chat {
+                    self.input_mode = InputMode::Insert;
+                    self.tool_in_progress = None;
+                    self.status = "ready".into();
+                    return;
                 }
-                rebuilt.extend(api_messages_to_chat(&messages));
-                self.messages = rebuilt;
-                self.timeline_entries = summarize_api_messages(&messages);
-                if self.timeline_selection >= self.timeline_entries.len() {
-                    self.timeline_selection = self.timeline_entries.len().saturating_sub(1);
+                self.apply_transcript_messages(&messages);
+                self.input_mode = InputMode::Insert;
+                self.tool_in_progress = None;
+                self.tool_output_tabs.clear();
+                self.show_repl_panel = false;
+                self.status = "ready".into();
+                if self.show_sessions_panel {
+                    self.sessions_panel
+                        .refresh(&self.session_id, self.bg_running_session.as_deref());
                 }
-                self.follow_bottom = true;
             }
             AgentEvent::TimelineSnapshot { entries } => {
                 self.timeline_entries = entries;
@@ -1840,6 +1335,14 @@ impl App {
                                         self.fleet_panel.selection = index;
                                         self.fleet_panel.expanded = true;
                                         self.activate_city_selection();
+                                    }
+                                }
+                                HitTarget::SessionRow { index } => {
+                                    if index < self.sessions_panel.rows.len()
+                                        && self.sessions_panel.rows[index].selectable()
+                                    {
+                                        self.sessions_panel.selection = index;
+                                        self.activate_sessions_selection();
                                     }
                                 }
                                 HitTarget::OutputTab { index } => {
@@ -2427,6 +1930,7 @@ impl App {
         if self.show_fleet_panel {
             self.show_timeline_panel = false;
             self.show_tree_panel = false;
+            self.show_sessions_panel = false;
             self.fleet_panel.refresh();
             self.push_system(
                 "City panel — WORKERS / WISHES / READY\n\
@@ -2434,6 +1938,494 @@ impl App {
             );
         } else {
             self.push_system("City panel hidden");
+        }
+    }
+
+    fn toggle_sessions_panel(&mut self) {
+        self.show_sessions_panel = !self.show_sessions_panel;
+        if self.show_sessions_panel {
+            self.show_fleet_panel = false;
+            self.show_timeline_panel = false;
+            self.show_tree_panel = false;
+            self.sessions_panel.refresh(&self.session_id, self.bg_running_session.as_deref());
+            self.push_system(
+                "Sessions panel — THIS PROJECT chats\n\
+                 ↑↓ select · Enter switch · n new · a all projects · /sessions again to hide",
+            );
+        } else {
+            self.push_system("Sessions panel hidden");
+        }
+    }
+
+    /// Rebuild chat + timeline from API messages, keeping the banner system opener.
+    fn apply_transcript_messages(&mut self, messages: &[Message]) {
+        let opener = self
+            .messages
+            .first()
+            .filter(|m| m.role == "system")
+            .cloned();
+        let mut rebuilt = Vec::new();
+        if let Some(sys) = opener {
+            rebuilt.push(sys);
+        }
+        rebuilt.extend(api_messages_to_chat(messages));
+        self.messages = rebuilt;
+        self.timeline_entries = summarize_api_messages(messages);
+        if self.timeline_selection >= self.timeline_entries.len() {
+            self.timeline_selection = self.timeline_entries.len().saturating_sub(1);
+        }
+        self.follow_bottom = true;
+        self.scroll_offset = 0;
+    }
+
+    /// Instantly update chat/header/panel from a loaded session (don't wait on agent thread).
+    fn apply_session_data_to_ui(&mut self, data: &SessionData) {
+        self.session_id = data.id.clone();
+        self.session_title = data.title.clone().filter(|t| !t.is_empty());
+        self.session_input_tokens = data.total_input_tokens;
+        self.session_output_tokens = data.total_output_tokens;
+        self.token_used = data.total_input_tokens.saturating_add(data.total_output_tokens);
+        self.apply_transcript_messages(&data.messages);
+        self.goal_indicator = match &data.goal {
+            Some(g)
+                if matches!(
+                    g.status,
+                    crate::agent::goal::GoalStatus::Active | crate::agent::goal::GoalStatus::Paused
+                ) =>
+            {
+                format!("◎ /goal {}", g.status.as_str())
+            }
+            _ => String::new(),
+        };
+        self.tool_output_tabs.clear();
+        self.tool_output_tab = 0;
+        self.show_repl_panel = false;
+        self.tool_in_progress = None;
+        self.input_mode = InputMode::Insert;
+        self.input.clear();
+        self.status = "ready".into();
+        self.near_limit = false;
+        self.queued_steers = 0;
+        self.provider_auto_continues = 0;
+        crate::tools::turn_snapshot::set_session(&self.session_id);
+        lifecycle::set_session(Some(self.session_id.clone()), None);
+        if self.show_sessions_panel {
+            self.sessions_panel.refresh(&self.session_id, self.bg_running_session.as_deref());
+        }
+    }
+
+    fn clear_chat_ui_for_new_session(&mut self) {
+        let opener = self
+            .messages
+            .first()
+            .filter(|m| m.role == "system")
+            .cloned();
+        self.messages = opener.into_iter().collect();
+        self.timeline_entries.clear();
+        self.timeline_selection = 0;
+        self.goal_indicator.clear();
+        self.session_title = None;
+        self.session_input_tokens = 0;
+        self.session_output_tokens = 0;
+        self.token_used = 0;
+        self.tool_output_tabs.clear();
+        self.tool_output_tab = 0;
+        self.show_repl_panel = false;
+        self.tool_in_progress = None;
+        self.input_mode = InputMode::Insert;
+        self.input.clear();
+        self.status = "new session…".into();
+        self.follow_bottom = true;
+        self.scroll_offset = 0;
+        self.near_limit = false;
+        self.queued_steers = 0;
+        self.provider_auto_continues = 0;
+    }
+
+    fn snapshot_focused_chat(&mut self) {
+        let id = self.session_id.clone();
+        if let Some(rt) = self.runtimes.get_mut(&id) {
+            rt.has_ui_snapshot = true;
+        }
+        self.ui_snapshots.insert(id, self.messages.clone());
+    }
+
+    fn append_text_delta_to_snapshot(messages: &mut Vec<ChatMessage>, text: &str) {
+        if messages.last().map(|m| m.role.as_str()) != Some("assistant") {
+            messages.push(ChatMessage {
+                role: "assistant".into(),
+                text: String::new(),
+                thinking: None,
+                show_thinking: false,
+                tool_blocks: Vec::new(),
+            });
+        }
+        if let Some(last) = messages.last_mut() {
+            last.text.push_str(text);
+        }
+    }
+
+    fn append_thinking_delta_to_snapshot(messages: &mut Vec<ChatMessage>, thinking: &str) {
+        if messages.last().map(|m| m.role.as_str()) != Some("assistant") {
+            messages.push(ChatMessage {
+                role: "assistant".into(),
+                text: String::new(),
+                thinking: None,
+                show_thinking: true,
+                tool_blocks: Vec::new(),
+            });
+        }
+        if let Some(last) = messages.last_mut() {
+            let was_empty = last.thinking.as_ref().map(|t| t.is_empty()).unwrap_or(true);
+            let prev = last.thinking.take().unwrap_or_default();
+            last.thinking = Some(prev + thinking);
+            if was_empty {
+                last.show_thinking = true;
+            }
+        }
+    }
+
+    fn focus_runtime(&mut self, id: &str) {
+        if let Some(rt) = self.runtimes.get(id) {
+            self.command_tx = rt.command_tx.clone();
+            self.abort_flag = rt.abort_flag.clone();
+            self.steer_queue = rt.steer_queue.clone();
+            self.agent_turn_active = rt.turn_active;
+        }
+        self.session_id = id.to_string();
+        self.agent_session_id = id.to_string();
+        self.refresh_bg_running();
+        crate::tools::turn_snapshot::set_session(&self.session_id);
+        lifecycle::set_session(Some(self.session_id.clone()), None);
+    }
+
+    /// Drain all session runtime event queues (update turn_active / offline buffers).
+    /// Returns focused-session events to paint via `handle_agent_event`.
+    fn pump_runtime_events(&mut self) -> Vec<AgentEvent> {
+        let focused = self.session_id.clone();
+        let mut focused_events = Vec::new();
+        let mut bg_stream: Vec<(String, AgentEvent)> = Vec::new();
+        let mut bg_done: Vec<(String, AgentEvent)> = Vec::new();
+        let mut bg_ids = Vec::new();
+        for (id, rt) in self.runtimes.iter_mut() {
+            while let Ok((_idx, ev)) = rt.event_rx.try_recv() {
+                if let Some(active) = turn_active_from_event(&ev) {
+                    rt.turn_active = active;
+                    if !active {
+                        rt.offline_events.clear();
+                    }
+                }
+                let is_focused = id == &focused;
+                if is_focused {
+                    focused_events.push(ev);
+                } else {
+                    let is_stream = matches!(
+                        ev,
+                        AgentEvent::TextDelta { .. }
+                            | AgentEvent::ThinkingDelta { .. }
+                            | AgentEvent::ToolUseStart { .. }
+                            | AgentEvent::ToolUseDelta { .. }
+                            | AgentEvent::ToolResult { .. }
+                            | AgentEvent::ToolOutput { .. }
+                            | AgentEvent::ReplOutput { .. }
+                    );
+                    if is_stream {
+                        if self.ui_snapshots.contains_key(id) {
+                            bg_stream.push((id.clone(), ev.clone()));
+                        } else if rt.turn_active {
+                            rt.offline_events.push(ev.clone());
+                        }
+                    }
+                    if matches!(
+                        ev,
+                        AgentEvent::Done | AgentEvent::Aborted | AgentEvent::Error { .. }
+                    ) {
+                        bg_done.push((id.clone(), ev));
+                    }
+                }
+            }
+            if rt.turn_active && id != &focused {
+                bg_ids.push(id.clone());
+            }
+        }
+        self.bg_running_session = bg_ids.first().cloned();
+
+        for (id, ev) in bg_stream {
+            if let Some(snap) = self.ui_snapshots.get_mut(&id) {
+                match ev {
+                    AgentEvent::TextDelta { text } => {
+                        Self::append_text_delta_to_snapshot(snap, &text);
+                    }
+                    AgentEvent::ThinkingDelta { thinking } => {
+                        Self::append_thinking_delta_to_snapshot(snap, &thinking);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        for (id, event) in bg_done {
+            let short = SessionStore::short_id(&id);
+            match &event {
+                AgentEvent::Error { message } => {
+                    self.push_toast(Toast::blocked(
+                        "background error",
+                        &format!("{short}: {message}"),
+                    ));
+                }
+                AgentEvent::Aborted => {
+                    self.push_system(format!("Background session {short} aborted."));
+                }
+                _ => {
+                    self.push_toast(Toast::finished(
+                        "background done",
+                        &format!("{short} finished"),
+                    ));
+                }
+            }
+            if self.show_sessions_panel {
+                self.sessions_panel
+                    .refresh(&self.session_id, self.bg_running_session.as_deref());
+            }
+        }
+        focused_events
+    }
+
+    fn apply_focus_ui_state(&mut self, id: &str, data: Option<&SessionData>) {
+        let title = data
+            .and_then(|d| d.title.clone())
+            .unwrap_or_else(|| "(untitled)".into());
+        let short = SessionStore::short_id(id).to_string();
+        let snap = self.ui_snapshots.get(id).cloned();
+        let has_snap = snap.is_some();
+
+        if let Some(data) = data {
+            self.session_title = data.title.clone().filter(|t| !t.is_empty());
+            self.session_input_tokens = data.total_input_tokens;
+            self.session_output_tokens = data.total_output_tokens;
+            self.token_used = data
+                .total_input_tokens
+                .saturating_add(data.total_output_tokens);
+            if !has_snap {
+                self.apply_session_data_to_ui(data);
+            }
+        }
+        if let Some(snap) = snap {
+            self.messages = snap;
+            self.follow_bottom = true;
+            self.scroll_offset = 0;
+        }
+
+        let still_active = self
+            .runtimes
+            .get(id)
+            .map(|r| r.turn_active)
+            .unwrap_or(false);
+        if still_active {
+            if !has_snap {
+                self.replay_offline_events(id);
+            } else if let Some(rt) = self.runtimes.get_mut(id) {
+                rt.offline_events.clear();
+            }
+            for ev in self.pump_runtime_events() {
+                self.handle_agent_event(ev);
+            }
+            self.ui_snapshots
+                .insert(id.to_string(), self.messages.clone());
+            let still_active = self
+                .runtimes
+                .get(id)
+                .map(|r| r.turn_active)
+                .unwrap_or(false);
+            if still_active {
+                self.input_mode = InputMode::Waiting;
+                self.status = "thinking...".into();
+                self.agent_turn_active = true;
+                self.push_system(format!("Focused live turn on {short} — {title}"));
+            } else {
+                self.input_mode = InputMode::Insert;
+                self.status = "ready".into();
+                self.agent_turn_active = false;
+                self.tool_in_progress = None;
+                self.push_system(format!("Switched to {short} — {title}"));
+            }
+        } else {
+            if let Some(rt) = self.runtimes.get_mut(id) {
+                rt.offline_events.clear();
+            }
+            self.ui_snapshots
+                .insert(id.to_string(), self.messages.clone());
+            self.input_mode = InputMode::Insert;
+            self.status = "ready".into();
+            self.agent_turn_active = false;
+            self.tool_in_progress = None;
+            self.push_system(format!("Switched to {short} — {title}"));
+        }
+    }
+
+    /// Replay stream buffered while this session was unfocused.
+    fn replay_offline_events(&mut self, id: &str) {
+        let events = self
+            .runtimes
+            .get_mut(id)
+            .map(|r| std::mem::take(&mut r.offline_events))
+            .unwrap_or_default();
+        for ev in events {
+            self.handle_agent_event(ev);
+        }
+    }
+
+    fn refresh_bg_running(&mut self) {
+        let focused = self.session_id.clone();
+        self.bg_running_session = self
+            .runtimes
+            .iter()
+            .find(|(id, rt)| rt.turn_active && *id != &focused)
+            .map(|(id, _)| id.clone());
+    }
+
+    fn spawn_config_for(&self, data: &SessionData) -> SessionRuntimeConfig {
+        SessionRuntimeConfig::from_session_data(
+            data,
+            self.provider.clone(),
+            self.model_name.clone(),
+            self.timeout_secs,
+            self.approved,
+            self.max_iterations,
+            self.rlm_depth,
+            self.thinking_budget,
+            self.system_prompt_opt.clone(),
+            self.permission_tx.clone(),
+        )
+    }
+
+    fn start_new_project_session(&mut self) {
+        // Persist the focused session; do not abort or NewSession the old runtime
+        // (it may still be running a turn in parallel).
+        let _ = self.command_tx.send(AppCommand::PersistSession);
+        for ev in self.pump_runtime_events() {
+            self.handle_agent_event(ev);
+        }
+        self.snapshot_focused_chat();
+
+        let cfg = SessionRuntimeConfig::empty_new(
+            self.provider.clone(),
+            self.model_name.clone(),
+            self.timeout_secs,
+            self.approved,
+            self.max_iterations,
+            self.rlm_depth,
+            self.thinking_budget,
+            self.system_prompt_opt.clone(),
+            self.permission_tx.clone(),
+        );
+        let new_id = cfg.id.clone();
+        let rt = spawn_session_runtime(cfg);
+        self.runtimes.insert(new_id.clone(), rt);
+        self.focus_runtime(&new_id);
+        self.clear_chat_ui_for_new_session();
+        self.ui_snapshots
+            .insert(new_id.clone(), self.messages.clone());
+        if let Some(rt) = self.runtimes.get_mut(&new_id) {
+            rt.has_ui_snapshot = true;
+        }
+        self.status = "ready".into();
+        self.push_system(format!(
+            "Started new session {} (previous session keeps running if mid-turn).",
+            SessionStore::short_id(&new_id)
+        ));
+        if self.show_sessions_panel {
+            self.sessions_panel
+                .refresh(&self.session_id, self.bg_running_session.as_deref());
+        }
+    }
+
+    fn switch_to_session_id(&mut self, id: &str) {
+        if id == self.session_id {
+            self.push_system(format!(
+                "Already on session {}",
+                SessionStore::short_id(id)
+            ));
+            return;
+        }
+
+        // Persist focused session before leaving (non-blocking command).
+        let _ = self.command_tx.send(AppCommand::PersistSession);
+        // Drain so turn_active flags are up to date before we decide Waiting vs ready.
+        for ev in self.pump_runtime_events() {
+            self.handle_agent_event(ev);
+        }
+        // Keep the live transcript (including typed user bubbles) — disk often
+        // lags behind PersistSession and offline TextDelta replay drops users.
+        self.snapshot_focused_chat();
+
+        if self.runtimes.contains_key(id) {
+            self.focus_runtime(id);
+            match SessionStore::new().load(id) {
+                Ok(data) => self.apply_focus_ui_state(id, Some(&data)),
+                Err(e) => {
+                    self.push_system(format!("Runtime attached, but failed to load UI: {e}"));
+                    self.apply_focus_ui_state(id, None);
+                }
+            }
+            if self.show_sessions_panel {
+                self.sessions_panel
+                    .refresh(&self.session_id, self.bg_running_session.as_deref());
+            }
+            return;
+        }
+
+        let data = match SessionStore::new().load(id) {
+            Ok(d) => d,
+            Err(e) => {
+                self.push_system(format!("Failed to load session: {e}"));
+                return;
+            }
+        };
+        let title = data
+            .title
+            .clone()
+            .unwrap_or_else(|| "(untitled)".into());
+        let short = SessionStore::short_id(&data.id).to_string();
+        let msg_count = data.messages.len();
+        let cfg = self.spawn_config_for(&data);
+        let rt = spawn_session_runtime(cfg);
+        self.runtimes.insert(data.id.clone(), rt);
+        self.focus_runtime(&data.id);
+        self.apply_session_data_to_ui(&data);
+        self.ui_snapshots
+            .insert(data.id.clone(), self.messages.clone());
+        if let Some(rt) = self.runtimes.get_mut(&data.id) {
+            rt.has_ui_snapshot = true;
+        }
+        self.input_mode = InputMode::Insert;
+        self.status = "ready".into();
+        self.agent_turn_active = false;
+        self.tool_in_progress = None;
+        self.push_system(format!(
+            "Switched to {short} — {title} ({msg_count} msgs)"
+        ));
+        if self.show_sessions_panel {
+            self.sessions_panel
+                .refresh(&self.session_id, self.bg_running_session.as_deref());
+        }
+    }
+
+    fn activate_sessions_selection(&mut self) {
+        match self.sessions_panel.selected_row().cloned() {
+            Some(SessionRow::Session { summary }) => {
+                self.switch_to_session_id(&summary.id);
+            }
+            Some(SessionRow::Action { id, .. }) if id == "new" => {
+                self.start_new_project_session();
+            }
+            Some(SessionRow::Action { id, .. }) if id == "toggle_scope" => {
+                self.sessions_panel.show_all = !self.sessions_panel.show_all;
+                self.sessions_panel.refresh(&self.session_id, self.bg_running_session.as_deref());
+            }
+            _ => {
+                self.push_system("Nothing selected — ↑↓ to a session or action.");
+            }
         }
     }
 
@@ -3410,41 +3402,63 @@ impl App {
                     self.push_system("Usage: /mode plan|ask|agent");
                 }
             }
-            "/sessions" => match SessionStore::new().list_summaries() {
-                Ok(mut summaries) => {
-                    if summaries.is_empty() {
-                        self.push_system("No saved sessions.");
-                    } else {
-                        summaries.sort_by(|a, b| b.id.cmp(&a.id));
-                        let mut out = String::from("Sessions (newest first):\n");
-                        for s in summaries.iter().take(20) {
-                            let title = s.title.clone().unwrap_or_else(|| "(untitled)".to_string());
-                            let fork = match (&s.parent_id, &s.branch_label) {
-                                (Some(p), Some(l)) => {
-                                    format!(" ↩{} [{}]", SessionStore::short_id(p), l)
+            "/sessions" => {
+                let raw = arg.trim().to_lowercase();
+                if raw == "list" || raw == "text" {
+                    match SessionStore::new().list_summaries() {
+                        Ok(mut summaries) => {
+                            if summaries.is_empty() {
+                                self.push_system("No saved sessions.");
+                            } else {
+                                let project = SessionStore::current_project_root();
+                                summaries.sort_by(|a, b| b.id.cmp(&a.id));
+                                let mut out = String::from("Sessions (newest first):\n");
+                                for s in summaries.iter().take(30) {
+                                    let title =
+                                        s.title.clone().unwrap_or_else(|| "(untitled)".to_string());
+                                    let mine = project
+                                        .as_ref()
+                                        .map(|p| {
+                                            SessionStore::same_project(s.project_root.as_deref(), p)
+                                        })
+                                        .unwrap_or(false);
+                                    let mark = if s.id == self.session_id {
+                                        "●"
+                                    } else if mine {
+                                        "·"
+                                    } else {
+                                        " "
+                                    };
+                                    let fork = match (&s.parent_id, &s.branch_label) {
+                                        (Some(p), Some(l)) => {
+                                            format!(" ↩{} [{}]", SessionStore::short_id(p), l)
+                                        }
+                                        (Some(p), None) => {
+                                            format!(" ↩{}", SessionStore::short_id(p))
+                                        }
+                                        _ => String::new(),
+                                    };
+                                    out.push_str(&format!(
+                                        "  {mark} {}  {} msgs  {}  — {}{}\n",
+                                        SessionStore::short_id(&s.id),
+                                        s.message_count,
+                                        s.model,
+                                        title,
+                                        fork
+                                    ));
                                 }
-                                (Some(p), None) => {
-                                    format!(" ↩{}", SessionStore::short_id(p))
-                                }
-                                _ => String::new(),
-                            };
-                            out.push_str(&format!(
-                                "  {}  {} msgs  {}  — {}{}\n",
-                                SessionStore::short_id(&s.id),
-                                s.message_count,
-                                s.model,
-                                title,
-                                fork
-                            ));
+                                out.push_str(
+                                    "Panel: /sessions · Switch in-panel with Enter · New: n or /new",
+                                );
+                                self.push_system(out);
+                            }
                         }
-                        out.push_str(
-                            "Resume: rs-agent -r <id> · rs-agent -r latest · Fork: /fork [label]",
-                        );
-                        self.push_system(out);
+                        Err(e) => self.push_system(format!("Failed to list sessions: {}", e)),
                     }
+                } else {
+                    self.toggle_sessions_panel();
                 }
-                Err(e) => self.push_system(format!("Failed to list sessions: {}", e)),
-            },
+            }
             "/export" => {
                 let fmt = if arg.is_empty() {
                     "md"
@@ -3576,9 +3590,7 @@ impl App {
                 }
             }
             "/new" => {
-                self.goal_indicator.clear();
-                let _ = self.command_tx.send(AppCommand::NewSession);
-                self.push_system("Starting new session…");
+                self.start_new_project_session();
             }
             "/fork" => {
                 let (at, label) = parse_fork_args(arg);
@@ -3591,6 +3603,8 @@ impl App {
             "/timeline" => {
                 self.show_timeline_panel = !self.show_timeline_panel;
                 if self.show_timeline_panel {
+                    self.show_fleet_panel = false;
+                    self.show_sessions_panel = false;
                     let _ = self.command_tx.send(AppCommand::RequestTimeline);
                     self.push_system(
                         "Timeline panel: j/k or ↑/↓ select · Enter fork at @N · Esc closes · /fork @N [label]",
@@ -3922,6 +3936,32 @@ impl App {
                 _ => {}
             }
         }
+        if self.show_sessions_panel {
+            match key.code {
+                KeyCode::Up => {
+                    self.sessions_panel.move_sel(-1);
+                    return;
+                }
+                KeyCode::Down => {
+                    self.sessions_panel.move_sel(1);
+                    return;
+                }
+                KeyCode::Enter => {
+                    self.activate_sessions_selection();
+                    return;
+                }
+                KeyCode::Char('n') => {
+                    self.start_new_project_session();
+                    return;
+                }
+                KeyCode::Char('a') => {
+                    self.sessions_panel.show_all = !self.sessions_panel.show_all;
+                    self.sessions_panel.refresh(&self.session_id, self.bg_running_session.as_deref());
+                    return;
+                }
+                _ => {}
+            }
+        }
         if self.key_matches("insert", key) {
             self.input_mode = InputMode::Insert;
             self.unseen_done = false;
@@ -3950,12 +3990,17 @@ impl App {
             }
             return;
         }
+        if self.key_matches("toggle_sessions", key) {
+            self.toggle_sessions_panel();
+            return;
+        }
         if self.key_matches("toggle_tree", key) {
-            if self.show_tree_panel && !self.show_fleet_panel {
+            if self.show_tree_panel && !self.show_fleet_panel && !self.show_sessions_panel {
                 self.side_mode = self.side_mode.toggle();
                 self.status = format!("side · {}", self.side_mode.label());
             } else {
                 self.show_fleet_panel = false;
+                self.show_sessions_panel = false;
                 self.show_timeline_panel = false;
                 self.show_tree_panel = true;
                 self.side_mode = SidePanelMode::Tree;
@@ -4145,6 +4190,10 @@ impl App {
         let expanded = Self::expand_dir_tokens(&text);
 
         self.input_mode = InputMode::Waiting;
+        self.agent_turn_active = true;
+        if let Some(rt) = self.runtimes.get_mut(&self.session_id) {
+            rt.turn_active = true;
+        }
         self.queued_steers = 0;
         if self.tool_in_progress.is_none() {
             self.tool_output_tabs.clear();
@@ -5049,15 +5098,17 @@ impl App {
         self.hit_map.clear();
         lifecycle::set_focused(true);
 
-        let show_side =
-            self.show_fleet_panel || self.show_timeline_panel || self.show_tree_panel;
+        let show_side = self.show_fleet_panel
+            || self.show_sessions_panel
+            || self.show_timeline_panel
+            || self.show_tree_panel;
         let show_repl = self.show_repl_panel || !self.tool_output_tabs.is_empty();
         let view = compute_view(
             area,
             LayoutOpts {
                 show_repl,
                 show_side,
-                side_pct: if self.show_fleet_panel {
+                side_pct: if self.show_fleet_panel || self.show_sessions_panel {
                     34
                 } else if self.show_timeline_panel {
                     32
@@ -5096,7 +5147,48 @@ impl App {
         }
         self.render_messages(frame, view.chat);
         if let Some(side) = view.side {
-            if self.show_fleet_panel {
+            if self.show_sessions_panel {
+                sessions_panel::render_sessions_panel(
+                    frame,
+                    side,
+                    &self.sessions_panel,
+                    &self.palette,
+                );
+                let mut y = side.y.saturating_add(1);
+                for (i, row) in self.sessions_panel.rows.iter().enumerate() {
+                    match row {
+                        SessionRow::Header { .. } => {
+                            y = y.saturating_add(1);
+                        }
+                        SessionRow::Hint { .. } => {
+                            y = y.saturating_add(1);
+                        }
+                        SessionRow::Session { summary } => {
+                            self.hit_map.push_line(
+                                side.x,
+                                y,
+                                side.width,
+                                HitTarget::SessionRow { index: i },
+                            );
+                            y = y.saturating_add(1);
+                            if i == self.sessions_panel.selection
+                                || summary.id == self.sessions_panel.active_id
+                            {
+                                y = y.saturating_add(1);
+                            }
+                        }
+                        SessionRow::Action { .. } => {
+                            self.hit_map.push_line(
+                                side.x,
+                                y,
+                                side.width,
+                                HitTarget::SessionRow { index: i },
+                            );
+                            y = y.saturating_add(1);
+                        }
+                    }
+                }
+            } else if self.show_fleet_panel {
                 fleet_panel::render_city_panel(frame, side, &self.fleet_panel, &self.palette);
                 // Map selectable rows to click targets (rough 1-line-per-row after chrome).
                 let mut y = side.y.saturating_add(3);

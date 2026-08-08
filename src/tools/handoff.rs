@@ -5,23 +5,19 @@ use crate::agent::tool::*;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
-use std::sync::{Mutex, OnceLock};
+use std::cell::RefCell;
 
-/// Active seat name for diary append (set when `/seat` binds).
-static ACTIVE_SEAT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-
-fn seat_slot() -> &'static Mutex<Option<String>> {
-    ACTIVE_SEAT.get_or_init(|| Mutex::new(None))
+// Active seat name for diary append (set when `/seat` binds) — per session runtime thread.
+thread_local! {
+    static ACTIVE_SEAT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 pub fn set_active_seat(name: Option<String>) {
-    if let Ok(mut g) = seat_slot().lock() {
-        *g = name;
-    }
+    ACTIVE_SEAT.with(|s| *s.borrow_mut() = name);
 }
 
 pub fn active_seat() -> Option<String> {
-    seat_slot().lock().ok().and_then(|g| g.clone())
+    ACTIVE_SEAT.with(|s| s.borrow().clone())
 }
 
 #[derive(Deserialize)]

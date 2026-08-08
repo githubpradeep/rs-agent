@@ -188,6 +188,26 @@ Panel sections (↑↓ · Enter · x):
 
 Spawn workers: `/fleet up`. Intake ambition: `/wish port Softmax`. Marshal fills READY; workers claim.
 
+## Sessions panel (multi-chat per project)
+
+Herdr-style session switcher for the project you’re in. **True parallel**: each
+session gets its own agent OS thread that keeps running when you switch away
+(◐ in the panel). Switch back to watch the live turn; messages on the focused
+session go to that session’s runtime immediately.
+
+```text
+/sessions       toggle Sessions side panel
+s               same (normal mode)
+/sessions list  text dump
+n               new session (while panel open)
+a               toggle this-project / all-projects
+Enter           switch to selected session (saves current first)
+```
+
+Sessions are tagged with `project_root` (cwd) on save. Panel defaults to **THIS PROJECT**.
+
+Fleet workers remain available for headless seats outside the TUI.
+
 ## Runtime control plane
 
 ```bash
@@ -211,7 +231,8 @@ Capture these for docs / demos (Kitty / iTerm recommended):
 
 1. **Idle** — header `○ idle`, lean footer, empty chat + input
 2. **Blocked** — permission modal + toast + `● blocked` chip; optional OSC notify when unfocused
-3. **Fleet** — `/fleet` side panel attention-sorted with a blocked seat
+3. **Sessions** — `/sessions` side panel with this-project chats + active ●
+4. **Fleet** — `/fleet` side panel attention-sorted with a blocked seat
 4. **Tree** — `/tree` TurnBar + lazy expand during a Deep Context turn
 5. **Palette** — `Ctrl+K` filtered command list; `?` help overlay
 
@@ -291,9 +312,10 @@ Typed in insert mode, run on `Enter`.
 | `/provider [name]` / `/login` | Interactive provider menu: switch ready providers, or open signup URL + paste API key into `~/.rs-agent/secrets.toml` |
 | `/theme [dark\|light\|forest]` | Switch (or show) the TUI color theme |
 | `/compact` | Compact/summarize the conversation to reclaim context |
-| `/new` | Start a fresh session (new session id) |
+| `/new` | Start a fresh session (new session id; saves the current one first) |
 | `/fork [label]` | Fork current session (same messages; new id + parent) |
-| `/sessions` | List saved sessions (shows fork parent when present) |
+| `/sessions` | Toggle Sessions side panel (project chats · Enter switch · `n` new) |
+| `/sessions list` | Text dump of saved sessions |
 | `/export [md\|json\|html]` | Export the current session transcript (markdown default; json/html for sharing) |
 | `/trust list\|reset` | Manage the per-project trust store |
 | `/rename <title>` | Rename the current session |

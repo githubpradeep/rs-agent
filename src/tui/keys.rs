@@ -12,6 +12,7 @@ pub fn default_keybindings() -> HashMap<String, String> {
     m.insert("jump_bottom".into(), "G".into());
     m.insert("expand_tool".into(), "e".into());
     m.insert("toggle_tree".into(), "T".into());
+    m.insert("toggle_sessions".into(), "s".into());
     m.insert("perm_once".into(), "a".into());
     // Keep off `t` — that toggles thinking in normal mode.
     m.insert("perm_always".into(), "A".into());
@@ -75,12 +76,13 @@ impl KeyMap {
 
     pub fn hint_line(&self) -> String {
         format!(
-            "[{}]=insert [{}]=quit [{}]=think [{}]=tool [{}]=tree",
+            "[{}]=insert [{}]=quit [{}]=think [{}]=tool [{}]=tree [{}]=sessions",
             self.binding("insert"),
             self.binding("quit"),
             self.binding("toggle_thinking"),
             self.binding("expand_tool"),
             self.binding("toggle_tree"),
+            self.binding("toggle_sessions"),
         )
     }
 }

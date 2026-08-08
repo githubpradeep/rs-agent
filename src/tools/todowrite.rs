@@ -4,7 +4,7 @@ use crate::agent::tool::*;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::Mutex;
+use std::cell::RefCell;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TodoItem {
@@ -26,25 +26,25 @@ struct TodoWriteArgs {
     merge: Option<bool>,
 }
 
-static TODOS: Mutex<Vec<TodoItem>> = Mutex::new(Vec::new());
+thread_local! {
+    static TODOS: RefCell<Vec<TodoItem>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Snapshot of the current in-memory todo list (for session persistence).
 pub fn snapshot() -> Vec<TodoItem> {
-    TODOS.lock().map(|g| g.clone()).unwrap_or_default()
+    TODOS.with(|t| t.borrow().clone())
 }
 
 /// Restore todos from a resumed session.
 pub fn restore(items: Vec<TodoItem>) {
-    if let Ok(mut g) = TODOS.lock() {
-        *g = items;
-    }
+    TODOS.with(|t| {
+        *t.borrow_mut() = items;
+    });
 }
 
 /// Clear the in-memory list (new session).
 pub fn clear() {
-    if let Ok(mut g) = TODOS.lock() {
-        g.clear();
-    }
+    TODOS.with(|t| t.borrow_mut().clear());
 }
 
 pub fn format_summary(items: &[TodoItem]) -> String {
@@ -147,24 +147,23 @@ impl AgentTool for TodoWriteTool {
             })
             .collect();
 
-        let mut guard = match TODOS.lock() {
-            Ok(g) => g,
-            Err(_) => return ToolExecuteResult::error("Todo store poisoned"),
-        };
-
-        if merge {
-            for item in incoming {
-                if let Some(existing) = guard.iter_mut().find(|t| t.id == item.id) {
-                    *existing = item;
-                } else {
-                    guard.push(item);
+        let summary = TODOS.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            if merge {
+                for item in incoming {
+                    if let Some(existing) = guard.iter_mut().find(|t| t.id == item.id) {
+                        *existing = item;
+                    } else {
+                        guard.push(item);
+                    }
                 }
+            } else {
+                *guard = incoming;
             }
-        } else {
-            *guard = incoming;
-        }
+            format_summary(&guard)
+        });
 
-        ToolExecuteResult::ok(format_summary(&guard))
+        ToolExecuteResult::ok(summary)
     }
 }
 

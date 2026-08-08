@@ -42,6 +42,10 @@ pub struct SessionData {
     /// Last handoff notes (agent-authored continuity).
     #[serde(default)]
     pub handoff: Option<crate::agent::handoff::HandoffNotes>,
+    /// Canonical project directory this session belongs to (cwd at save time).
+    /// Used by the sessions side panel to filter "this project" vs all.
+    #[serde(default)]
+    pub project_root: Option<String>,
 }
 
 impl SessionData {
@@ -56,6 +60,13 @@ impl SessionData {
     pub fn ensure_title(&mut self) {
         if self.title.is_none() {
             self.title = self.auto_title_from_messages();
+        }
+    }
+
+    /// Tag this session with the current working directory (project scope).
+    pub fn stamp_project(&mut self) {
+        if let Some(root) = SessionStore::current_project_root() {
+            self.project_root = Some(root);
         }
     }
 }
@@ -97,6 +108,8 @@ pub struct SessionSummary {
     pub parent_id: Option<String>,
     #[serde(default)]
     pub branch_label: Option<String>,
+    #[serde(default)]
+    pub project_root: Option<String>,
 }
 
 /// Render a session transcript as a Markdown document (for export/sharing).
@@ -320,6 +333,28 @@ impl SessionStore {
         id.strip_prefix("session_").unwrap_or(id)
     }
 
+    /// Normalize a path for project-root comparisons (absolute, no trailing slash).
+    pub fn normalize_project_root(path: &Path) -> String {
+        let abs = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let s = abs.to_string_lossy().to_string();
+        s.trim_end_matches('/').to_string()
+    }
+
+    /// Current working directory as a project root, if available.
+    pub fn current_project_root() -> Option<String> {
+        std::env::current_dir()
+            .ok()
+            .map(|p| Self::normalize_project_root(&p))
+    }
+
+    /// True when `session_root` matches `project` (both normalized).
+    pub fn same_project(session_root: Option<&str>, project: &str) -> bool {
+        match session_root {
+            Some(r) => Self::normalize_project_root(Path::new(r)) == project,
+            None => false,
+        }
+    }
+
     pub fn session_path(&self, id: &str) -> String {
         Path::new(&self.dir).join(format!("{}.json", id))
             .to_string_lossy()
@@ -463,6 +498,9 @@ impl SessionStore {
             _ => "fork".into(),
         };
         data.title = Some(format!("{} [{}]", base_title, fork_label));
+        if data.project_root.is_none() {
+            data.project_root = Self::current_project_root();
+        }
         self.save(&data)?;
         Ok(data)
     }
@@ -484,10 +522,33 @@ impl SessionStore {
                     message_count: data.messages.len(),
                     parent_id: data.parent_id,
                     branch_label: data.branch_label,
+                    project_root: data.project_root,
                 })
             })
             .collect();
         Ok(summaries)
+    }
+
+    /// Summaries for one project (newest first). `include_untagged` keeps
+    /// legacy sessions with no `project_root` (useful when migrating).
+    pub fn list_summaries_for_project(
+        &self,
+        project: &str,
+        include_untagged: bool,
+    ) -> Result<Vec<SessionSummary>, String> {
+        let project = Self::normalize_project_root(Path::new(project));
+        let mut out: Vec<SessionSummary> = self
+            .list_summaries()?
+            .into_iter()
+            .filter(|s| {
+                if Self::same_project(s.project_root.as_deref(), &project) {
+                    return true;
+                }
+                include_untagged && s.project_root.is_none()
+            })
+            .collect();
+        out.sort_by(|a, b| b.id.cmp(&a.id));
+        Ok(out)
     }
 }
 
@@ -540,6 +601,7 @@ mod tests {
             goal: None,
             seat: None,
             handoff: None,
+            project_root: None,
         }
     }
 

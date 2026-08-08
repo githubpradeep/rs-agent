@@ -7,6 +7,7 @@ pub mod keys;
 pub mod kitty;
 pub mod layout;
 pub mod renderer;
+pub mod sessions_panel;
 pub mod settings;
 pub mod status;
 pub mod theme;
