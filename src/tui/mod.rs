@@ -13,6 +13,7 @@ pub mod status;
 pub mod theme;
 pub mod toast;
 pub mod tree_view;
+pub mod ui;
 pub mod widgets;
 
 pub use app::App;

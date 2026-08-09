@@ -739,6 +739,36 @@ pub fn fleet_up(opts: FleetUpOpts) -> Result<String, String> {
     Ok(out)
 }
 
+/// Delete a seat from the city: stop process, remove fleet files, drop seat profile.
+pub fn delete_seat(seat: &str) -> String {
+    let mut out = String::new();
+    out.push_str(&fleet_down(Some(vec![seat.to_string()])));
+    let slug = seat_slug(seat);
+    let dir = fleet_dir();
+    let mut removed = Vec::new();
+    for suffix in [
+        ".status.json",
+        ".log",
+        ".pid",
+        ".control.jsonl",
+        ".control.offset",
+        ".spawn.log",
+    ] {
+        let path = dir.join(format!("{slug}{suffix}"));
+        if path.exists() {
+            match fs::remove_file(&path) {
+                Ok(()) => removed.push(suffix.trim_start_matches('.').to_string()),
+                Err(e) => out.push_str(&format!("  WARN remove {}: {e}\n", path.display())),
+            }
+        }
+    }
+    match crate::agent::seat::delete(seat) {
+        Ok(()) => out.push_str(&format!("Deleted seat `{seat}` (profile + {:?})\n", removed)),
+        Err(e) => out.push_str(&format!("Deleted fleet files for `{seat}`; profile: {e}\n")),
+    }
+    out
+}
+
 /// Stop fleet workers (by pid files + running status).
 pub fn fleet_down(seats: Option<Vec<String>>) -> String {
     ensure_fleet_dir();

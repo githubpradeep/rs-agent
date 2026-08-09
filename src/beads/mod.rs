@@ -609,6 +609,23 @@ pub fn close(path: Option<&Path>, id: &str, notes: Option<&str>) -> Result<Bead,
     Ok(close_pipeline(path, id, notes)?.closed)
 }
 
+/// Hard-delete a bead from the graph (removes the record; does not spawn pipeline stages).
+pub fn delete(path: Option<&Path>, id: &str) -> Result<Bead, String> {
+    with_lock_path(path, |_p, file| {
+        let idx = file
+            .beads
+            .iter()
+            .position(|b| b.id == id)
+            .ok_or_else(|| format!("bead `{id}` not found"))?;
+        let removed = file.beads.remove(idx);
+        // Drop dangling deps that pointed at this bead.
+        for b in &mut file.beads {
+            b.deps.retain(|d| d != id);
+        }
+        Ok(removed)
+    })
+}
+
 /// Close a bead and advance the design→implement→review pipeline when applicable.
 pub fn close_pipeline(
     path: Option<&Path>,

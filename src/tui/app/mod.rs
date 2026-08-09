@@ -29,7 +29,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::Frame;
 
-use super::fleet_panel::{self, BeadDetailKind, CityRow, CityView, FleetPanelState};
+use super::fleet_panel::{self, BoardRow, FleetPanelState};
+use super::ui::FocusZone;
 use super::sessions_panel::{self, SessionRow, SessionsPanelState};
 use super::help::{self, HelpOverlay};
 use super::hit::{HitMap, HitTarget};
@@ -173,30 +174,24 @@ struct FleetAttachState {
     attach_started: Instant,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SpawnFocus {
-    Fleet,
-    Crew,
+mod city_ops;
+
+#[derive(Debug, Clone)]
+enum CityDeleteTarget {
+    Worker { seat: String },
+    Bead { id: String, title: String },
 }
 
-/// Modals for City cockpit (wish / spawn / steer / stop / assign).
+/// Confirm / assign only — wish/steer/spawn are inline composers.
 #[derive(Debug, Clone)]
 enum CityOverlay {
     None,
-    Wish {
-        text: String,
-    },
-    Spawn {
-        fleet_n: String,
-        crew_n: String,
-        focus: SpawnFocus,
-    },
-    Steer {
-        text: String,
-    },
     ConfirmDown {
-        /// None = stop all workers.
         seat: Option<String>,
+    },
+    /// Hard-delete worker (files+profile) or bead/wish.
+    ConfirmDelete {
+        target: CityDeleteTarget,
     },
     Assign {
         bead_id: String,
@@ -331,6 +326,9 @@ pub struct App {
     /// Log follower for seat detail when not using fleet_attach.follower.
     city_detail_follower: Option<crate::fleet::LogFollower>,
     city_overlay: CityOverlay,
+    focus_zone: FocusZone,
+    /// When true, Deep Context tree strip shows under City (coexist).
+    show_tree_with_city: bool,
     show_sessions_panel: bool,
     sessions_panel: SessionsPanelState,
     side_mode: SidePanelMode,
@@ -743,6 +741,8 @@ impl App {
             fleet_panel: FleetPanelState::default(),
             city_detail_follower: None,
             city_overlay: CityOverlay::None,
+            focus_zone: FocusZone::Chat,
+            show_tree_with_city: false,
             show_sessions_panel: false,
             sessions_panel: SessionsPanelState::default(),
             side_mode: SidePanelMode::Tree,
@@ -896,6 +896,15 @@ impl App {
             if self.show_fleet_panel && self.fleet_refresh_at.elapsed() >= Duration::from_secs(1) {
                 self.fleet_panel.refresh();
                 self.fleet_refresh_at = Instant::now();
+            }
+            // Deep Context auto-surface: show tree drawer with City when [D] active.
+            if self.tree_breadcrumb != "idle" && self.show_fleet_panel && !self.show_tree_with_city
+            {
+                self.show_tree_with_city = true;
+                self.show_tree_panel = true;
+            }
+            if self.tree_breadcrumb == "idle" && self.show_tree_with_city && self.show_fleet_panel {
+                // Keep drawer until user toggles; do not auto-hide (less surprising).
             }
             if self.show_sessions_panel && self.fleet_refresh_at.elapsed() >= Duration::from_secs(2) {
                 self.sessions_panel.refresh(&self.session_id, self.bg_running_session.as_deref());
@@ -1379,12 +1388,10 @@ impl App {
                                     }
                                 }
                                 HitTarget::FleetRow { index } => {
-                                    if index < self.fleet_panel.rows.len()
-                                        && self.fleet_panel.rows[index].selectable()
-                                    {
+                                    if index < self.fleet_panel.board_rows.len() {
                                         self.fleet_panel.selection = index;
-                                        self.fleet_panel.expanded = true;
                                         self.activate_city_selection();
+                                        self.focus_zone = FocusZone::CityInspector;
                                     }
                                 }
                                 HitTarget::SessionRow { index } => {
@@ -1684,14 +1691,11 @@ impl App {
         if self.fleet_attach.is_some() {
             self.fleet_detach(true);
         }
-        self.city_open_seat_detail(seat);
+        self.fleet_panel.select_seat(seat);
         let (follower, initial) = crate::fleet::LogFollower::from_tail(seat, 80);
         self.fleet_panel.set_log_from_parsed(&initial);
         self.city_detail_follower = None;
-        self.push_system(format!(
-            "Following `{seat}` — live log in City panel (worker keeps running).\n\
-             Keys: s steer · b abort · a attach · Esc / D detach follow"
-        ));
+        self.fleet_panel.status_line = format!("following {seat}");
         self.fleet_attach = Some(FleetAttachState {
             seat: seat.to_string(),
             phase: FleetAttachPhase::Follow,
@@ -1701,12 +1705,11 @@ impl App {
             attach_started: Instant::now(),
         });
         self.status = format!("following {seat}");
+        self.focus_zone = FocusZone::CityInspector;
         if !self.show_fleet_panel {
             self.show_fleet_panel = true;
-            self.show_sessions_panel = false;
-            self.show_timeline_panel = false;
-            self.show_tree_panel = false;
         }
+        self.push_toast(Toast::finished("follow", seat));
     }
 
     fn fleet_start_attach(&mut self, seat: &str) {
@@ -1984,30 +1987,24 @@ impl App {
     fn toggle_city_panel(&mut self) {
         self.show_fleet_panel = !self.show_fleet_panel;
         if self.show_fleet_panel {
-            self.show_timeline_panel = false;
-            self.show_tree_panel = false;
             self.show_sessions_panel = false;
-            self.fleet_panel.back_to_board();
-            self.city_detail_follower = None;
-            self.push_system(
-                "City panel — ACTIONS / WORKERS / WISHES / READY\n\
-                 c toggle · w wish · u spawn · Enter detail · Esc back",
-            );
+            self.show_timeline_panel = false;
+            // Tree can coexist via show_tree_with_city; keep tree panel flag for drawer.
+            self.fleet_panel.refresh();
+            self.focus_zone = FocusZone::CityWish;
+            self.fleet_panel.status_line =
+                "wish→spawn→select→follow — Tab zones".into();
         } else {
             self.city_overlay = CityOverlay::None;
             self.city_detail_follower = None;
-            if self.fleet_panel.is_board() {
-                // keep board cleared
-            } else {
-                self.fleet_panel.back_to_board();
+            if self.focus_zone.is_city() {
+                self.focus_zone = FocusZone::Chat;
             }
-            self.push_system("City panel hidden");
         }
     }
 
-    fn city_open_seat_detail(&mut self, seat: &str) {
-        self.fleet_panel.open_seat_detail(seat);
-        // Prefer attach follower when already following this seat.
+    fn city_select_seat(&mut self, seat: &str) {
+        self.fleet_panel.select_seat(seat);
         let reuse_attach = self
             .fleet_attach
             .as_ref()
@@ -2018,43 +2015,100 @@ impl App {
             self.fleet_panel.set_log_from_parsed(&initial);
             self.city_detail_follower = Some(follower);
         }
+        self.focus_zone = FocusZone::CityInspector;
         self.fleet_panel.refresh();
     }
 
-    fn city_open_wish_modal(&mut self) {
-        self.city_overlay = CityOverlay::Wish {
-            text: String::new(),
-        };
-        self.status = "compose wish…".into();
-    }
-
-    fn city_open_spawn_modal(&mut self) {
-        self.city_overlay = CityOverlay::Spawn {
-            fleet_n: "2".into(),
-            crew_n: "0".into(),
-            focus: SpawnFocus::Fleet,
-        };
-        self.status = "spawn workers…".into();
-    }
-
-    fn city_open_steer_modal(&mut self) {
-        if self.fleet_attach.is_none() {
-            if let Some(seat) = self.fleet_panel.seat_detail_name().map(|s| s.to_string()) {
-                self.fleet_start_follow(&seat);
-            } else {
-                self.push_system("Open a seat detail first, then steer.");
-                return;
+    fn city_submit_wish(&mut self) {
+        let text = std::mem::take(&mut self.fleet_panel.wish_text);
+        if text.trim().is_empty() {
+            self.fleet_panel.status_line = "wish text empty".into();
+            return;
+        }
+        match crate::wish::create_wish(&text, false, true) {
+            Ok(b) => {
+                self.push_toast(Toast::finished("wish", &b.id));
+                self.fleet_panel.status_line = format!("wish {} accepted", b.id);
+                self.fleet_panel.refresh();
+                self.focus_zone = FocusZone::CityBoard;
+            }
+            Err(e) => {
+                self.fleet_panel.status_line = e;
             }
         }
-        self.city_overlay = CityOverlay::Steer {
-            text: String::new(),
-        };
-        self.status = "steer…".into();
+    }
+
+    fn city_submit_spawn(&mut self) {
+        let fn_ = city_ops::parse_count(&self.fleet_panel.spawn_fleet_n, 2);
+        let cn = city_ops::parse_count(&self.fleet_panel.spawn_crew_n, 0);
+        let seats = city_ops::seats_for_spawn(fn_, cn);
+        if seats.is_empty() {
+            self.fleet_panel.status_line = "spawn needs fleet or crew > 0".into();
+            return;
+        }
+        let opts = city_ops::fleet_up_opts(
+            seats,
+            Some(self.provider_name.clone()),
+            Some(self.model_name.clone()),
+        );
+        match crate::fleet::fleet_up(opts) {
+            Ok(msg) => {
+                self.push_toast(Toast::finished("fleet up", "spawned"));
+                self.fleet_panel.status_line = msg.lines().next().unwrap_or("spawned").into();
+                self.fleet_panel.refresh();
+                self.focus_zone = FocusZone::CityBoard;
+            }
+            Err(e) => self.fleet_panel.status_line = e,
+        }
+    }
+
+    fn city_submit_steer(&mut self) {
+        let text = std::mem::take(&mut self.fleet_panel.steer_text);
+        if text.trim().is_empty() {
+            return;
+        }
+        if self.fleet_attach.is_none() {
+            if let Some(seat) = self.fleet_panel.selected_seat.clone() {
+                self.fleet_start_follow(&seat);
+            }
+        }
+        self.fleet_steer_remote(&text);
+        self.fleet_panel.status_line = "steer sent".into();
+        self.focus_zone = FocusZone::CityInspector;
     }
 
     fn city_open_down_confirm(&mut self, seat: Option<String>) {
         self.city_overlay = CityOverlay::ConfirmDown { seat };
         self.status = "confirm stop…".into();
+    }
+
+    fn city_open_delete_confirm(&mut self, target: CityDeleteTarget) {
+        self.city_overlay = CityOverlay::ConfirmDelete { target };
+        self.status = "confirm delete…".into();
+    }
+
+    /// Delete selection: worker → remove seat; flow item → delete bead.
+    fn city_request_delete_selection(&mut self) {
+        let target = match self.fleet_panel.board_rows.get(self.fleet_panel.selection) {
+            Some(BoardRow::Worker { seat }) => Some(CityDeleteTarget::Worker {
+                seat: seat.seat.clone(),
+            }),
+            Some(BoardRow::Flow { item }) => Some(CityDeleteTarget::Bead {
+                id: item.id.clone(),
+                title: item.title.clone(),
+            }),
+            None => self
+                .fleet_panel
+                .selected_seat
+                .clone()
+                .map(|seat| CityDeleteTarget::Worker { seat }),
+        };
+        match target {
+            Some(t) => self.city_open_delete_confirm(t),
+            None => {
+                self.fleet_panel.status_line = "select a worker or wish to delete".into();
+            }
+        }
     }
 
     fn city_open_assign_modal(&mut self, bead_id: &str) {
@@ -2067,91 +2121,71 @@ impl App {
 
     fn city_submit_overlay(&mut self) {
         match self.city_overlay.clone() {
-            CityOverlay::Wish { text } => {
-                self.city_overlay = CityOverlay::None;
-                match crate::wish::create_wish(&text, false, true) {
-                    Ok(b) => {
-                        self.push_toast(Toast::finished("wish", &b.id));
-                        self.push_system(crate::wish::format_created(&b));
-                        if self.show_fleet_panel {
-                            self.fleet_panel.refresh();
-                        }
-                    }
-                    Err(e) => self.push_system(e),
-                }
-                self.status = "ready".into();
-            }
-            CityOverlay::Spawn {
-                fleet_n, crew_n, ..
-            } => {
-                self.city_overlay = CityOverlay::None;
-                let fn_ = fleet_n.parse::<usize>().unwrap_or(2).min(16);
-                let cn = crew_n.parse::<usize>().unwrap_or(0).min(8);
-                let mut seats = Vec::new();
-                for i in 1..=fn_ {
-                    seats.push(format!("Fleet-{i}"));
-                }
-                for i in 1..=cn {
-                    seats.push(format!("Crew-{i}"));
-                }
-                if seats.is_empty() {
-                    self.push_system("Spawn needs at least one fleet or crew seat.");
-                    self.status = "ready".into();
-                    return;
-                }
-                let opts = crate::fleet::FleetUpOpts {
-                    seats,
-                    budget_minutes: 480,
-                    sleep_secs: 5,
-                    quiet: false,
-                    provider: Some(self.provider_name.clone()),
-                    model: Some(self.model_name.clone()),
-                    approve: true,
-                    fail_fast: false,
-                };
-                match crate::fleet::fleet_up(opts) {
-                    Ok(msg) => {
-                        self.push_toast(Toast::finished("fleet up", "spawned"));
-                        self.push_system(msg);
-                        if self.show_fleet_panel {
-                            self.fleet_panel.back_to_board();
-                        }
-                    }
-                    Err(e) => self.push_system(e),
-                }
-                self.status = "ready".into();
-            }
-            CityOverlay::Steer { text } => {
-                self.city_overlay = CityOverlay::None;
-                self.fleet_steer_remote(&text);
-                self.status = "ready".into();
-            }
             CityOverlay::ConfirmDown { seat } => {
                 self.city_overlay = CityOverlay::None;
                 let msg = match seat {
                     Some(s) => crate::fleet::fleet_down(Some(vec![s])),
                     None => crate::fleet::fleet_down(None),
                 };
-                self.push_system(msg);
-                if self.show_fleet_panel {
-                    self.fleet_panel.refresh();
+                self.fleet_panel.status_line = msg.lines().next().unwrap_or("stopped").into();
+                self.fleet_panel.refresh();
+                self.status = "ready".into();
+            }
+            CityOverlay::ConfirmDelete { target } => {
+                self.city_overlay = CityOverlay::None;
+                match target {
+                    CityDeleteTarget::Worker { seat } => {
+                        if self
+                            .fleet_attach
+                            .as_ref()
+                            .map(|a| a.seat == seat)
+                            .unwrap_or(false)
+                        {
+                            self.fleet_detach(true);
+                        }
+                        let msg = crate::fleet::delete_seat(&seat);
+                        self.push_toast(Toast::finished("deleted", &seat));
+                        self.fleet_panel.status_line =
+                            msg.lines().next().unwrap_or("deleted").into();
+                        if self.fleet_panel.selected_seat.as_deref() == Some(seat.as_str()) {
+                            self.fleet_panel.selected_seat = None;
+                            self.fleet_panel.detail_seat = None;
+                            self.fleet_panel.log_lines.clear();
+                            self.city_detail_follower = None;
+                            self.focus_zone = FocusZone::CityBoard;
+                        }
+                    }
+                    CityDeleteTarget::Bead { id, title } => {
+                        match crate::beads::delete(None, &id) {
+                            Ok(b) => {
+                                self.push_toast(Toast::finished("deleted", &b.id));
+                                self.fleet_panel.status_line =
+                                    format!("deleted bead {} ({})", b.id, title);
+                                if self.fleet_panel.selected_flow_id.as_deref() == Some(id.as_str())
+                                {
+                                    self.fleet_panel.selected_flow_id = None;
+                                }
+                            }
+                            Err(e) => self.fleet_panel.status_line = e,
+                        }
+                    }
                 }
+                self.fleet_panel.refresh();
                 self.status = "ready".into();
             }
             CityOverlay::Assign { bead_id, seat } => {
                 self.city_overlay = CityOverlay::None;
                 match crate::marshal::assign_bead(&bead_id, &seat) {
                     Ok(b) => {
-                        self.push_toast(Toast::finished("assigned", &format!("{bead_id} → {seat}")));
-                        self.push_system(format!(
-                            "Assigned {} to `{seat}` — {}",
-                            b.id, b.title
+                        self.push_toast(Toast::finished(
+                            "assigned",
+                            &format!("{bead_id} → {seat}"),
                         ));
-                        if self.show_fleet_panel {
-                            self.fleet_panel.back_to_board();
-                        }
+                        self.fleet_panel.status_line =
+                            format!("assigned {} to {seat}", b.id);
+                        self.fleet_panel.refresh();
                     }
-                    Err(e) => self.push_system(e),
+                    Err(e) => self.fleet_panel.status_line = e,
                 }
                 self.status = "ready".into();
             }
@@ -2176,28 +2210,6 @@ impl App {
             _ => {}
         }
         match &mut self.city_overlay {
-            CityOverlay::Wish { text } => match key.code {
-                KeyCode::Char(c) => {
-                    text.push(c);
-                    true
-                }
-                KeyCode::Backspace => {
-                    text.pop();
-                    true
-                }
-                _ => true,
-            },
-            CityOverlay::Steer { text } => match key.code {
-                KeyCode::Char(c) => {
-                    text.push(c);
-                    true
-                }
-                KeyCode::Backspace => {
-                    text.pop();
-                    true
-                }
-                _ => true,
-            },
             CityOverlay::Assign { seat, .. } => match key.code {
                 KeyCode::Char(c) => {
                     seat.push(c);
@@ -2209,57 +2221,21 @@ impl App {
                 }
                 _ => true,
             },
-            CityOverlay::Spawn {
-                fleet_n,
-                crew_n,
-                focus,
-            } => match key.code {
-                KeyCode::Tab | KeyCode::BackTab => {
-                    *focus = match *focus {
-                        SpawnFocus::Fleet => SpawnFocus::Crew,
-                        SpawnFocus::Crew => SpawnFocus::Fleet,
-                    };
-                    true
-                }
-                KeyCode::Char(c) if c.is_ascii_digit() => {
-                    match *focus {
-                        SpawnFocus::Fleet => fleet_n.push(c),
-                        SpawnFocus::Crew => crew_n.push(c),
-                    }
-                    true
-                }
-                KeyCode::Backspace => {
-                    match *focus {
-                        SpawnFocus::Fleet => {
-                            fleet_n.pop();
-                        }
-                        SpawnFocus::Crew => {
-                            crew_n.pop();
-                        }
-                    }
-                    true
-                }
-                _ => true,
-            },
-            CityOverlay::ConfirmDown { .. } => true,
+            CityOverlay::ConfirmDown { .. } | CityOverlay::ConfirmDelete { .. } => true,
             CityOverlay::None => false,
         }
     }
 
     fn city_run_marshal_once(&mut self) {
-        let mut out = crate::marshal::run_once();
-        if let Some(r) = crate::marshal::read_last_report() {
-            out.push_str(&format!(
-                "\nLast report: reclaimed={} assigned={} stuck={}",
-                r.reclaimed,
-                r.auto_assigned.len(),
-                r.stuck_mailed.len()
-            ));
-        }
-        self.push_system(out);
-        if self.show_fleet_panel {
-            self.fleet_panel.refresh();
-        }
+        let out = crate::marshal::run_once();
+        let summary = out.lines().next().unwrap_or("marshal done");
+        self.fleet_panel.status_line = summary.into();
+        self.push_toast(Toast::finished("marshal", summary));
+        self.fleet_panel.refresh();
+    }
+
+    fn city_cycle_focus(&mut self, dir: i32) {
+        self.focus_zone = city_ops::cycle_city_focus(&self.fleet_panel, self.focus_zone, dir);
     }
 
     fn toggle_sessions_panel(&mut self) {
@@ -2268,13 +2244,11 @@ impl App {
             self.show_fleet_panel = false;
             self.show_timeline_panel = false;
             self.show_tree_panel = false;
+            self.show_tree_with_city = false;
             self.sessions_panel.refresh(&self.session_id, self.bg_running_session.as_deref());
-            self.push_system(
-                "Sessions panel — THIS PROJECT chats\n\
-                 ↑↓ select · Enter switch · n new · a all projects · /sessions again to hide",
-            );
-        } else {
-            self.push_system("Sessions panel hidden");
+            self.focus_zone = FocusZone::Sessions;
+        } else if self.focus_zone == FocusZone::Sessions {
+            self.focus_zone = FocusZone::Chat;
         }
     }
 
@@ -2751,31 +2725,14 @@ impl App {
     }
 
     fn activate_city_selection(&mut self) {
-        if !self.fleet_panel.is_board() {
-            return;
+        self.fleet_panel.apply_selection();
+        if let Some(seat) = self.fleet_panel.selected_seat.clone() {
+            self.city_select_seat(&seat);
         }
-        match self.fleet_panel.selected_row().cloned() {
-            Some(CityRow::Action { id, .. }) => match id {
-                "wish" => self.city_open_wish_modal(),
-                "spawn" => self.city_open_spawn_modal(),
-                "marshal" => self.city_run_marshal_once(),
-                "down_all" => self.city_open_down_confirm(None),
-                _ => {}
-            },
-            Some(CityRow::Worker { seat }) => {
-                self.city_open_seat_detail(&seat.seat);
-            }
-            Some(CityRow::Wish { bead }) => {
-                self.fleet_panel
-                    .open_bead_detail(&bead, BeadDetailKind::Wish);
-            }
-            Some(CityRow::Ready { bead }) => {
-                self.fleet_panel
-                    .open_bead_detail(&bead, BeadDetailKind::Ready);
-            }
-            _ => {
-                self.push_system("Nothing selected — ↑↓ to an action, worker, wish, or ready bead.");
-            }
+        if let Some(fid) = self.fleet_panel.selected_flow_id.clone() {
+            // Ready flow item → offer assign via A; status already set
+            let _ = fid;
+            self.focus_zone = FocusZone::CityInspector;
         }
     }
 
@@ -2851,12 +2808,8 @@ impl App {
     }
 
     fn poll_fleet_attach(&mut self) {
-        // Seat-detail log when not using an attach follower for the same seat.
         let attach_seat = self.fleet_attach.as_ref().map(|a| a.seat.clone());
-        let detail_seat = self
-            .fleet_panel
-            .seat_detail_name()
-            .map(|s| s.to_string());
+        let detail_seat = self.fleet_panel.selected_seat.clone();
         if let Some(ref ds) = detail_seat {
             let attach_covers = attach_seat.as_deref() == Some(ds.as_str());
             if !attach_covers {
@@ -2869,32 +2822,28 @@ impl App {
             }
         }
 
-        let lines = {
+        let (lines, phase) = {
             let Some(attach) = self.fleet_attach.as_mut() else {
-                let phase = None::<FleetAttachPhase>;
-                let _ = phase;
                 return;
             };
-            attach.follower.poll()
+            (attach.follower.poll(), attach.phase)
         };
-        let divert = self.show_fleet_panel
-            && detail_seat
-                .as_deref()
-                .zip(attach_seat.as_deref())
-                .is_some_and(|(d, a)| d == a)
-            && matches!(
-                self.fleet_attach.as_ref().map(|a| a.phase),
-                Some(FleetAttachPhase::Follow) | Some(FleetAttachPhase::Attaching)
-            );
+        let divert = city_ops::should_divert_logs(
+            self.show_fleet_panel,
+            detail_seat.as_deref(),
+            attach_seat.as_deref(),
+        ) && matches!(
+            phase,
+            FleetAttachPhase::Follow | FleetAttachPhase::Attaching
+        );
         for line in &lines {
             if divert {
                 self.fleet_panel.push_log_line(line);
-            } else {
+            } else if !matches!(phase, FleetAttachPhase::Follow) {
                 self.push_fleet_log_line(line);
             }
         }
-        let phase = self.fleet_attach.as_ref().map(|a| a.phase);
-        if phase == Some(FleetAttachPhase::Attaching) {
+        if phase == FleetAttachPhase::Attaching {
             self.fleet_complete_attach();
         }
     }
@@ -4276,147 +4225,226 @@ impl App {
             _ => {}
         }
         if self.show_fleet_panel {
-            // Seat / bead detail keys
-            if !self.fleet_panel.is_board() {
-                match key.code {
-                    KeyCode::Esc => {
-                        self.city_detail_follower = None;
-                        self.fleet_panel.back_to_board();
-                        return;
-                    }
-                    KeyCode::PageUp => {
-                        self.fleet_panel.log_scroll_by(-8);
-                        return;
-                    }
-                    KeyCode::PageDown => {
-                        self.fleet_panel.log_scroll_by(8);
-                        return;
-                    }
-                    KeyCode::Char('f')
-                        if matches!(self.fleet_panel.view, CityView::SeatDetail { .. }) =>
-                    {
-                        if let Some(seat) =
-                            self.fleet_panel.seat_detail_name().map(|s| s.to_string())
-                        {
-                            self.fleet_start_follow(&seat);
-                        }
-                        return;
-                    }
-                    KeyCode::Char('a')
-                        if matches!(self.fleet_panel.view, CityView::SeatDetail { .. }) =>
-                    {
-                        if let Some(seat) =
-                            self.fleet_panel.seat_detail_name().map(|s| s.to_string())
-                        {
-                            self.fleet_start_attach(&seat);
-                        }
-                        return;
-                    }
-                    KeyCode::Char('o')
-                        if matches!(self.fleet_panel.view, CityView::SeatDetail { .. }) =>
-                    {
-                        if let Some(seat) =
-                            self.fleet_panel.seat_detail_name().map(|s| s.to_string())
-                        {
-                            self.fleet_open_inspect(&seat);
-                        }
-                        return;
-                    }
-                    KeyCode::Char('s')
-                        if matches!(self.fleet_panel.view, CityView::SeatDetail { .. }) =>
-                    {
-                        self.city_open_steer_modal();
-                        return;
-                    }
-                    KeyCode::Char('b')
-                        if matches!(self.fleet_panel.view, CityView::SeatDetail { .. }) =>
-                    {
-                        self.fleet_abort_remote();
-                        return;
-                    }
-                    KeyCode::Char('D')
-                        if matches!(self.fleet_panel.view, CityView::SeatDetail { .. }) =>
-                    {
-                        self.fleet_detach(false);
-                        return;
-                    }
-                    KeyCode::Char('d')
-                        if matches!(self.fleet_panel.view, CityView::SeatDetail { .. }) =>
-                    {
-                        if let Some(seat) =
-                            self.fleet_panel.seat_detail_name().map(|s| s.to_string())
-                        {
-                            self.city_open_down_confirm(Some(seat));
-                        }
-                        return;
-                    }
-                    KeyCode::Char('A')
-                        if matches!(
-                            self.fleet_panel.view,
-                            CityView::BeadDetail {
-                                kind: BeadDetailKind::Ready,
-                                ..
-                            }
-                        ) =>
-                    {
-                        if let CityView::BeadDetail { id, .. } = self.fleet_panel.view.clone() {
-                            self.city_open_assign_modal(&id);
-                        }
-                        return;
-                    }
-                    _ => {}
-                }
+            if !self.focus_zone.is_city()
+                && matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+            {
+                self.focus_zone = FocusZone::CityBoard;
+                return;
             }
+        }
+        if self.show_fleet_panel && self.focus_zone.is_city() {
             match key.code {
-                KeyCode::Esc if self.fleet_panel.is_board() => {
-                    self.toggle_city_panel();
+                KeyCode::Tab => {
+                    self.city_cycle_focus(1);
                     return;
                 }
-                KeyCode::Up => {
-                    self.fleet_panel.move_sel(-1);
+                KeyCode::BackTab => {
+                    self.city_cycle_focus(-1);
                     return;
                 }
-                KeyCode::Down => {
-                    self.fleet_panel.move_sel(1);
-                    return;
-                }
-                KeyCode::Enter => {
-                    self.activate_city_selection();
-                    return;
-                }
-                KeyCode::Char('x') if self.fleet_panel.is_board() => {
-                    self.fleet_panel.expanded = !self.fleet_panel.expanded;
-                    return;
-                }
-                KeyCode::Char('w') if self.fleet_panel.is_board() => {
-                    self.city_open_wish_modal();
-                    return;
-                }
-                KeyCode::Char('u') if self.fleet_panel.is_board() => {
-                    self.city_open_spawn_modal();
-                    return;
-                }
-                KeyCode::Char('d') if self.fleet_panel.is_board() => {
-                    if let Some(seat) = self.fleet_panel.selected().map(|s| s.seat.clone()) {
-                        self.city_open_down_confirm(Some(seat));
-                    } else {
-                        self.city_open_down_confirm(None);
+                KeyCode::Esc => {
+                    match self.focus_zone {
+                        FocusZone::CityWish | FocusZone::CitySteer | FocusZone::CitySpawn => {
+                            self.focus_zone = FocusZone::CityBoard;
+                        }
+                        FocusZone::CityInspector => {
+                            self.focus_zone = FocusZone::CityBoard;
+                        }
+                        _ => {
+                            self.toggle_city_panel();
+                        }
                     }
                     return;
                 }
-                KeyCode::Char('m') if self.fleet_panel.is_board() => {
-                    self.city_run_marshal_once();
-                    return;
-                }
-                KeyCode::Char('A') if self.fleet_panel.is_board() => {
-                    if let Some(CityRow::Ready { bead }) =
-                        self.fleet_panel.selected_row().cloned()
-                    {
-                        self.city_open_assign_modal(&bead.id);
-                    } else {
-                        self.push_system("Select a READY bead first, then press A to assign.");
+                _ => {}
+            }
+            match self.focus_zone {
+                FocusZone::CityWish => {
+                    match key.code {
+                        KeyCode::Enter => {
+                            self.city_submit_wish();
+                            return;
+                        }
+                        KeyCode::Char(c) => {
+                            self.fleet_panel.wish_text.push(c);
+                            return;
+                        }
+                        KeyCode::Backspace => {
+                            self.fleet_panel.wish_text.pop();
+                            return;
+                        }
+                        _ => {}
                     }
-                    return;
+                }
+                FocusZone::CitySteer => {
+                    match key.code {
+                        KeyCode::Enter => {
+                            self.city_submit_steer();
+                            return;
+                        }
+                        KeyCode::Char(c) => {
+                            self.fleet_panel.steer_text.push(c);
+                            return;
+                        }
+                        KeyCode::Backspace => {
+                            self.fleet_panel.steer_text.pop();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                FocusZone::CitySpawn => {
+                    match key.code {
+                        KeyCode::Enter => {
+                            self.city_submit_spawn();
+                            return;
+                        }
+                        KeyCode::Char(c) if c.is_ascii_digit() => {
+                            if self.fleet_panel.spawn_focus_fleet {
+                                self.fleet_panel.spawn_fleet_n.push(c);
+                            } else {
+                                self.fleet_panel.spawn_crew_n.push(c);
+                            }
+                            return;
+                        }
+                        KeyCode::Backspace => {
+                            if self.fleet_panel.spawn_focus_fleet {
+                                self.fleet_panel.spawn_fleet_n.pop();
+                            } else {
+                                self.fleet_panel.spawn_crew_n.pop();
+                            }
+                            return;
+                        }
+                        KeyCode::Left | KeyCode::Right => {
+                            self.fleet_panel.spawn_focus_fleet =
+                                !self.fleet_panel.spawn_focus_fleet;
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                FocusZone::CityInspector => {
+                    match key.code {
+                        KeyCode::PageUp => {
+                            self.fleet_panel.log_scroll_by(-8);
+                            return;
+                        }
+                        KeyCode::PageDown => {
+                            self.fleet_panel.log_scroll_by(8);
+                            return;
+                        }
+                        KeyCode::Char('f') => {
+                            if let Some(seat) = self.fleet_panel.selected_seat.clone() {
+                                self.fleet_start_follow(&seat);
+                            }
+                            return;
+                        }
+                        KeyCode::Char('a') => {
+                            if let Some(seat) = self.fleet_panel.selected_seat.clone() {
+                                self.fleet_start_attach(&seat);
+                            }
+                            return;
+                        }
+                        KeyCode::Char('o') => {
+                            if let Some(seat) = self.fleet_panel.selected_seat.clone() {
+                                self.fleet_open_inspect(&seat);
+                            }
+                            return;
+                        }
+                        KeyCode::Char('b') => {
+                            self.fleet_abort_remote();
+                            return;
+                        }
+                        KeyCode::Char('D') => {
+                            self.fleet_detach(false);
+                            return;
+                        }
+                        KeyCode::Char('d') => {
+                            if let Some(seat) = self.fleet_panel.selected_seat.clone() {
+                                self.city_open_down_confirm(Some(seat));
+                            }
+                            return;
+                        }
+                        KeyCode::Char('X') | KeyCode::Delete => {
+                            self.city_request_delete_selection();
+                            return;
+                        }
+                        KeyCode::Enter => {
+                            self.focus_zone = FocusZone::CitySteer;
+                            return;
+                        }
+                        KeyCode::Char('A') => {
+                            if let Some(id) = self.fleet_panel.selected_flow_id.clone() {
+                                self.city_open_assign_modal(&id);
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                FocusZone::CityBoard => {
+                    match key.code {
+                        KeyCode::Up => {
+                            self.fleet_panel.move_sel(-1);
+                            return;
+                        }
+                        KeyCode::Down => {
+                            self.fleet_panel.move_sel(1);
+                            return;
+                        }
+                        KeyCode::Enter => {
+                            self.activate_city_selection();
+                            return;
+                        }
+                        KeyCode::Char('u') => {
+                            self.focus_zone = FocusZone::CitySpawn;
+                            return;
+                        }
+                        KeyCode::Char('d') => {
+                            let seat = self
+                                .fleet_panel
+                                .board_rows
+                                .get(self.fleet_panel.selection)
+                                .and_then(|r| match r {
+                                    BoardRow::Worker { seat } => Some(seat.seat.clone()),
+                                    _ => None,
+                                });
+                            self.city_open_down_confirm(seat);
+                            return;
+                        }
+                        KeyCode::Char('X') | KeyCode::Delete => {
+                            self.city_request_delete_selection();
+                            return;
+                        }
+                        KeyCode::Char('m') => {
+                            self.city_run_marshal_once();
+                            return;
+                        }
+                        KeyCode::Char('A') => {
+                            let id = self
+                                .fleet_panel
+                                .board_rows
+                                .get(self.fleet_panel.selection)
+                                .and_then(|r| match r {
+                                    BoardRow::Flow { item } => Some(item.id.clone()),
+                                    _ => None,
+                                });
+                            if let Some(id) = id {
+                                self.city_open_assign_modal(&id);
+                            }
+                            return;
+                        }
+                        KeyCode::Char('g') => {
+                            // Jump to first blocked seat (attention)
+                            if let Some(s) =
+                                self.fleet_panel.first_blocked_seat().map(|s| s.to_string())
+                            {
+                                self.city_select_seat(&s);
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
                 }
                 _ => {}
             }
@@ -4453,6 +4481,7 @@ impl App {
         }
         if self.key_matches("insert", key) {
             self.input_mode = InputMode::Insert;
+            self.focus_zone = FocusZone::Chat;
             self.unseen_done = false;
             return;
         }
@@ -4484,15 +4513,26 @@ impl App {
             return;
         }
         if self.key_matches("toggle_tree", key) {
-            if self.show_tree_panel && !self.show_fleet_panel && !self.show_sessions_panel {
+            if self.show_fleet_panel {
+                // Coexist: tree drawer under City
+                self.show_tree_with_city = !self.show_tree_with_city;
+                self.show_tree_panel = self.show_tree_with_city;
+                self.side_mode = SidePanelMode::Tree;
+                self.status = if self.show_tree_with_city {
+                    "city + tree".into()
+                } else {
+                    "city".into()
+                };
+            } else if self.show_tree_panel && !self.show_sessions_panel {
                 self.side_mode = self.side_mode.toggle();
                 self.status = format!("side · {}", self.side_mode.label());
             } else {
-                self.show_fleet_panel = false;
                 self.show_sessions_panel = false;
                 self.show_timeline_panel = false;
                 self.show_tree_panel = true;
+                self.show_tree_with_city = false;
                 self.side_mode = SidePanelMode::Tree;
+                self.focus_zone = FocusZone::Tree;
             }
             return;
         }
@@ -5597,13 +5637,11 @@ impl App {
             LayoutOpts {
                 show_repl,
                 show_side,
-                side_pct: if self.show_fleet_panel
-                    && !self.fleet_panel.is_board()
-                {
-                    40
-                } else if self.show_fleet_panel || self.show_sessions_panel {
+                side_pct: if self.show_fleet_panel {
+                    42
+                } else if self.show_sessions_panel {
                     34
-                } else if self.show_timeline_panel {
+                } else if self.show_timeline_panel || self.show_tree_panel {
                     32
                 } else {
                     28
@@ -5682,37 +5720,47 @@ impl App {
                     }
                 }
             } else if self.show_fleet_panel {
-                fleet_panel::render_city_panel(frame, side, &self.fleet_panel, &self.palette);
-                // Map selectable rows to click targets (rough 1-line-per-row after chrome).
-                if self.fleet_panel.is_board() {
-                    let mut y = side.y.saturating_add(3);
-                    for (i, row) in self.fleet_panel.rows.iter().enumerate() {
-                        match row {
-                            CityRow::Header { .. } => {
-                                y = y.saturating_add(2);
-                            }
-                            CityRow::Hint { .. } => {
-                                y = y.saturating_add(1);
-                            }
-                            CityRow::Action { .. }
-                            | CityRow::Worker { .. }
-                            | CityRow::Wish { .. }
-                            | CityRow::Ready { .. } => {
-                                self.hit_map.push_line(
-                                    side.x,
-                                    y,
-                                    side.width,
-                                    HitTarget::FleetRow { index: i },
-                                );
-                                y = y.saturating_add(1);
-                                if self.fleet_panel.expanded && i == self.fleet_panel.selection {
-                                    y = y.saturating_add(1);
-                                }
-                            }
-                        }
-                    }
+                let city_focus = if self.focus_zone.is_city() {
+                    self.focus_zone
+                } else {
+                    FocusZone::CityBoard
+                };
+                // Optionally split side: City top + Tree drawer bottom when coexist.
+                let (city_area, tree_area) = if self.show_tree_with_city
+                    && self.tree_breadcrumb != "idle"
+                {
+                    let parts = ratatui::layout::Layout::default()
+                        .direction(ratatui::layout::Direction::Vertical)
+                        .constraints([
+                            ratatui::layout::Constraint::Percentage(72),
+                            ratatui::layout::Constraint::Percentage(28),
+                        ])
+                        .split(side);
+                    (parts[0], Some(parts[1]))
+                } else {
+                    (side, None)
+                };
+                fleet_panel::render_city_panel(
+                    frame,
+                    city_area,
+                    &self.fleet_panel,
+                    &self.palette,
+                    city_focus,
+                );
+                let mut y = city_area.y.saturating_add(3);
+                for (i, _row) in self.fleet_panel.board_rows.iter().enumerate() {
+                    self.hit_map.push_line(
+                        city_area.x,
+                        y,
+                        city_area.width,
+                        HitTarget::FleetRow { index: i },
+                    );
+                    y = y.saturating_add(1);
                 }
-            } else if self.show_timeline_panel || self.side_mode == SidePanelMode::Timeline {
+                if let Some(tree_area) = tree_area {
+                    self.render_tree_panel(frame, tree_area);
+                }
+            } else if self.show_timeline_panel || self.side_mode == SidePanelMode::Timeline {            } else if self.show_timeline_panel || self.side_mode == SidePanelMode::Timeline {
                 self.render_timeline_panel(frame, side);
             } else {
                 self.render_tree_panel(frame, side);
@@ -5809,7 +5857,8 @@ impl App {
             })
             .or_else(|| {
                 self.fleet_panel
-                    .seat_detail_name()
+                    .selected_seat
+                    .as_deref()
                     .filter(|_| self.show_fleet_panel)
                     .map(|s| format!("VIEW {s}"))
             })
@@ -6532,77 +6581,6 @@ impl App {
     fn render_city_overlay(&mut self, frame: &mut Frame, area: Rect) {
         let mut lines: Vec<Line<'static>> = Vec::new();
         let (title, border) = match &self.city_overlay {
-            CityOverlay::Wish { text } => {
-                lines.push(Line::from(Span::styled(
-                    "What should the city build?",
-                    Style::default().fg(self.palette.subtext),
-                )));
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    if text.is_empty() {
-                        "▌".to_string()
-                    } else {
-                        format!("{text}▌")
-                    },
-                    Style::default().fg(self.palette.text),
-                )));
-                lines.push(Line::from(""));
-                lines.push(widgets::action_hints(
-                    &[("↵", "create"), ("esc", "cancel")],
-                    &self.palette,
-                ));
-                ("new wish", self.palette.accent)
-            }
-            CityOverlay::Spawn {
-                fleet_n,
-                crew_n,
-                focus,
-            } => {
-                let f_mark = if *focus == SpawnFocus::Fleet { "›" } else { " " };
-                let c_mark = if *focus == SpawnFocus::Crew { "›" } else { " " };
-                lines.push(Line::from(Span::styled(
-                    "Spawn headless workers (Tab switches field)",
-                    Style::default().fg(self.palette.subtext),
-                )));
-                lines.push(Line::from(""));
-                lines.push(Line::from(format!(
-                    "{f_mark} Fleet count: {fleet_n}"
-                )));
-                lines.push(Line::from(format!("{c_mark} Crew count:  {crew_n}")));
-                lines.push(Line::from(""));
-                lines.push(widgets::action_hints(
-                    &[("↵", "spawn"), ("tab", "field"), ("esc", "cancel")],
-                    &self.palette,
-                ));
-                ("spawn fleet / crew", self.palette.accent)
-            }
-            CityOverlay::Steer { text } => {
-                let seat = self
-                    .fleet_attach
-                    .as_ref()
-                    .map(|a| a.seat.as_str())
-                    .or_else(|| self.fleet_panel.seat_detail_name())
-                    .unwrap_or("?");
-                lines.push(Line::from(Span::styled(
-                    format!("Steer `{seat}`"),
-                    Style::default().fg(self.palette.subtext),
-                )));
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    if text.is_empty() {
-                        "▌".to_string()
-                    } else {
-                        format!("{text}▌")
-                    },
-                    Style::default().fg(self.palette.text),
-                )));
-                lines.push(Line::from(""));
-                lines.push(widgets::action_hints(
-                    &[("↵", "send"), ("esc", "cancel")],
-                    &self.palette,
-                ));
-                ("steer", self.palette.warn)
-            }
             CityOverlay::ConfirmDown { seat } => {
                 let msg = match seat {
                     Some(s) => format!("Stop worker `{s}`?"),
@@ -6618,6 +6596,28 @@ impl App {
                     &self.palette,
                 ));
                 ("confirm stop", self.palette.state_blocked)
+            }
+            CityOverlay::ConfirmDelete { target } => {
+                let msg = match target {
+                    CityDeleteTarget::Worker { seat } => {
+                        format!("DELETE seat `{seat}`?\nStops process, removes logs/status/profile.")
+                    }
+                    CityDeleteTarget::Bead { id, title } => {
+                        format!("DELETE bead `{id}`?\n{title}")
+                    }
+                };
+                for line in msg.lines() {
+                    lines.push(Line::from(Span::styled(
+                        line.to_string(),
+                        Style::default().fg(self.palette.state_blocked),
+                    )));
+                }
+                lines.push(Line::from(""));
+                lines.push(widgets::action_hints(
+                    &[("↵", "delete"), ("esc", "cancel")],
+                    &self.palette,
+                ));
+                ("confirm delete", self.palette.state_blocked)
             }
             CityOverlay::Assign { bead_id, seat } => {
                 lines.push(Line::from(Span::styled(

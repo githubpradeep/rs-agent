@@ -32,6 +32,29 @@ rs-agent runtime stop
 
 `PROTOCOL_VERSION` is `1`. Set `RS_AGENT_SOCKET` / `RS_AGENT_RUNTIME=1` for the ops skill.
 
+## City methods
+
+| Method | Params | Result |
+|--------|--------|--------|
+| `city.board` | — | `{ workers, flow, wishes, ready }` snapshot |
+| `wish.create` | `{ text, as_task?, auto_ready? }` | created bead |
+| `fleet.up` | `{ seats?: string[], fleet_n?, crew_n? }` | spawn report |
+| `fleet.down` | `{ seats?: string[] }` | stop report |
+| `fleet.delete` / `seat.delete` | `{ seat }` | stop + remove fleet files + seat profile |
+| `bead.delete` / `wish.delete` | `{ id }` | hard-delete bead from graph |
+| `seat.steer` | `{ seat, text }` | steered (alias of `agent.steer`) |
+| `seat.abort` | `{ seat }` | abort control op |
+| `seat.pause` / `seat.resume` | `{ seat }` | attach helpers |
+
+Example:
+
+```bash
+rs-agent api city.board
+rs-agent api wish.create --params '{"text":"port Softmax"}'
+rs-agent api fleet.up --params '{"fleet_n":2,"crew_n":1}'
+rs-agent api seat.steer --params '{"seat":"Fleet-1","text":"summarize"}'
+```
+
 ## Notifications
 
 Config (`~/.rs-agent/config.toml`):

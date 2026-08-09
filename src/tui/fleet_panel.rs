@@ -1,12 +1,14 @@
-//! City cockpit side panel — operator board + seat/bead detail.
+//! City cockpit — overview + inspector (never replaces the board).
 //!
-//! Board: ACTIONS / WORKERS / WISHES / READY
-//! Detail: seat status + action strip + dedicated log viewport
+//! Layout:
+//!   wish composer
+//!   WORKERS + FLOW lists
+//!   inspector (status + log + steer composer + actions)
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::agent::SeatCaste;
@@ -16,6 +18,7 @@ use crate::lifecycle::Lifecycle;
 
 use super::status;
 use super::theme::Palette;
+use super::ui::FocusZone;
 use super::widgets;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,40 +95,52 @@ impl SeatAttention {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BeadDetailKind {
+pub enum FlowStage {
     Wish,
     Ready,
+    Doing,
+    Done,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CityView {
-    Board,
-    SeatDetail { seat: String },
-    BeadDetail { id: String, kind: BeadDetailKind },
-}
-
-impl Default for CityView {
-    fn default() -> Self {
-        Self::Board
+impl FlowStage {
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Wish => "wish",
+            Self::Ready => "ready",
+            Self::Doing => "doing",
+            Self::Done => "done",
+        }
     }
 }
 
 #[derive(Debug, Clone)]
-pub enum CityRow {
-    Header { title: String },
-    Action { id: &'static str, label: String },
-    Worker { seat: SeatStatus },
-    Wish { bead: Bead },
-    Ready { bead: Bead },
-    Hint { text: String },
+pub struct FlowItem {
+    pub id: String,
+    pub title: String,
+    pub stage: FlowStage,
+    pub kind: BeadKind,
 }
 
-impl CityRow {
-    pub fn selectable(&self) -> bool {
-        matches!(
-            self,
-            Self::Worker { .. } | Self::Wish { .. } | Self::Ready { .. } | Self::Action { .. }
-        )
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum BoardSection {
+    Workers,
+    Flow,
+}
+
+/// Selectable board row for ↑↓ navigation.
+#[derive(Debug, Clone)]
+pub enum BoardRow {
+    Worker { seat: SeatStatus },
+    Flow { item: FlowItem },
+}
+
+impl BoardRow {
+    pub fn key(&self) -> String {
+        match self {
+            Self::Worker { seat } => format!("w:{}", seat.seat),
+            Self::Flow { item } => format!("f:{}", item.id),
+        }
     }
 }
 
@@ -134,31 +149,43 @@ pub type FleetPanelState = CityPanelState;
 
 #[derive(Debug, Clone)]
 pub struct CityPanelState {
-    pub rows: Vec<CityRow>,
-    pub selection: usize,
-    pub expanded: bool,
     pub seats: Vec<SeatStatus>,
-    pub view: CityView,
-    /// Dedicated seat log (Follow / detail) — not dumped into operator chat.
+    pub board_rows: Vec<BoardRow>,
+    pub selection: usize,
+    pub selected_seat: Option<String>,
+    pub selected_flow_id: Option<String>,
+    pub flow: Vec<FlowItem>,
+    pub wish_text: String,
+    pub steer_text: String,
+    pub spawn_fleet_n: String,
+    pub spawn_crew_n: String,
+    pub spawn_focus_fleet: bool,
     pub log_lines: Vec<String>,
-    /// Lines scrolled up from bottom (0 = follow tail).
     pub log_scroll: usize,
     pub detail_seat: Option<SeatStatus>,
-    pub detail_bead: Option<Bead>,
+    pub status_line: String,
+    pub expanded: bool,
 }
 
 impl Default for CityPanelState {
     fn default() -> Self {
         Self {
-            rows: Vec::new(),
-            selection: 0,
-            expanded: false,
             seats: Vec::new(),
-            view: CityView::Board,
+            board_rows: Vec::new(),
+            selection: 0,
+            selected_seat: None,
+            selected_flow_id: None,
+            flow: Vec::new(),
+            wish_text: String::new(),
+            steer_text: String::new(),
+            spawn_fleet_n: "2".into(),
+            spawn_crew_n: "0".into(),
+            spawn_focus_fleet: true,
             log_lines: Vec::new(),
             log_scroll: 0,
             detail_seat: None,
-            detail_bead: None,
+            status_line: String::new(),
+            expanded: false,
         }
     }
 }
@@ -204,180 +231,161 @@ fn format_parsed_log(line: &ParsedLogLine) -> String {
 
 impl CityPanelState {
     pub fn refresh(&mut self) {
-        match self.view.clone() {
-            CityView::Board => self.refresh_board(),
-            CityView::SeatDetail { seat } => self.refresh_seat_detail(&seat),
-            CityView::BeadDetail { id, kind } => self.refresh_bead_detail(&id, kind),
-        }
-    }
-
-    fn refresh_board(&mut self) {
-        let prev_key = self.selected_key();
+        let prev_key = self
+            .board_rows
+            .get(self.selection)
+            .map(|r| r.key());
 
         let mut seats = fleet::list_seat_statuses();
         seats.sort_by_key(|s| SeatAttention::from_status(s).priority());
         self.seats = seats;
 
+        // Flow: wishes (open) → ready → doing (claimed by workers) → recent closed omitted for space
         let open = beads::list_open(None).unwrap_or_default();
-        let mut wishes: Vec<Bead> = open.into_iter().filter(is_wish_bead).collect();
-        wishes.sort_by_key(|b| b.priority);
-        wishes.truncate(8);
+        let ready = beads::list_ready(None).unwrap_or_default();
+        let mut flow = Vec::new();
+        let mut seen = std::collections::HashSet::new();
 
-        let mut ready = beads::list_ready(None).unwrap_or_default();
-        ready.sort_by_key(|b| b.priority);
-        ready.truncate(10);
+        for b in open.iter().filter(|b| is_wish_bead(b)) {
+            if seen.insert(b.id.clone()) {
+                flow.push(FlowItem {
+                    id: b.id.clone(),
+                    title: b.title.clone(),
+                    stage: FlowStage::Wish,
+                    kind: b.kind,
+                });
+            }
+        }
+        for b in &ready {
+            if seen.insert(b.id.clone()) {
+                flow.push(FlowItem {
+                    id: b.id.clone(),
+                    title: b.title.clone(),
+                    stage: FlowStage::Ready,
+                    kind: b.kind,
+                });
+            }
+        }
+        for s in &self.seats {
+            if let Some(bid) = s.last_bead.as_ref() {
+                if seen.insert(bid.clone()) {
+                    flow.push(FlowItem {
+                        id: bid.clone(),
+                        title: s
+                            .last_title
+                            .clone()
+                            .unwrap_or_else(|| bid.clone()),
+                        stage: FlowStage::Doing,
+                        kind: BeadKind::Implement,
+                    });
+                } else if let Some(item) = flow.iter_mut().find(|f| &f.id == bid) {
+                    item.stage = FlowStage::Doing;
+                }
+            }
+        }
+        flow.truncate(14);
+        self.flow = flow;
 
         let mut rows = Vec::new();
+        for seat in &self.seats {
+            rows.push(BoardRow::Worker { seat: seat.clone() });
+        }
+        for item in &self.flow {
+            rows.push(BoardRow::Flow { item: item.clone() });
+        }
+        self.board_rows = rows;
 
-        rows.push(CityRow::Header {
-            title: "ACTIONS".into(),
-        });
-        rows.push(CityRow::Action {
-            id: "wish",
-            label: "＋ new wish".into(),
-        });
-        rows.push(CityRow::Action {
-            id: "spawn",
-            label: "⬆ spawn fleet / crew".into(),
-        });
-        rows.push(CityRow::Action {
-            id: "marshal",
-            label: "◎ marshal once".into(),
-        });
-        rows.push(CityRow::Action {
-            id: "down_all",
-            label: "⏹ stop all workers".into(),
-        });
-
-        rows.push(CityRow::Header {
-            title: format!("WORKERS ({})", self.seats.len()),
-        });
-        if self.seats.is_empty() {
-            rows.push(CityRow::Hint {
-                text: "none — Enter spawn or press u".into(),
-            });
-        } else {
-            for seat in &self.seats {
-                rows.push(CityRow::Worker { seat: seat.clone() });
+        if let Some(key) = prev_key {
+            if let Some(i) = self.board_rows.iter().position(|r| r.key() == key) {
+                self.selection = i;
             }
         }
-
-        rows.push(CityRow::Header {
-            title: format!("WISHES ({})", wishes.len()),
-        });
-        if wishes.is_empty() {
-            rows.push(CityRow::Hint {
-                text: "none — Enter new wish or press w".into(),
-            });
-        } else {
-            for bead in wishes {
-                rows.push(CityRow::Wish { bead });
-            }
+        if self.selection >= self.board_rows.len() {
+            self.selection = self.board_rows.len().saturating_sub(1);
         }
 
-        rows.push(CityRow::Header {
-            title: format!("READY ({})", ready.len()),
-        });
-        if ready.is_empty() {
-            rows.push(CityRow::Hint {
-                text: "queue empty".into(),
+        // Refresh inspector seat status
+        if let Some(seat) = self.selected_seat.clone() {
+            self.detail_seat = fleet::read_seat_status(&seat).or_else(|| {
+                self.seats.iter().find(|s| s.seat == seat).cloned()
             });
-        } else {
-            for bead in ready {
-                rows.push(CityRow::Ready { bead });
-            }
         }
+    }
 
-        rows.push(CityRow::Hint {
-            text: "c city · w wish · u spawn · d stop · A assign".into(),
-        });
+    pub fn move_sel(&mut self, delta: isize) {
+        if self.board_rows.is_empty() {
+            return;
+        }
+        let n = self.board_rows.len() as isize;
+        let cur = self.selection as isize;
+        self.selection = ((cur + delta).rem_euclid(n)) as usize;
+        self.apply_selection();
+    }
 
-        self.rows = rows;
-        self.selection = self
-            .rows
+    pub fn apply_selection(&mut self) {
+        match self.board_rows.get(self.selection).cloned() {
+            Some(BoardRow::Worker { seat }) => {
+                let name = seat.seat.clone();
+                if self.selected_seat.as_deref() != Some(name.as_str()) {
+                    self.log_lines.clear();
+                    self.log_scroll = 0;
+                }
+                self.selected_seat = Some(name);
+                self.selected_flow_id = None;
+                self.detail_seat = Some(seat);
+            }
+            Some(BoardRow::Flow { item }) => {
+                self.selected_flow_id = Some(item.id.clone());
+                // Prefer a worker currently on this bead
+                if let Some(w) = self
+                    .seats
+                    .iter()
+                    .find(|s| s.last_bead.as_deref() == Some(item.id.as_str()))
+                {
+                    if self.selected_seat.as_deref() != Some(w.seat.as_str()) {
+                        self.log_lines.clear();
+                        self.log_scroll = 0;
+                    }
+                    self.selected_seat = Some(w.seat.clone());
+                    self.detail_seat = Some(w.clone());
+                }
+                self.status_line = format!("{} · {}", item.stage.tag(), item.title);
+            }
+            None => {}
+        }
+    }
+
+    pub fn select_seat(&mut self, seat: &str) {
+        if let Some(i) = self
+            .board_rows
             .iter()
-            .position(|r| r.selectable() && self.row_key(r).as_deref() == prev_key.as_deref())
-            .or_else(|| self.rows.iter().position(|r| r.selectable()))
-            .unwrap_or(0);
-    }
-
-    fn refresh_seat_detail(&mut self, seat: &str) {
-        self.seats = fleet::list_seat_statuses();
-        self.detail_seat = fleet::read_seat_status(seat).or_else(|| {
-            self.seats
-                .iter()
-                .find(|s| s.seat == seat)
-                .cloned()
-                .or_else(|| {
-                    Some(SeatStatus {
-                        seat: seat.to_string(),
-                        state: "unknown".into(),
-                        running: false,
-                        ..SeatStatus::default()
-                    })
-                })
-        });
-        self.detail_bead = None;
-        self.rows.clear();
-    }
-
-    fn refresh_bead_detail(&mut self, id: &str, kind: BeadDetailKind) {
-        self.detail_bead = beads::get(None, id).ok().flatten().or_else(|| {
-            // Fallback: search open/ready lists
-            let open = beads::list_open(None).unwrap_or_default();
-            open.into_iter().find(|b| b.id == id).or_else(|| {
-                beads::list_ready(None)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .find(|b| b.id == id)
-            })
-        });
-        let _ = kind;
-        self.detail_seat = None;
-        self.rows.clear();
-    }
-
-    pub fn open_seat_detail(&mut self, seat: &str) {
-        self.view = CityView::SeatDetail {
-            seat: seat.to_string(),
-        };
-        self.log_scroll = 0;
-        self.refresh_seat_detail(seat);
-    }
-
-    pub fn open_bead_detail(&mut self, bead: &Bead, kind: BeadDetailKind) {
-        self.view = CityView::BeadDetail {
-            id: bead.id.clone(),
-            kind,
-        };
-        self.detail_bead = Some(bead.clone());
-        self.detail_seat = None;
-        self.log_lines.clear();
-        self.log_scroll = 0;
-    }
-
-    pub fn back_to_board(&mut self) {
-        self.view = CityView::Board;
-        self.detail_seat = None;
-        self.detail_bead = None;
-        self.log_lines.clear();
-        self.log_scroll = 0;
-        self.refresh_board();
-    }
-
-    pub fn is_board(&self) -> bool {
-        matches!(self.view, CityView::Board)
-    }
-
-    pub fn seat_detail_name(&self) -> Option<&str> {
-        match &self.view {
-            CityView::SeatDetail { seat } => Some(seat.as_str()),
-            _ => None,
+            .position(|r| matches!(r, BoardRow::Worker { seat: s } if s.seat == seat))
+        {
+            self.selection = i;
+            self.apply_selection();
+        } else {
+            self.selected_seat = Some(seat.to_string());
+            self.detail_seat = fleet::read_seat_status(seat);
+            self.log_lines.clear();
         }
     }
 
-    pub fn is_seat_detail(&self, seat: &str) -> bool {
-        matches!(&self.view, CityView::SeatDetail { seat: s } if s == seat)
+    pub fn has_selection(&self) -> bool {
+        self.selected_seat.is_some()
+    }
+
+    pub fn blocked_count(&self) -> usize {
+        self.seats
+            .iter()
+            .filter(|s| SeatAttention::from_status(s) == SeatAttention::Blocked)
+            .count()
+    }
+
+    pub fn first_blocked_seat(&self) -> Option<&str> {
+        self.seats
+            .iter()
+            .find(|s| SeatAttention::from_status(s) == SeatAttention::Blocked)
+            .map(|s| s.seat.as_str())
     }
 
     pub fn set_log_from_parsed(&mut self, lines: &[ParsedLogLine]) {
@@ -392,11 +400,6 @@ impl CityPanelState {
             let drain = self.log_lines.len() - MAX;
             self.log_lines.drain(0..drain);
         }
-        if self.log_scroll == 0 {
-            // stay pinned to bottom
-        } else {
-            // keep relative position when scrolled up
-        }
     }
 
     pub fn log_scroll_by(&mut self, delta: isize) {
@@ -410,94 +413,155 @@ impl CityPanelState {
         }
     }
 
-    fn row_key(&self, row: &CityRow) -> Option<String> {
-        match row {
-            CityRow::Worker { seat } => Some(format!("w:{}", seat.seat)),
-            CityRow::Wish { bead } => Some(format!("wish:{}", bead.id)),
-            CityRow::Ready { bead } => Some(format!("ready:{}", bead.id)),
-            CityRow::Action { id, .. } => Some(format!("a:{id}")),
-            _ => None,
-        }
-    }
-
-    fn selected_key(&self) -> Option<String> {
-        self.rows.get(self.selection).and_then(|r| self.row_key(r))
-    }
-
-    pub fn blocked_count(&self) -> usize {
-        self.seats
+    /// Snapshot for runtime socket `city.board`.
+    pub fn board_snapshot_json() -> serde_json::Value {
+        let mut state = Self::default();
+        state.refresh();
+        let workers: Vec<_> = state
+            .seats
             .iter()
-            .filter(|s| SeatAttention::from_status(s) == SeatAttention::Blocked)
-            .count()
-    }
-
-    pub fn selected(&self) -> Option<&SeatStatus> {
-        match self.rows.get(self.selection) {
-            Some(CityRow::Worker { seat }) => Some(seat),
-            _ => None,
-        }
-    }
-
-    pub fn selected_row(&self) -> Option<&CityRow> {
-        self.rows.get(self.selection)
-    }
-
-    pub fn move_sel(&mut self, delta: isize) {
-        if !matches!(self.view, CityView::Board) {
-            return;
-        }
-        let selectable: Vec<usize> = self
-            .rows
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.selectable())
-            .map(|(i, _)| i)
+            .map(|s| {
+                serde_json::json!({
+                    "seat": s.seat,
+                    "state": s.state,
+                    "running": s.running,
+                    "last_bead": s.last_bead,
+                    "last_line": s.last_line,
+                    "caste": caste_badge(&s.seat),
+                    "attention": format!("{:?}", SeatAttention::from_status(s)).to_lowercase(),
+                })
+            })
             .collect();
-        if selectable.is_empty() {
-            return;
-        }
-        let cur_pos = selectable
+        let flow: Vec<_> = state
+            .flow
             .iter()
-            .position(|&i| i == self.selection)
-            .unwrap_or(0) as isize;
-        let n = selectable.len() as isize;
-        let next = selectable[((cur_pos + delta).rem_euclid(n)) as usize];
-        self.selection = next;
+            .map(|f| {
+                serde_json::json!({
+                    "id": f.id,
+                    "title": f.title,
+                    "stage": f.stage.tag(),
+                    "kind": f.kind.as_str(),
+                })
+            })
+            .collect();
+        let wishes: Vec<_> = state
+            .flow
+            .iter()
+            .filter(|f| f.stage == FlowStage::Wish)
+            .map(|f| serde_json::json!({ "id": f.id, "title": f.title }))
+            .collect();
+        let ready: Vec<_> = state
+            .flow
+            .iter()
+            .filter(|f| f.stage == FlowStage::Ready)
+            .map(|f| serde_json::json!({ "id": f.id, "title": f.title }))
+            .collect();
+        serde_json::json!({
+            "workers": workers,
+            "flow": flow,
+            "wishes": wishes,
+            "ready": ready,
+        })
     }
 }
 
-pub fn render_fleet_panel(frame: &mut Frame, area: Rect, state: &CityPanelState, palette: &Palette) {
-    render_city_panel(frame, area, state, palette);
+/// Legacy row enum kept so older hit/activate call sites compile during transition.
+#[derive(Debug, Clone)]
+pub enum CityRow {
+    Header { title: String },
+    Action { id: &'static str, label: String },
+    Worker { seat: SeatStatus },
+    Wish { bead: Bead },
+    Ready { bead: Bead },
+    Hint { text: String },
 }
 
-pub fn render_city_panel(frame: &mut Frame, area: Rect, state: &CityPanelState, palette: &Palette) {
-    match &state.view {
-        CityView::Board => render_board(frame, area, state, palette),
-        CityView::SeatDetail { seat } => render_seat_detail(frame, area, state, seat, palette),
-        CityView::BeadDetail { id, kind } => {
-            render_bead_detail(frame, area, state, id, *kind, palette)
-        }
+impl CityRow {
+    pub fn selectable(&self) -> bool {
+        matches!(
+            self,
+            Self::Worker { .. } | Self::Wish { .. } | Self::Ready { .. } | Self::Action { .. }
+        )
     }
 }
 
-fn render_board(frame: &mut Frame, area: Rect, state: &CityPanelState, palette: &Palette) {
-    let max_w = (area.width as usize).saturating_sub(4).max(8);
+pub fn render_fleet_panel(
+    frame: &mut Frame,
+    area: Rect,
+    state: &CityPanelState,
+    palette: &Palette,
+    focus: FocusZone,
+) {
+    render_city_panel(frame, area, state, palette, focus);
+}
+
+pub fn render_city_panel(
+    frame: &mut Frame,
+    area: Rect,
+    state: &CityPanelState,
+    palette: &Palette,
+    focus: FocusZone,
+) {
+    let title = format!(
+        "City · {}w · focus:{}",
+        state.seats.len(),
+        focus.label()
+    );
+    let block = widgets::panel_block(&title, palette, focus.is_city());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),  // wish
+            Constraint::Min(6),     // board
+            Constraint::Length(10), // inspector
+        ])
+        .split(inner);
+
+    render_wish_composer(frame, chunks[0], state, palette, focus == FocusZone::CityWish);
+    render_board(frame, chunks[1], state, palette, focus == FocusZone::CityBoard);
+    render_inspector(frame, chunks[2], state, palette, focus);
+}
+
+fn render_wish_composer(
+    frame: &mut Frame,
+    area: Rect,
+    state: &CityPanelState,
+    palette: &Palette,
+    focused: bool,
+) {
+    let cursor = if focused { "▌" } else { "" };
+    let style = if focused {
+        Style::default()
+            .fg(palette.highlight_fg)
+            .bg(palette.highlight_bg)
+    } else {
+        Style::default().fg(palette.subtext)
+    };
+    let text = if state.wish_text.is_empty() && !focused {
+        "wish> (Tab focus · type ambition · ↵ create)".into()
+    } else {
+        format!("wish> {}{cursor}", state.wish_text)
+    };
+    frame.render_widget(Paragraph::new(Span::styled(text, style)), area);
+}
+
+fn render_board(
+    frame: &mut Frame,
+    area: Rect,
+    state: &CityPanelState,
+    palette: &Palette,
+    focused: bool,
+) {
+    let max_w = (area.width as usize).saturating_sub(2).max(8);
     let mut lines: Vec<Line> = Vec::new();
     let blocked = state.blocked_count();
-    let wish_n = state
-        .rows
-        .iter()
-        .filter(|r| matches!(r, CityRow::Wish { .. }))
-        .count();
-    let ready_n = state
-        .rows
-        .iter()
-        .filter(|r| matches!(r, CityRow::Ready { .. }))
-        .count();
 
     lines.push(Line::from(vec![
         Span::styled(
-            " city ",
+            " WORKERS ",
             Style::default()
                 .fg(palette.contrast_on_accent())
                 .bg(if blocked > 0 {
@@ -508,60 +572,38 @@ fn render_board(frame: &mut Frame, area: Rect, state: &CityPanelState, palette: 
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!(
-                " {}w · {}wish · {}ready{} ",
-                state.seats.len(),
-                wish_n,
-                ready_n,
-                if blocked > 0 {
-                    format!(" · {blocked}⚠")
-                } else {
-                    String::new()
-                }
-            ),
-            Style::default().fg(palette.subtext),
+            format!(" {}  [u]spawn  [d]stop  [X]del ", state.seats.len()),
+            Style::default().fg(palette.overlay0),
         ),
     ]));
-    lines.push(Line::from(Span::styled(
-        "↑↓ · Enter · w/u/d · Esc",
-        Style::default().fg(palette.overlay0),
-    )));
 
-    for (i, row) in state.rows.iter().enumerate() {
-        let sel = i == state.selection && row.selectable();
+    if state.seats.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  none — press u to spawn",
+            Style::default().fg(palette.muted),
+        )));
+    }
+
+    for (i, row) in state.board_rows.iter().enumerate() {
+        let is_worker = matches!(row, BoardRow::Worker { .. });
+        // Section header before first flow item
+        if matches!(row, BoardRow::Flow { .. })
+            && (i == 0 || matches!(state.board_rows.get(i - 1), Some(BoardRow::Worker { .. })))
+        {
+            lines.push(Line::from(Span::styled(
+                " FLOW  wish→ready→doing ",
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+        if is_worker && i == 0 && !state.seats.is_empty() {
+            // already have WORKERS header
+        }
+
+        let sel = focused && i == state.selection;
         match row {
-            CityRow::Header { title } => {
-                lines.push(Line::from(Span::styled(
-                    "─".repeat(max_w.min(36)),
-                    Style::default().fg(palette.border),
-                )));
-                lines.push(Line::from(Span::styled(
-                    title.clone(),
-                    Style::default()
-                        .fg(palette.accent)
-                        .add_modifier(Modifier::BOLD),
-                )));
-            }
-            CityRow::Hint { text } => {
-                lines.push(Line::from(Span::styled(
-                    format!("  {text}"),
-                    Style::default().fg(palette.muted),
-                )));
-            }
-            CityRow::Action { label, .. } => {
-                let marker = if sel { "›" } else { " " };
-                let row_s = status::ellipsize(&format!("{marker}{label}"), max_w);
-                let style = if sel {
-                    Style::default()
-                        .fg(palette.highlight_fg)
-                        .bg(palette.highlight_bg)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(palette.subtext)
-                };
-                lines.push(Line::from(Span::styled(row_s, style)));
-            }
-            CityRow::Worker { seat } => {
+            BoardRow::Worker { seat } => {
                 let att = SeatAttention::from_status(seat);
                 let marker = if sel { "›" } else { " " };
                 let badge = caste_badge(&seat.seat);
@@ -583,36 +625,22 @@ fn render_board(frame: &mut Frame, area: Rect, state: &CityPanelState, palette: 
                     Style::default().fg(att.color(palette))
                 };
                 lines.push(Line::from(Span::styled(row_s, style)));
-                if sel && state.expanded {
-                    if let Some(line) = seat.last_line.as_deref() {
-                        lines.push(Line::from(Span::styled(
-                            status::ellipsize(&format!("   {line}"), max_w),
-                            Style::default().fg(palette.overlay0),
-                        )));
-                    }
-                }
             }
-            CityRow::Wish { bead } => {
+            BoardRow::Flow { item } => {
                 let marker = if sel { "›" } else { " " };
-                let st = bead_status_short(bead.status);
-                let row_s = status::ellipsize(
-                    &format!("{marker}◇ {} [{st}] {}", bead.id, bead.title),
-                    max_w,
-                );
-                let style = if sel {
-                    Style::default()
-                        .fg(palette.highlight_fg)
-                        .bg(palette.highlight_bg)
-                } else {
-                    Style::default().fg(palette.warn)
+                let glyph = match item.stage {
+                    FlowStage::Wish => "◆",
+                    FlowStage::Ready => "▸",
+                    FlowStage::Doing => "◐",
+                    FlowStage::Done => "✓",
                 };
-                lines.push(Line::from(Span::styled(row_s, style)));
-            }
-            CityRow::Ready { bead } => {
-                let marker = if sel { "›" } else { " " };
-                let kind = bead_kind_short(bead.kind);
                 let row_s = status::ellipsize(
-                    &format!("{marker}▸ {} [{kind}] {}", bead.id, bead.title),
+                    &format!(
+                        "{marker}{glyph} {} [{}] {}",
+                        item.id,
+                        item.stage.tag(),
+                        item.title
+                    ),
                     max_w,
                 );
                 let style = if sel {
@@ -620,22 +648,159 @@ fn render_board(frame: &mut Frame, area: Rect, state: &CityPanelState, palette: 
                         .fg(palette.highlight_fg)
                         .bg(palette.highlight_bg)
                 } else {
-                    Style::default().fg(palette.ok)
+                    Style::default().fg(match item.stage {
+                        FlowStage::Wish => palette.warn,
+                        FlowStage::Ready => palette.ok,
+                        FlowStage::Doing => palette.state_working,
+                        FlowStage::Done => palette.state_done,
+                    })
                 };
                 lines.push(Line::from(Span::styled(row_s, style)));
             }
         }
     }
 
-    let panel = Paragraph::new(lines).block(widgets::panel_block(
-        "City · wish / spawn / watch",
-        palette,
-        true,
-    ));
-    frame.render_widget(panel, area);
+    // Spawn inline hint when spawn zone focused — drawn at end of board area via status
+    if !state.status_line.is_empty() {
+        lines.push(Line::from(Span::styled(
+            status::ellipsize(&state.status_line, max_w),
+            Style::default().fg(palette.muted),
+        )));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn bead_status_short(st: BeadStatus) -> &'static str {
+fn render_inspector(
+    frame: &mut Frame,
+    area: Rect,
+    state: &CityPanelState,
+    palette: &Palette,
+    focus: FocusZone,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(2),
+            Constraint::Length(2),
+        ])
+        .split(area);
+
+    let seat_name = state.selected_seat.as_deref().unwrap_or("(none)");
+    let insp_focus = matches!(
+        focus,
+        FocusZone::CityInspector | FocusZone::CitySteer | FocusZone::CitySpawn
+    );
+
+    let mut top: Vec<Line> = Vec::new();
+    if let Some(s) = &state.detail_seat {
+        let att = SeatAttention::from_status(s);
+        top.push(Line::from(vec![
+            Span::styled(
+                format!(" {} ", att.icon()),
+                Style::default().fg(att.color(palette)),
+            ),
+            Span::styled(
+                format!(
+                    "{seat_name} [{}] {}",
+                    caste_badge(seat_name),
+                    s.state
+                ),
+                Style::default()
+                    .fg(if insp_focus {
+                        palette.text
+                    } else {
+                        palette.subtext
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        top.push(Line::from(Span::styled(
+            "[f]ollow [a]ttach [o]pen [b]abort [D]etach [d]stop [X]delete",
+            Style::default().fg(palette.overlay0),
+        )));
+    } else if focus == FocusZone::CitySpawn {
+        let fmark = if state.spawn_focus_fleet { "›" } else { " " };
+        let cmark = if state.spawn_focus_fleet { " " } else { "›" };
+        top.push(Line::from(Span::styled(
+            format!(
+                "spawn {fmark}Fleet:{}  {cmark}Crew:{}  (Tab field · ↵ go)",
+                state.spawn_fleet_n, state.spawn_crew_n
+            ),
+            Style::default()
+                .fg(palette.highlight_fg)
+                .bg(palette.highlight_bg),
+        )));
+        top.push(Line::from(Span::styled(
+            "Esc back · ↑↓ workers",
+            Style::default().fg(palette.overlay0),
+        )));
+    } else {
+        top.push(Line::from(Span::styled(
+            "inspector — select a worker",
+            Style::default().fg(palette.muted),
+        )));
+        top.push(Line::from(Span::styled(
+            "↑↓ board · Tab zones · u spawn",
+            Style::default().fg(palette.overlay0),
+        )));
+    }
+    frame.render_widget(Paragraph::new(top), chunks[0]);
+
+    // Log
+    let log_h = chunks[1].height as usize;
+    let visible = log_h.max(1);
+    let end = state.log_lines.len().saturating_sub(state.log_scroll);
+    let start = end.saturating_sub(visible);
+    let slice = if start < end {
+        &state.log_lines[start..end]
+    } else {
+        &[][..]
+    };
+    let mut log_lines: Vec<Line> = Vec::new();
+    if slice.is_empty() {
+        log_lines.push(Line::from(Span::styled(
+            if state.selected_seat.is_some() {
+                "(log empty — f to follow)"
+            } else {
+                ""
+            },
+            Style::default().fg(palette.muted),
+        )));
+    } else {
+        for l in slice {
+            log_lines.push(Line::from(Span::styled(
+                status::ellipsize(l, (chunks[1].width as usize).saturating_sub(1).max(8)),
+                Style::default().fg(palette.overlay1),
+            )));
+        }
+    }
+    frame.render_widget(Paragraph::new(log_lines), chunks[1]);
+
+    // Steer composer
+    let steer_focus = focus == FocusZone::CitySteer;
+    let cursor = if steer_focus { "▌" } else { "" };
+    let style = if steer_focus {
+        Style::default()
+            .fg(palette.highlight_fg)
+            .bg(palette.highlight_bg)
+    } else {
+        Style::default().fg(palette.subtext)
+    };
+    let steer = if state.selected_seat.is_none() {
+        String::new()
+    } else if state.steer_text.is_empty() && !steer_focus {
+        "steer> (Tab · type · ↵)".into()
+    } else {
+        format!("steer> {}{cursor}", state.steer_text)
+    };
+    frame.render_widget(Paragraph::new(Span::styled(steer, style)), chunks[2]);
+}
+
+// Silence unused import warnings for BeadStatus in this rewrite.
+#[allow(dead_code)]
+fn _bead_status_short(st: BeadStatus) -> &'static str {
     match st {
         BeadStatus::Open => "open",
         BeadStatus::Claimed => "claim",
@@ -643,214 +808,4 @@ fn bead_status_short(st: BeadStatus) -> &'static str {
         BeadStatus::Gated => "gate",
         BeadStatus::Closed => "done",
     }
-}
-
-fn bead_kind_short(kind: BeadKind) -> &'static str {
-    match kind {
-        BeadKind::Design => "des",
-        BeadKind::Implement => "imp",
-        BeadKind::Review => "rev",
-        BeadKind::Task => "tsk",
-    }
-}
-
-fn render_seat_detail(
-    frame: &mut Frame,
-    area: Rect,
-    state: &CityPanelState,
-    seat: &str,
-    palette: &Palette,
-) {
-    let title = format!("City · {seat}");
-    let block = widgets::panel_block(&title, palette, true);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(9), Constraint::Min(4)])
-        .split(inner);
-
-    let st = state.detail_seat.as_ref();
-    let att = st
-        .map(SeatAttention::from_status)
-        .unwrap_or(SeatAttention::Unknown);
-    let badge = caste_badge(seat);
-    let mut top: Vec<Line> = Vec::new();
-    top.push(Line::from(vec![
-        Span::styled(
-            format!(" {} ", att.icon()),
-            Style::default().fg(att.color(palette)),
-        ),
-        Span::styled(
-            format!("{seat} [{badge}]"),
-            Style::default()
-                .fg(palette.text)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
-    if let Some(s) = st {
-        top.push(Line::from(Span::styled(
-            format!(
-                "state={} pid={} {}",
-                s.state,
-                s.pid,
-                if s.running { "running" } else { "stopped" }
-            ),
-            Style::default().fg(palette.subtext),
-        )));
-        if let Some(b) = s.last_bead.as_deref() {
-            top.push(Line::from(Span::styled(
-                format!(
-                    "bead {b}{}",
-                    s.last_title
-                        .as_deref()
-                        .map(|t| format!(" — {t}"))
-                        .unwrap_or_default()
-                ),
-                Style::default().fg(palette.overlay1),
-            )));
-        }
-        if let Some(tool) = s.last_tool.as_deref() {
-            top.push(Line::from(Span::styled(
-                format!("tool {tool}"),
-                Style::default().fg(palette.tool),
-            )));
-        }
-        if s.awaiting_human.unwrap_or(false) {
-            top.push(Line::from(Span::styled(
-                "awaiting human",
-                Style::default().fg(palette.state_blocked),
-            )));
-        }
-        if let Some(line) = s.last_line.as_deref() {
-            top.push(Line::from(Span::styled(
-                status::ellipsize(line, (chunks[0].width as usize).saturating_sub(2).max(8)),
-                Style::default().fg(palette.muted),
-            )));
-        }
-    } else {
-        top.push(Line::from(Span::styled(
-            "no status file yet",
-            Style::default().fg(palette.muted),
-        )));
-    }
-    top.push(Line::from(Span::styled(
-        "[f]ollow [a]ttach [o]pen [s]teer [b]abort",
-        Style::default().fg(palette.overlay0),
-    )));
-    top.push(Line::from(Span::styled(
-        "[D]etach [d]own  Esc back",
-        Style::default().fg(palette.overlay0),
-    )));
-
-    frame.render_widget(Paragraph::new(top), chunks[0]);
-
-    let log_h = chunks[1].height as usize;
-    let visible = log_h.saturating_sub(1).max(1);
-    let end = state
-        .log_lines
-        .len()
-        .saturating_sub(state.log_scroll);
-    let start = end.saturating_sub(visible);
-    let slice = if start < end {
-        &state.log_lines[start..end]
-    } else {
-        &[][..]
-    };
-    let mut log_lines: Vec<Line> = vec![Line::from(Span::styled(
-        format!(
-            "─ log {} ─ PgUp/Dn",
-            if state.log_scroll == 0 {
-                "live".into()
-            } else {
-                format!("↑{}", state.log_scroll)
-            }
-        ),
-        Style::default().fg(palette.border),
-    ))];
-    for l in slice {
-        log_lines.push(Line::from(Span::styled(
-            status::ellipsize(l, (chunks[1].width as usize).saturating_sub(1).max(8)),
-            Style::default().fg(palette.overlay1),
-        )));
-    }
-    if slice.is_empty() {
-        log_lines.push(Line::from(Span::styled(
-            "(no log yet — press f to follow)",
-            Style::default().fg(palette.muted),
-        )));
-    }
-    frame.render_widget(Paragraph::new(log_lines), chunks[1]);
-}
-
-fn render_bead_detail(
-    frame: &mut Frame,
-    area: Rect,
-    state: &CityPanelState,
-    id: &str,
-    kind: BeadDetailKind,
-    palette: &Palette,
-) {
-    let title = match kind {
-        BeadDetailKind::Wish => format!("City · wish {id}"),
-        BeadDetailKind::Ready => format!("City · ready {id}"),
-    };
-    let mut lines: Vec<Line> = Vec::new();
-    if let Some(b) = &state.detail_bead {
-        lines.push(Line::from(Span::styled(
-            b.title.clone(),
-            Style::default()
-                .fg(palette.text)
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{} · {} · prio {}",
-                b.kind.as_str(),
-                b.status.as_str(),
-                b.priority
-            ),
-            Style::default().fg(palette.subtext),
-        )));
-        if !b.deps.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("deps: {}", b.deps.join(", ")),
-                Style::default().fg(palette.overlay0),
-            )));
-        }
-        lines.push(Line::from(""));
-        for chunk in b.notes.lines().take(12) {
-            lines.push(Line::from(Span::styled(
-                chunk.to_string(),
-                Style::default().fg(palette.overlay1),
-            )));
-        }
-        lines.push(Line::from(""));
-        if kind == BeadDetailKind::Ready {
-            lines.push(Line::from(Span::styled(
-                "A assign to seat · Esc back",
-                Style::default().fg(palette.overlay0),
-            )));
-        } else {
-            lines.push(Line::from(Span::styled(
-                "Esc back to board",
-                Style::default().fg(palette.overlay0),
-            )));
-        }
-    } else {
-        lines.push(Line::from(Span::styled(
-            format!("bead {id} not found"),
-            Style::default().fg(palette.state_blocked),
-        )));
-        lines.push(Line::from(Span::styled(
-            "Esc back",
-            Style::default().fg(palette.overlay0),
-        )));
-    }
-
-    let panel = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .block(widgets::panel_block(&title, palette, true));
-    frame.render_widget(panel, area);
 }

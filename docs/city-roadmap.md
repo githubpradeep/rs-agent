@@ -5,7 +5,9 @@ Source essays:
 - [The Shape of Things to Come, Part 1](https://yegge.ai/essays/the-shape-of-things-to-come/)
 - [Model Welfare, Part 2](https://yegge.ai/essays/model-welfare/)
 
-**Product constraint:** rs-agent TUI + CLI only (no Emacs / Wheelhouse cockpit). Deep Context stays the USP.
+**Product constraint:** rs-agent **TUI + CLI** are the product (no Emacs / Wheelhouse /
+browser ops cockpit as primary). Deep Context stays the USP. UI IA:
+[ui-ia.md](ui-ia.md). Desktop later = thin socket client ([desktop.md](desktop.md)).
 
 **Honesty:** What shipped as “Phase 1–2” is a **factory scaffold**, not a city. This plan replaces that half-plan. Every phase below must leave a **working operator loop**, not a status string that looks like a feature.
 
@@ -65,7 +67,10 @@ You sleep. In the morning: backlog smaller, reviews waiting or landed, mail/wish
 4. **Crons watch, models act** for standing roles (launchd-friendly CLI + heartbeat files).
 5. **Welfare is architecture:** wake with purpose, handoff not clonk, laurels without work attached, escalate/refuse, bounded workday, blameless postmortems into brain.
 6. **One interactive surface:** rs-agent TUI. Fleet runs headless; TUI is the cockpit.
+   City uses overview+inspector (never replace the board). Chat is not an ops log.
 7. **Project-local city state** under `.rs-agent/` (+ `brain/`). Seats stay in `~/.rs-agent/seats/`.
+8. **UI is a client of durable state** — Unix control socket is the shared API for TUI,
+   CLI, and a future thin desktop host. No second data path.
 
 ---
 

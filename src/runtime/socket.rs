@@ -102,7 +102,7 @@ pub fn handle_request(req: &ApiRequest) -> ApiResponse {
             let _ = std::fs::write(&flag, "1\n");
             ApiResponse::ok(id, serde_json::json!({ "stopping": true }))
         }
-        "agent.steer" => {
+        "agent.steer" | "seat.steer" => {
             let text = req
                 .params
                 .get("text")
@@ -110,10 +110,143 @@ pub fn handle_request(req: &ApiRequest) -> ApiResponse {
                 .unwrap_or("");
             let seat = req.params.get("seat").and_then(|v| v.as_str());
             if let Some(seat) = seat {
-                let _ = crate::fleet::append_control(seat, crate::fleet::ControlOp::Steer, Some(text));
+                let _ =
+                    crate::fleet::append_control(seat, crate::fleet::ControlOp::Steer, Some(text));
                 ApiResponse::ok(id, serde_json::json!({ "steered": seat, "text": text }))
             } else {
-                ApiResponse::err(id, "params.seat required for agent.steer")
+                ApiResponse::err(id, "params.seat required for seat.steer")
+            }
+        }
+        "seat.abort" => {
+            let Some(seat) = req.params.get("seat").and_then(|v| v.as_str()) else {
+                return ApiResponse::err(id, "params.seat required");
+            };
+            let _ = crate::fleet::append_control(seat, crate::fleet::ControlOp::Abort, None);
+            ApiResponse::ok(id, serde_json::json!({ "aborted": seat }))
+        }
+        "seat.pause" => {
+            let Some(seat) = req.params.get("seat").and_then(|v| v.as_str()) else {
+                return ApiResponse::err(id, "params.seat required");
+            };
+            let _ = crate::fleet::append_control(seat, crate::fleet::ControlOp::Pause, None);
+            ApiResponse::ok(id, serde_json::json!({ "paused": seat }))
+        }
+        "seat.resume" => {
+            let Some(seat) = req.params.get("seat").and_then(|v| v.as_str()) else {
+                return ApiResponse::err(id, "params.seat required");
+            };
+            let _ = crate::fleet::append_control(seat, crate::fleet::ControlOp::Resume, None);
+            ApiResponse::ok(id, serde_json::json!({ "resumed": seat }))
+        }
+        "city.board" => ApiResponse::ok(
+            id,
+            crate::tui::fleet_panel::CityPanelState::board_snapshot_json(),
+        ),
+        "wish.create" => {
+            let text = req
+                .params
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let as_task = req
+                .params
+                .get("as_task")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let auto_ready = req
+                .params
+                .get("auto_ready")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            match crate::wish::create_wish(text, as_task, auto_ready) {
+                Ok(b) => ApiResponse::ok(
+                    id,
+                    serde_json::json!({
+                        "id": b.id,
+                        "title": b.title,
+                        "kind": b.kind.as_str(),
+                    }),
+                ),
+                Err(e) => ApiResponse::err(id, e),
+            }
+        }
+        "fleet.up" => {
+            let seats = if let Some(arr) = req.params.get("seats").and_then(|v| v.as_array()) {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            } else {
+                let fleet_n = req
+                    .params
+                    .get("fleet_n")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(2) as usize;
+                let crew_n = req
+                    .params
+                    .get("crew_n")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                let mut seats = Vec::new();
+                for i in 1..=fleet_n.min(16) {
+                    seats.push(format!("Fleet-{i}"));
+                }
+                for i in 1..=crew_n.min(8) {
+                    seats.push(format!("Crew-{i}"));
+                }
+                seats
+            };
+            if seats.is_empty() {
+                return ApiResponse::err(id, "fleet.up needs seats or fleet_n/crew_n");
+            }
+            let opts = crate::fleet::FleetUpOpts {
+                seats,
+                budget_minutes: 480,
+                sleep_secs: 5,
+                quiet: false,
+                provider: req
+                    .params
+                    .get("provider")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                model: req
+                    .params
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                approve: true,
+                fail_fast: false,
+            };
+            match crate::fleet::fleet_up(opts) {
+                Ok(msg) => ApiResponse::ok(id, serde_json::json!({ "report": msg })),
+                Err(e) => ApiResponse::err(id, e),
+            }
+        }
+        "fleet.down" => {
+            let seats = req.params.get("seats").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            });
+            let msg = crate::fleet::fleet_down(seats);
+            ApiResponse::ok(id, serde_json::json!({ "report": msg }))
+        }
+        "fleet.delete" | "seat.delete" => {
+            let Some(seat) = req.params.get("seat").and_then(|v| v.as_str()) else {
+                return ApiResponse::err(id, "params.seat required");
+            };
+            let report = crate::fleet::delete_seat(seat);
+            ApiResponse::ok(id, serde_json::json!({ "report": report }))
+        }
+        "bead.delete" | "wish.delete" => {
+            let Some(bead_id) = req.params.get("id").and_then(|v| v.as_str()) else {
+                return ApiResponse::err(id, "params.id required");
+            };
+            match crate::beads::delete(None, bead_id) {
+                Ok(b) => ApiResponse::ok(
+                    id,
+                    serde_json::json!({ "id": b.id, "title": b.title, "deleted": true }),
+                ),
+                Err(e) => ApiResponse::err(id, e),
             }
         }
         other => ApiResponse::err(id, format!("unknown method: {other}")),

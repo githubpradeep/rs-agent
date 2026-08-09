@@ -260,6 +260,16 @@ pub fn save(seat: &SeatProfile) -> Result<(), String> {
     Ok(())
 }
 
+/// Remove a seat profile file (`~/.rs-agent/seats/<slug>.json`).
+pub fn delete(name_or_slug: &str) -> Result<(), String> {
+    let slug = slugify(name_or_slug);
+    let path = path_for(&slug);
+    if !path.is_file() {
+        return Ok(());
+    }
+    fs::remove_file(&path).map_err(|e| format!("delete seat `{slug}`: {e}"))
+}
+
 /// Load or create a seat by name.
 pub fn load_or_create(name: &str) -> Result<SeatProfile, String> {
     let slug = slugify(name);

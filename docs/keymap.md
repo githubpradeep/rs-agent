@@ -173,46 +173,27 @@ status bar shows `[D]` while Deep Context is active.
 
 ## City cockpit (agents / wishes / workers)
 
-Ops-core side panel: create wishes, spawn fleet/crew, watch progress, steer/attach — without
-dumping follow logs into the operator chat.
+Overview + inspector (board never replaced). See [ui-ia.md](ui-ia.md).
 
 ```text
-c / /city / /fleet     toggle City side panel
-w                      compose wish (modal)
-u                      spawn fleet/crew counts (modal)
-d                      stop selected worker (or all from ACTIONS)
-m                      marshal once
-A                      assign READY bead to a seat
-Enter                  open seat/bead detail or run ACTION
-Esc                    back to board / close panel
+c / /city / /fleet     toggle City
+Tab / BackTab          cycle zones: wish → board → inspect → steer → spawn
+wish> …                type ambition · ↵ create
+u                      focus spawn (Fleet/Crew counts · ↵)
+↑↓ · Enter             select worker/flow → inspector
+g                      jump to first blocked worker
+T                      tree drawer under City (Deep Context coexist)
 ```
 
-Board sections (↑↓ · Enter · x expands worker line):
+| Zone | Keys |
+|------|------|
+| **wish** | type · ↵ submit |
+| **board** | ↑↓ · Enter · u spawn · d stop · **X delete** · m marshal · A assign · g blocked |
+| **inspect** | f follow · a attach · o open · b abort · D detach · d stop · **X delete** · ↵ → steer |
+| **steer** | type · ↵ send (log stays in panel, not chat) |
+| **spawn** | digits · ←/→ field · ↵ spawn |
 
-| Section | What you see | Enter |
-|---------|----------------|-------|
-| **ACTIONS** | New wish · Spawn · Marshal · Stop all | Run action / open modal |
-| **WORKERS** | Seats attention-sorted; caste badge `[F]`/`[C]` | Seat detail + log |
-| **WISHES** | Open beads tagged `label:wish` | Bead detail |
-| **READY** | Claimable beads | Bead detail (`A` assign) |
-
-Seat detail keys:
-
-| Key | Action |
-|-----|--------|
-| `f` | Follow — live log in panel (not chat) |
-| `a` | Attach — pause worker, chat as that seat |
-| `o` | Open/inspect session read-only |
-| `s` | Steer modal |
-| `b` | Abort turn |
-| `D` | Detach / stop follow |
-| `d` | Stop this worker |
-| PgUp/PgDn | Scroll seat log |
-| Esc | Back to board |
-
-Footer chip: `VIEW seat` / `FOLLOW` / `ATTACHED` / `INSPECT`.
-
-Slash fallbacks still work: `/wish …`, `/fleet up|down`, `/seat follow|attach|steer|abort`.
+Footer: `VIEW` / `FOLLOW` / `ATTACHED` / `INSPECT`. Socket: `city.board`, `wish.create`, `fleet.up` ([runtime.md](runtime.md)).
 
 ## Sessions panel (multi-chat per project)
 
@@ -258,10 +239,9 @@ Capture these for docs / demos (Kitty / iTerm recommended):
 1. **Idle** — header `○ idle`, lean footer, empty chat + input
 2. **Blocked** — permission modal + toast + `● blocked` chip; optional OSC notify when unfocused
 3. **Sessions** — `/sessions` side panel with this-project chats + active ●
-4. **City** — `/city` board with ACTIONS + wish compose + seat detail log
-5. **Fleet blocked** — City WORKERS with ● blocked seat + FOLLOW chip
-6. **Tree** — `/tree` TurnBar + lazy expand during a Deep Context turn
-7. **Palette** — `Ctrl+K` filtered command list; `?` help overlay
+4. **City** — split wish composer + WORKERS/FLOW + inspector log/steer
+5. **City + tree** — Deep Context drawer under City while `[D]` active
+6. **Palette** — `Ctrl+K` filtered command list; `?` help overlay
 
 Theme: `/theme auto` follows host `COLORFGBG`. Settings: `/settings`.
 

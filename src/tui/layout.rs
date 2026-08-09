@@ -59,7 +59,7 @@ pub fn compute_view(area: Rect, opts: LayoutOpts) -> ViewRects {
     let footer = chunks[idx];
 
     let (chat, side) = if opts.show_side {
-        let pct = opts.side_pct.clamp(22, 42);
+        let pct = opts.side_pct.clamp(22, 48);
         let h = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([

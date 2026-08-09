@@ -146,13 +146,18 @@ pub fn build_entries(keys: &KeyMap) -> Vec<HelpEntry> {
             group: "slash",
         },
         HelpEntry {
-            keys: "w/u/d".into(),
-            desc: "city: wish / spawn / stop (panel open)".into(),
+            keys: "Tab".into(),
+            desc: "city: cycle wish/board/inspect/steer/spawn".into(),
             group: "city",
         },
         HelpEntry {
-            keys: "f/a/o/s/b".into(),
-            desc: "seat detail: follow/attach/open/steer/abort".into(),
+            keys: "f/a/o/b".into(),
+            desc: "city inspect: follow/attach/open/abort".into(),
+            group: "city",
+        },
+        HelpEntry {
+            keys: "↵".into(),
+            desc: "city: submit wish/steer/spawn or open inspector".into(),
             group: "city",
         },
         HelpEntry {
