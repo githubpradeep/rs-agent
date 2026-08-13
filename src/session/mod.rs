@@ -80,7 +80,10 @@ fn auto_title_from_messages(messages: &[Message]) -> Option<String> {
         m.content.iter().find_map(|c| c.text.clone())
     })?;
 
-    let collapsed: String = first_user_text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed: String = first_user_text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     let trimmed = collapsed.trim();
     if trimmed.is_empty() {
         return None;
@@ -118,7 +121,10 @@ pub fn export_markdown(data: &SessionData) -> String {
     let title = data.title.clone().unwrap_or_else(|| data.id.clone());
     out.push_str(&format!("# {}\n\n", title));
     out.push_str(&format!("- **Session ID:** {}\n", data.id));
-    out.push_str(&format!("- **Model:** {} ({})\n", data.model, data.provider));
+    out.push_str(&format!(
+        "- **Model:** {} ({})\n",
+        data.model, data.provider
+    ));
     out.push_str(&format!("- **Created:** {}\n", data.created_at));
     out.push_str(&format!("- **Updated:** {}\n", data.updated_at));
     out.push_str(&format!(
@@ -147,7 +153,10 @@ pub fn export_markdown(data: &SessionData) -> String {
                 ContentType::Thinking => {
                     if let Some(ref t) = c.thinking {
                         if !t.trim().is_empty() {
-                            parts.push(format!("<details><summary>thinking</summary>\n\n{}\n\n</details>", t));
+                            parts.push(format!(
+                                "<details><summary>thinking</summary>\n\n{}\n\n</details>",
+                                t
+                            ));
                         }
                     }
                 }
@@ -204,7 +213,8 @@ pub fn export_html(data: &SessionData) -> String {
                 ContentType::Text => {
                     if let Some(ref t) = c.text {
                         if !t.trim().is_empty() {
-                            inner.push_str(&format!("<pre class=\"text\">{}</pre>", html_escape(t)));
+                            inner
+                                .push_str(&format!("<pre class=\"text\">{}</pre>", html_escape(t)));
                         }
                     }
                 }
@@ -234,7 +244,11 @@ pub fn export_html(data: &SessionData) -> String {
                 ContentType::ToolResult => {
                     let name = html_escape(c.name.as_deref().unwrap_or("tool"));
                     let body_t = html_escape(c.text.as_deref().unwrap_or(""));
-                    let cls = if c.is_error { "tool-result error" } else { "tool-result" };
+                    let cls = if c.is_error {
+                        "tool-result error"
+                    } else {
+                        "tool-result"
+                    };
                     inner.push_str(&format!(
                         "<div class=\"{cls}\"><strong>result {name}</strong><pre>{body_t}</pre></div>"
                     ));
@@ -245,7 +259,9 @@ pub fn export_html(data: &SessionData) -> String {
         if inner.is_empty() {
             continue;
         }
-        body.push_str(&format!("<section class=\"msg {role}\"><h2>{role}</h2>{inner}</section>\n"));
+        body.push_str(&format!(
+            "<section class=\"msg {role}\"><h2>{role}</h2>{inner}</section>\n"
+        ));
     }
 
     format!(
@@ -356,7 +372,8 @@ impl SessionStore {
     }
 
     pub fn session_path(&self, id: &str) -> String {
-        Path::new(&self.dir).join(format!("{}.json", id))
+        Path::new(&self.dir)
+            .join(format!("{}.json", id))
             .to_string_lossy()
             .to_string()
     }
@@ -390,10 +407,7 @@ impl SessionStore {
         let matches: Vec<String> = ids
             .into_iter()
             .filter(|id| {
-                id == q
-                    || id.starts_with(q)
-                    || Self::short_id(id).starts_with(q)
-                    || id.contains(q)
+                id == q || id.starts_with(q) || Self::short_id(id).starts_with(q) || id.contains(q)
             })
             .collect();
         match matches.as_slice() {
@@ -422,7 +436,8 @@ impl SessionStore {
 
     pub fn load(&self, id: &str) -> Result<SessionData, String> {
         let path = self.session_path(id);
-        let json = fs::read_to_string(&path).map_err(|e| format!("Session '{}' not found: {}", id, e))?;
+        let json =
+            fs::read_to_string(&path).map_err(|e| format!("Session '{}' not found: {}", id, e))?;
         serde_json::from_str(&json).map_err(|e| format!("Failed to parse session '{}': {}", id, e))
     }
 
@@ -434,7 +449,12 @@ impl SessionStore {
         let mut sessions: Vec<String> = fs::read_dir(dir)
             .map_err(|e| e.to_string())?
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map(|ext| ext == "json").unwrap_or(false))
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "json")
+                    .unwrap_or(false)
+            })
             .filter_map(|e| {
                 e.path()
                     .file_stem()
@@ -451,7 +471,11 @@ impl SessionStore {
     }
 
     /// Fork a session: copy transcript into a new id with `parent_id` set.
-    pub fn fork(&self, source_id: &str, branch_label: Option<String>) -> Result<SessionData, String> {
+    pub fn fork(
+        &self,
+        source_id: &str,
+        branch_label: Option<String>,
+    ) -> Result<SessionData, String> {
         self.fork_at(source_id, None, branch_label)
     }
 
@@ -487,10 +511,7 @@ impl SessionStore {
         let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         data.created_at = now.clone();
         data.updated_at = now;
-        let base_title = data
-            .title
-            .clone()
-            .unwrap_or_else(|| parent.clone());
+        let base_title = data.title.clone().unwrap_or_else(|| parent.clone());
         let fork_label = match (&branch_label, at) {
             (Some(label), Some(n)) if !label.is_empty() => format!("{} [@{}]", label, n),
             (Some(label), _) if !label.is_empty() => label.clone(),
@@ -695,7 +716,9 @@ mod tests {
         data.ensure_title();
         store.save(&data).expect("save should succeed");
 
-        let loaded = store.load("session_roundtrip").expect("load should succeed");
+        let loaded = store
+            .load("session_roundtrip")
+            .expect("load should succeed");
         assert_eq!(loaded.title, data.title);
         assert_eq!(loaded.messages.len(), data.messages.len());
     }
@@ -711,10 +734,19 @@ mod tests {
         newer.ensure_title();
         store.save(&newer).unwrap();
 
-        assert_eq!(SessionStore::short_id("session_20260808_150000"), "20260808_150000");
+        assert_eq!(
+            SessionStore::short_id("session_20260808_150000"),
+            "20260808_150000"
+        );
         assert_eq!(store.resolve("latest").unwrap(), "session_20260808_150000");
-        assert_eq!(store.resolve("20260808_150000").unwrap(), "session_20260808_150000");
-        assert_eq!(store.resolve("20260808").unwrap(), "session_20260808_150000");
+        assert_eq!(
+            store.resolve("20260808_150000").unwrap(),
+            "session_20260808_150000"
+        );
+        assert_eq!(
+            store.resolve("20260808").unwrap(),
+            "session_20260808_150000"
+        );
     }
 
     #[test]
@@ -730,8 +762,7 @@ mod tests {
             "total_input_tokens": 0,
             "total_output_tokens": 0
         }"#;
-        let data: SessionData =
-            serde_json::from_str(json).expect("should parse without call_tree");
+        let data: SessionData = serde_json::from_str(json).expect("should parse without call_tree");
         assert!(data.call_tree.is_none());
     }
 
@@ -753,7 +784,9 @@ mod tests {
         }));
         store.save(&data).expect("save should succeed");
 
-        let loaded = store.load("session_with_tree").expect("load should succeed");
+        let loaded = store
+            .load("session_with_tree")
+            .expect("load should succeed");
         assert_eq!(loaded.call_tree, data.call_tree);
     }
 
@@ -771,7 +804,9 @@ mod tests {
         b.messages.push(user_message("another message"));
         store.save(&b).unwrap();
 
-        let summaries = store.list_summaries().expect("list_summaries should succeed");
+        let summaries = store
+            .list_summaries()
+            .expect("list_summaries should succeed");
         assert_eq!(summaries.len(), 2);
 
         let summary_b = summaries.iter().find(|s| s.id == "session_b").unwrap();
@@ -796,7 +831,9 @@ mod tests {
         src.title = Some("Original".into());
         store.save(&src).unwrap();
 
-        let forked = store.fork("session_src", Some("experiment".into())).unwrap();
+        let forked = store
+            .fork("session_src", Some("experiment".into()))
+            .unwrap();
         assert_ne!(forked.id, "session_src");
         assert_eq!(forked.parent_id.as_deref(), Some("session_src"));
         assert_eq!(forked.branch_label.as_deref(), Some("experiment"));
@@ -814,7 +851,9 @@ mod tests {
         assert!(n >= 1);
         store.save(&src).unwrap();
 
-        let forked = store.fork_at("session_long", Some(1), Some("at1".into())).unwrap();
+        let forked = store
+            .fork_at("session_long", Some(1), Some("at1".into()))
+            .unwrap();
         assert_eq!(forked.messages.len(), 1.min(n));
         assert_eq!(forked.parent_id.as_deref(), Some("session_long"));
         assert!(forked.title.as_deref().unwrap().contains("@1"));

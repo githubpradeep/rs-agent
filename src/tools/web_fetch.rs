@@ -49,10 +49,30 @@ fn extract_text(node: scraper::ElementRef, out: &mut String) {
             scraper::node::Node::Element(_) => {
                 if let Some(el) = scraper::ElementRef::wrap(child.clone()) {
                     let tag = el.value().name();
-                    if matches!(tag, "script" | "style" | "noscript" | "iframe" | "object" | "embed") {
+                    if matches!(
+                        tag,
+                        "script" | "style" | "noscript" | "iframe" | "object" | "embed"
+                    ) {
                         continue;
                     }
-                    if matches!(tag, "p" | "div" | "br" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "li" | "tr" | "blockquote" | "hr" | "table" | "ul" | "ol") {
+                    if matches!(
+                        tag,
+                        "p" | "div"
+                            | "br"
+                            | "h1"
+                            | "h2"
+                            | "h3"
+                            | "h4"
+                            | "h5"
+                            | "h6"
+                            | "li"
+                            | "tr"
+                            | "blockquote"
+                            | "hr"
+                            | "table"
+                            | "ul"
+                            | "ol"
+                    ) {
                         if !out.is_empty() && !out.ends_with('\n') {
                             out.push('\n');
                         }
@@ -172,7 +192,8 @@ fn node_to_markdown(node: scraper::ElementRef, out: &mut String, depth: usize) {
                         "pre" => {
                             let mut code = String::new();
                             for code_child in el.children() {
-                                if let Some(code_el) = scraper::ElementRef::wrap(code_child.clone()) {
+                                if let Some(code_el) = scraper::ElementRef::wrap(code_child.clone())
+                                {
                                     if code_el.value().name() == "code" {
                                         node_to_markdown(code_el, &mut code, depth + 1);
                                     }
@@ -187,9 +208,13 @@ fn node_to_markdown(node: scraper::ElementRef, out: &mut String, depth: usize) {
                         }
                         "code" => {
                             // Check if parent is <pre> (handled above)
-                            let is_in_pre = el.parent().and_then(|p| {
-                                scraper::ElementRef::wrap(p).map(|pe| pe.value().name() == "pre")
-                            }).unwrap_or(false);
+                            let is_in_pre = el
+                                .parent()
+                                .and_then(|p| {
+                                    scraper::ElementRef::wrap(p)
+                                        .map(|pe| pe.value().name() == "pre")
+                                })
+                                .unwrap_or(false);
                             if !is_in_pre {
                                 let mut content = String::new();
                                 node_to_markdown(el, &mut content, depth + 1);
@@ -244,7 +269,8 @@ fn node_to_markdown(node: scraper::ElementRef, out: &mut String, depth: usize) {
                         "tr" => {
                             let mut cells = Vec::new();
                             for cell_child in el.children() {
-                                if let Some(cell_el) = scraper::ElementRef::wrap(cell_child.clone()) {
+                                if let Some(cell_el) = scraper::ElementRef::wrap(cell_child.clone())
+                                {
                                     let tag_name = cell_el.value().name();
                                     if tag_name == "td" || tag_name == "th" {
                                         let mut content = String::new();
@@ -257,7 +283,8 @@ fn node_to_markdown(node: scraper::ElementRef, out: &mut String, depth: usize) {
                                 out.push_str(&format!("| {} |\n", cells.join(" | ")));
                             }
                         }
-                        "div" | "span" | "section" | "article" | "main" | "header" | "footer" | "nav" => {
+                        "div" | "span" | "section" | "article" | "main" | "header" | "footer"
+                        | "nav" => {
                             node_to_markdown(el, out, depth);
                         }
                         _ => {
@@ -311,7 +338,9 @@ impl AgentTool for WebFetchTool {
 
         // Validate URL
         if !parsed.url.starts_with("http://") && !parsed.url.starts_with("https://") {
-            return ToolExecuteResult::error("Only http:// and https:// URLs are supported".to_string());
+            return ToolExecuteResult::error(
+                "Only http:// and https:// URLs are supported".to_string(),
+            );
         }
 
         let timeout_secs = parsed.timeout.unwrap_or(DEFAULT_TIMEOUT).min(MAX_TIMEOUT);
@@ -329,7 +358,10 @@ impl AgentTool for WebFetchTool {
         let resp = match client
             .get(&parsed.url)
             .header("user-agent", browser_user_agent())
-            .header("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .header(
+                "accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
             .send()
             .await
         {
@@ -343,7 +375,10 @@ impl AgentTool for WebFetchTool {
                 let resp2 = match client
                     .get(&parsed.url)
                     .header("user-agent", "opencode")
-                    .header("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                    .header(
+                        "accept",
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    )
                     .send()
                     .await
                 {
@@ -351,11 +386,30 @@ impl AgentTool for WebFetchTool {
                     Err(e) => return ToolExecuteResult::error(format!("Request failed: {}", e)),
                 };
                 if !resp2.status().is_success() {
-                    return ToolExecuteResult::error(format!("HTTP {}: {}", resp2.status().as_u16(), resp2.text().await.unwrap_or_default().chars().take(200).collect::<String>()));
+                    return ToolExecuteResult::error(format!(
+                        "HTTP {}: {}",
+                        resp2.status().as_u16(),
+                        resp2
+                            .text()
+                            .await
+                            .unwrap_or_default()
+                            .chars()
+                            .take(200)
+                            .collect::<String>()
+                    ));
                 }
                 return process_response(resp2, format, &parsed.url).await;
             }
-            return ToolExecuteResult::error(format!("HTTP {}: {}", status.as_u16(), resp.text().await.unwrap_or_default().chars().take(200).collect::<String>()));
+            return ToolExecuteResult::error(format!(
+                "HTTP {}: {}",
+                status.as_u16(),
+                resp.text()
+                    .await
+                    .unwrap_or_default()
+                    .chars()
+                    .take(200)
+                    .collect::<String>()
+            ));
         }
 
         return process_response(resp, format, &parsed.url).await;
@@ -373,7 +427,10 @@ async fn process_response(resp: reqwest::Response, format: &str, url: &str) -> T
     // Check content length
     if let Some(len) = resp.content_length() {
         if len > MAX_RESPONSE_BYTES {
-            return ToolExecuteResult::error(format!("Response too large: {} bytes (max {})", len, MAX_RESPONSE_BYTES));
+            return ToolExecuteResult::error(format!(
+                "Response too large: {} bytes (max {})",
+                len, MAX_RESPONSE_BYTES
+            ));
         }
     }
 
@@ -383,7 +440,11 @@ async fn process_response(resp: reqwest::Response, format: &str, url: &str) -> T
     };
 
     if body.len() > MAX_RESPONSE_BYTES as usize {
-        return ToolExecuteResult::error(format!("Response too large: {} bytes (max {})", body.len(), MAX_RESPONSE_BYTES));
+        return ToolExecuteResult::error(format!(
+            "Response too large: {} bytes (max {})",
+            body.len(),
+            MAX_RESPONSE_BYTES
+        ));
     }
 
     // Reject images

@@ -252,7 +252,8 @@ impl ReplSession {
         F: FnMut(String, Vec<Value>, Value) -> Fut,
         Fut: std::future::Future<Output = Result<Value, String>>,
     {
-        self.exec_with_host_and_output(code, host_handler, |_, _| {}).await
+        self.exec_with_host_and_output(code, host_handler, |_, _| {})
+            .await
     }
 
     /// Like [`exec_with_host`], but also forwards live `stdout`/`stderr` JSON

@@ -42,10 +42,7 @@ pub fn all_models() -> &'static [CatalogModel] {
 
 /// Distinct provider ids present in the catalog (sorted).
 pub fn catalog_providers() -> Vec<&'static str> {
-    let mut v: Vec<&str> = catalog()
-        .iter()
-        .map(|m| m.provider.as_str())
-        .collect();
+    let mut v: Vec<&str> = catalog().iter().map(|m| m.provider.as_str()).collect();
     v.sort_unstable();
     v.dedup();
     v

@@ -18,9 +18,7 @@ pub struct Fact {
 impl Fact {
     pub fn new(text: String) -> Self {
         Self {
-            written_at: chrono::Local::now()
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string(),
+            written_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             text,
             falsified: false,
             id: Some(format!("f{}", chrono::Local::now().format("%H%M%S"))),
@@ -164,9 +162,7 @@ pub fn record_close(bead_id: &str, kind: &str, summary: &str) -> Result<(), Stri
     let dir = project_rs_agent();
     fs::create_dir_all(&dir).map_err(|e| format!("mkdir .rs-agent: {e}"))?;
     let entry = LedgerEntry {
-        at: chrono::Local::now()
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string(),
+        at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         bead: bead_id.to_string(),
         summary: summary.chars().take(400).collect(),
         git_sha: git_head_sha(),

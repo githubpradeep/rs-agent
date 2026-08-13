@@ -137,12 +137,12 @@ pub fn build_entries(keys: &KeyMap) -> Vec<HelpEntry> {
         },
         HelpEntry {
             keys: keys.binding("toggle_city").into(),
-            desc: "toggle city cockpit (wish/spawn/watch)".into(),
+            desc: "workers cockpit (wish/spawn/watch)".into(),
             group: "normal",
         },
         HelpEntry {
             keys: "/fleet".into(),
-            desc: "city cockpit panel (alias /city)".into(),
+            desc: "workers cockpit (alias /city)".into(),
             group: "slash",
         },
         HelpEntry {
@@ -210,7 +210,14 @@ pub fn render_help(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!(" {} ", if overlay.query.is_empty() { "type to filter…" } else { &overlay.query }),
+            format!(
+                " {} ",
+                if overlay.query.is_empty() {
+                    "type to filter…"
+                } else {
+                    &overlay.query
+                }
+            ),
             Style::default().fg(palette.text),
         ),
     ])];

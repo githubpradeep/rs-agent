@@ -2,9 +2,7 @@
 
 pub mod socket;
 
-pub use socket::{
-    call, default_socket_path, handle_request, serve_socket, PROTOCOL_VERSION,
-};
+pub use socket::{call, default_socket_path, handle_request, serve_socket, PROTOCOL_VERSION};
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -68,6 +66,5 @@ pub fn pid_path() -> PathBuf {
 }
 
 pub fn is_runtime_env() -> bool {
-    std::env::var_os("RS_AGENT_RUNTIME").is_some()
-        || std::env::var_os("RS_AGENT_SOCKET").is_some()
+    std::env::var_os("RS_AGENT_RUNTIME").is_some() || std::env::var_os("RS_AGENT_SOCKET").is_some()
 }

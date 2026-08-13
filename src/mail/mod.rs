@@ -45,9 +45,7 @@ fn ensure_dirs() -> Result<(), String> {
 }
 
 fn now_str() -> String {
-    chrono::Local::now()
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string()
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 /// Send mail to a seat (or `broadcast` / `human` / `Seneschal`).
@@ -184,8 +182,13 @@ mod tests {
     #[test]
     fn send_ack_roundtrip() {
         crate::with_temp_cwd(|_| {
-            let msg =
-                send("Fleet-1", "Seneschal", "stuck on secrets", vec!["b1".into()]).unwrap();
+            let msg = send(
+                "Fleet-1",
+                "Seneschal",
+                "stuck on secrets",
+                vec!["b1".into()],
+            )
+            .unwrap();
             assert!(!msg.acked);
             let listed = inbox(Some("Seneschal"), false);
             assert_eq!(listed.len(), 1);

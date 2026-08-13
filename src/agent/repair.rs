@@ -105,10 +105,7 @@ pub fn weak_model_system_note() -> &'static str {
 }
 
 /// Resolve a model-supplied tool name to a registered tool (aliases + case).
-pub fn resolve_tool<'a>(
-    registry: &'a ToolRegistry,
-    name: &str,
-) -> Result<&'a SharedTool, String> {
+pub fn resolve_tool<'a>(registry: &'a ToolRegistry, name: &str) -> Result<&'a SharedTool, String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err(unknown_tool_message(registry, "(empty)"));
@@ -178,7 +175,10 @@ pub fn make_arg_parse_error_value(err: &str, raw: &str) -> Value {
 
 /// Normalize + soft-validate against the tool's JSON schema `required` list.
 /// Returns Ok(normalized_args) or Err(repair message for the model).
-pub fn prepare_tool_args(tool: &dyn crate::agent::tool::AgentTool, args: Value) -> Result<Value, String> {
+pub fn prepare_tool_args(
+    tool: &dyn crate::agent::tool::AgentTool,
+    args: Value,
+) -> Result<Value, String> {
     let mut args = crate::tools::normalize_file_tool_args(args);
     // Also apply generic aliases for bash etc.
     args = normalize_generic_args(args, tool.name());
@@ -306,12 +306,7 @@ fn schema_hint(schema: &Value) -> String {
     let props = schema
         .get("properties")
         .and_then(|p| p.as_object())
-        .map(|p| {
-            p.keys()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
+        .map(|p| p.keys().cloned().collect::<Vec<_>>().join(", "))
         .unwrap_or_default();
     if props.is_empty() {
         String::new()

@@ -99,12 +99,26 @@ pub struct StreamDelta {
 
 #[derive(Debug, Clone)]
 pub enum DeltaType {
-    Text { text: String },
-    Thinking { thinking: String },
-    Signature { signature: String },
-    ToolCallStart { id: String, name: String, input: String },
-    ToolCallDelta { input: String },
-    Stop { stop_reason: Option<StopReason> },
+    Text {
+        text: String,
+    },
+    Thinking {
+        thinking: String,
+    },
+    Signature {
+        signature: String,
+    },
+    ToolCallStart {
+        id: String,
+        name: String,
+        input: String,
+    },
+    ToolCallDelta {
+        input: String,
+    },
+    Stop {
+        stop_reason: Option<StopReason>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

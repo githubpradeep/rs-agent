@@ -1,26 +1,24 @@
+use crate::agent::compact_pins::{append_pins_to_summary, collect_pins_from_messages, CompactPins};
 use crate::agent::control::{AbortFlag, SteerQueue};
-use crate::agent::registry::ToolRegistry;
-use crate::agent::state::AgentState;
-use crate::agent::compact_pins::{
-    append_pins_to_summary, collect_pins_from_messages, CompactPins,
-};
 use crate::agent::goal::{
     self, evaluator_system_prompt, evaluator_user_prompt, format_transcript_for_evaluator,
     parse_evaluator_reply, parse_verify_reply, verify_system_prompt, verify_user_prompt,
     GoalStatus, MAX_CONSECUTIVE_BLOCKS,
 };
 use crate::agent::mode::AgentMode;
+use crate::agent::registry::ToolRegistry;
 use crate::agent::repair::{
     is_weak_model, make_arg_parse_error_value, prepare_tool_args, resolve_tool,
     tool_call_fingerprint, tool_near_dupe_key, weak_model_system_note,
 };
 use crate::agent::rlm_escalate;
-use crate::agent::tool::{AgentTool, ToolExecutionMode, ToolExecuteResult};
+use crate::agent::state::AgentState;
+use crate::agent::tool::{AgentTool, ToolExecuteResult, ToolExecutionMode};
 use crate::ai::provider::Provider;
 use crate::ai::token_count;
 use crate::ai::types::*;
-use crate::permission::{PendingPermission, PermissionReply};
 use crate::hooks::HookRegistry;
+use crate::permission::{PendingPermission, PermissionReply};
 use crate::rlm::tree::CallTree;
 use crossbeam_channel as channel;
 use futures::StreamExt;
@@ -30,25 +28,51 @@ use tracing;
 
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
-    TextDelta { text: String },
-    ThinkingDelta { thinking: String },
-    ToolUseStart { id: String, name: String },
-    ToolUseDelta { input: String },
-    ToolResult { id: String, name: String, result: ToolExecuteResult },
+    TextDelta {
+        text: String,
+    },
+    ThinkingDelta {
+        thinking: String,
+    },
+    ToolUseStart {
+        id: String,
+        name: String,
+    },
+    ToolUseDelta {
+        input: String,
+    },
+    ToolResult {
+        id: String,
+        name: String,
+        result: ToolExecuteResult,
+    },
     /// Streaming REPL stdout/stderr lines while `repl` runs.
-    ReplOutput { stream: String, text: String },
+    ReplOutput {
+        stream: String,
+        text: String,
+    },
     /// Progressive tool output (e.g. bash stdout) while a tool is running.
     ToolOutput {
         name: String,
         stream: String,
         text: String,
     },
-    TurnEnd { stop_reason: Option<StopReason> },
-    Error { message: String },
-    Status { message: String },
+    TurnEnd {
+        stop_reason: Option<StopReason>,
+    },
+    Error {
+        message: String,
+    },
+    Status {
+        message: String,
+    },
     Done,
     Aborted,
-    ContextWarning { fraction: f64, used: usize, limit: usize },
+    ContextWarning {
+        fraction: f64,
+        used: usize,
+        limit: usize,
+    },
     TokenUpdate {
         used: usize,
         limit: usize,
@@ -56,19 +80,36 @@ pub enum AgentEvent {
         output_tokens: usize,
     },
     Compacting,
-    Compacted { summary: String },
-    TreeUpdate { tree: CallTree },
-    TitleUpdate { title: String },
+    Compacted {
+        summary: String,
+    },
+    TreeUpdate {
+        tree: CallTree,
+    },
+    TitleUpdate {
+        title: String,
+    },
     /// Session id/title changed (`/new`, `/fork`).
-    SessionMeta { id: String, title: Option<String> },
+    SessionMeta {
+        id: String,
+        title: Option<String>,
+    },
     /// Replace the visible transcript (e.g. after fork-at-N).
-    ReloadTranscript { messages: Vec<crate::ai::types::Message> },
+    ReloadTranscript {
+        messages: Vec<crate::ai::types::Message>,
+    },
     /// API-message timeline for `/timeline` / fork-at-N.
-    TimelineSnapshot { entries: Vec<(usize, String)> },
+    TimelineSnapshot {
+        entries: Vec<(usize, String)>,
+    },
     /// LSP diagnostics summary for the status bar.
-    LspUpdate { summary: String },
+    LspUpdate {
+        summary: String,
+    },
     /// `/goal` status changed (set/clear/pause/achieve).
-    GoalUpdate { summary: String },
+    GoalUpdate {
+        summary: String,
+    },
 }
 
 /// Truncates a tool result to `max` chars by keeping the head and tail and
@@ -363,11 +404,7 @@ impl AgentLoop {
                 .iter()
                 .rev()
                 .take(6)
-                .flat_map(|m| {
-                    m.content
-                        .iter()
-                        .filter_map(|c| c.text.as_deref())
-                })
+                .flat_map(|m| m.content.iter().filter_map(|c| c.text.as_deref()))
                 .collect::<Vec<_>>()
                 .join("\n");
             if let Some(true) = goal.eval_cond_dsl(&hay) {
@@ -410,7 +447,9 @@ impl AgentLoop {
 
         // Fast path: bead-store conditions without an LLM round-trip.
         if let Some((met, reason)) = crate::beads::evaluate_bead_condition(&goal.condition) {
-            return self.finish_goal_eval(met, reason, &goal.condition, callback).await;
+            return self
+                .finish_goal_eval(met, reason, &goal.condition, callback)
+                .await;
         }
 
         callback(AgentEvent::Status {
@@ -462,12 +501,8 @@ impl AgentLoop {
         // Soft goals must not achieve while the bead backlog still has work.
         if met && crate::beads::soft_goal_blocked_by_backlog(condition) {
             met = false;
-            let ready = crate::beads::list_ready(None)
-                .map(|r| r.len())
-                .unwrap_or(0);
-            let open = crate::beads::list_open(None)
-                .map(|r| r.len())
-                .unwrap_or(0);
+            let ready = crate::beads::list_ready(None).map(|r| r.len()).unwrap_or(0);
+            let open = crate::beads::list_open(None).map(|r| r.len()).unwrap_or(0);
             reason = format!(
                 "backlog remains ({ready} ready / {open} open) — keep implementing; \
                  use /goal no open beads for a hard stop"
@@ -535,7 +570,8 @@ impl AgentLoop {
             self.abort.clone(),
             self.call_tree.clone(),
             self.rlm_depth,
-            self.max_rlm_depth.min(self.rlm_depth.saturating_add(1).max(1)),
+            self.max_rlm_depth
+                .min(self.rlm_depth.saturating_add(1).max(1)),
             15,
             root_id,
         );
@@ -635,11 +671,7 @@ impl AgentLoop {
 
     /// Swap the live provider client and model (pi-style mid-session switch).
     /// Re-attaches the RLM `repl` tool so sub-calls use the new client.
-    pub fn set_provider_and_model(
-        &mut self,
-        provider: Arc<dyn Provider>,
-        model: String,
-    ) {
+    pub fn set_provider_and_model(&mut self, provider: Arc<dyn Provider>, model: String) {
         let max_depth = self.max_rlm_depth;
         self.state.provider = provider.name().to_string();
         self.state.model = model;
@@ -819,8 +851,9 @@ impl AgentLoop {
             true
         } else {
             callback(AgentEvent::Status {
-                message: "stream failed after recoveries — type continue or /handoff (session ready)"
-                    .into(),
+                message:
+                    "stream failed after recoveries — type continue or /handoff (session ready)"
+                        .into(),
             });
             // Soft end: do not surface as hard Error / do not leave Waiting wedged.
             callback(AgentEvent::Done);
@@ -943,7 +976,8 @@ impl AgentLoop {
     fn is_context_overflow(err: &str) -> bool {
         let lower = err.to_lowercase();
         lower.contains("context_length_exceeded")
-            || (lower.contains("context length") && (lower.contains("exceed") || lower.contains("too long")))
+            || (lower.contains("context length")
+                && (lower.contains("exceed") || lower.contains("too long")))
             || lower.contains("maximum context")
             || lower.contains("prompt is too long")
             || lower.contains("too many tokens")
@@ -984,7 +1018,15 @@ impl AgentLoop {
             "first i",
         ];
         let has_starter = starters.iter().any(|s| text.contains(s));
-        let action_words = ["explore", "check", "look", "read", "examine", "see what's", "start by"];
+        let action_words = [
+            "explore",
+            "check",
+            "look",
+            "read",
+            "examine",
+            "see what's",
+            "start by",
+        ];
         let has_action = action_words.iter().any(|s| text.contains(s));
         has_starter && has_action
     }
@@ -1041,7 +1083,11 @@ impl AgentLoop {
             }
 
             if fraction >= 0.65 {
-                callback(AgentEvent::ContextWarning { fraction, used, limit });
+                callback(AgentEvent::ContextWarning {
+                    fraction,
+                    used,
+                    limit,
+                });
                 let _ = self.compact(callback).await;
             }
 
@@ -1051,7 +1097,8 @@ impl AgentLoop {
                 Err(e) if e == "aborted" => return Err(e),
                 Err(e) if !self.overflow_retried && Self::is_context_overflow(&e) => {
                     callback(AgentEvent::Error {
-                        message: "Context overflow detected, compacting and retrying...".to_string(),
+                        message: "Context overflow detected, compacting and retrying..."
+                            .to_string(),
                     });
                     self.overflow_retried = true;
                     let _ = self.compact(callback).await;
@@ -1115,9 +1162,7 @@ impl AgentLoop {
                 self.blank_retries = 0;
 
                 // Weak-model thrash: repeated "let me explore…" text turns with no tools.
-                if self.should_force_sequential()
-                    && Self::looks_like_explore_spin(&assistant_msg)
-                {
+                if self.should_force_sequential() && Self::looks_like_explore_spin(&assistant_msg) {
                     if let Ok(mut recent) = self.recent_near_dupes.lock() {
                         let key = "text_explore_spin".to_string();
                         let streak = recent.iter().rev().take(3).filter(|p| *p == &key).count();
@@ -1180,9 +1225,10 @@ impl AgentLoop {
                 }
             }
 
-            let has_sequential = self.tools.iter().any(|t| {
-                t.execution_mode() == ToolExecutionMode::Sequential
-            });
+            let has_sequential = self
+                .tools
+                .iter()
+                .any(|t| t.execution_mode() == ToolExecutionMode::Sequential);
 
             if has_sequential || self.should_force_sequential() {
                 self.execute_tools_sequential(&tool_calls, callback).await?;
@@ -1207,10 +1253,14 @@ impl AgentLoop {
         let api_key = std::env::var(self.provider.api_key_env_var())
             .map_err(|_| format!("{} not set", self.provider.api_key_env_var()))?;
 
-        let thinking = self.state.thinking_budget.filter(|b| *b > 0).map(|b| ThinkingConfig {
-            r#type: "enabled".to_string(),
-            budget_tokens: b,
-        });
+        let thinking = self
+            .state
+            .thinking_budget
+            .filter(|b| *b > 0)
+            .map(|b| ThinkingConfig {
+                r#type: "enabled".to_string(),
+                budget_tokens: b,
+            });
         // Anthropic extended thinking: max_tokens must exceed budget; temperature must be omitted/1.
         let (max_tokens, temperature) = if let Some(ref t) = thinking {
             (
@@ -1260,19 +1310,18 @@ impl AgentLoop {
             system.push_str(&note);
         }
         if self.state.pending_wake {
-            let seat = self.state.seat.as_ref().and_then(|n| {
-                crate::agent::seat::load(n).ok()
-            });
+            let seat = self
+                .state
+                .seat
+                .as_ref()
+                .and_then(|n| crate::agent::seat::load(n).ok());
             let handoff = self
                 .state
                 .handoff
                 .clone()
                 .or_else(crate::agent::handoff::snapshot);
-            let inputs = crate::agent::wake::WakeInputs::from_parts(
-                seat,
-                handoff,
-                self.state.goal.clone(),
-            );
+            let inputs =
+                crate::agent::wake::WakeInputs::from_parts(seat, handoff, self.state.goal.clone());
             if let Some(packet) = crate::agent::wake::build(&inputs) {
                 if !system.is_empty() {
                     system.push_str("\n\n");
@@ -1291,7 +1340,11 @@ impl AgentLoop {
         let request = ChatRequest {
             model: self.state.model.clone(),
             messages: self.state.messages.clone(),
-            system: if system.is_empty() { None } else { Some(system) },
+            system: if system.is_empty() {
+                None
+            } else {
+                Some(system)
+            },
             tools,
             max_tokens,
             temperature,
@@ -1379,7 +1432,9 @@ impl AgentLoop {
                                             tool_arg_buf[idx].push_str(&input);
                                         }
                                     }
-                                    DeltaType::Stop { stop_reason: reason } => {
+                                    DeltaType::Stop {
+                                        stop_reason: reason,
+                                    } => {
                                         stop_reason = reason;
                                     }
                                 }
@@ -1400,11 +1455,7 @@ impl AgentLoop {
                     if let Some(err) = last_err.take() {
                         let delay = Self::retry_delay(&err, attempt);
                         callback(AgentEvent::Status {
-                            message: format!(
-                                "stream retry {}/5 after {:?}…",
-                                attempt + 1,
-                                err
-                            ),
+                            message: format!("stream retry {}/5 after {:?}…", attempt + 1, err),
                         });
                         tokio::time::sleep(delay).await;
                         continue;
@@ -1450,11 +1501,7 @@ impl AgentLoop {
                 Err(e) if Self::is_retryable(&e) && attempt < 4 => {
                     let delay = Self::retry_delay(&e, attempt);
                     callback(AgentEvent::Status {
-                        message: format!(
-                            "stream retry {}/5 after {:?}…",
-                            attempt + 1,
-                            e
-                        ),
+                        message: format!("stream retry {}/5 after {:?}…", attempt + 1, e),
                     });
                     tokio::time::sleep(delay).await;
                 }
@@ -1467,7 +1514,6 @@ impl AgentLoop {
             last_err.unwrap_or(ProviderError::Other("unknown".into()))
         ))
     }
-
 
     async fn execute_tools_sequential(
         &mut self,
@@ -1506,15 +1552,19 @@ impl AgentLoop {
             name: String,
             input: serde_json::Value,
         }
-        let tool_data: Vec<ToolJob> = tool_calls.iter().map(|tc| ToolJob {
-            id: tc.id.as_deref().unwrap_or("").to_string(),
-            name: tc.name.as_deref().unwrap_or("").to_string(),
-            input: tc.input.clone().unwrap_or(serde_json::Value::Null),
-        }).collect();
+        let tool_data: Vec<ToolJob> = tool_calls
+            .iter()
+            .map(|tc| ToolJob {
+                id: tc.id.as_deref().unwrap_or("").to_string(),
+                name: tc.name.as_deref().unwrap_or("").to_string(),
+                input: tc.input.clone().unwrap_or(serde_json::Value::Null),
+            })
+            .collect();
 
-        let futures: Vec<_> = tool_data.iter().map(|job| {
-            self.execute_single_tool(&job.id, &job.name, &job.input)
-        }).collect();
+        let futures: Vec<_> = tool_data
+            .iter()
+            .map(|job| self.execute_single_tool(&job.id, &job.name, &job.input))
+            .collect();
 
         let results = futures::future::join_all(futures).await;
 
@@ -1566,10 +1616,7 @@ impl AgentLoop {
                     });
                 }
                 callback(AgentEvent::Status {
-                    message: format!(
-                        "escalated (needs: {}) — {}",
-                        esc.needs, esc.reason
-                    ),
+                    message: format!("escalated (needs: {}) — {}", esc.needs, esc.reason),
                 });
             }
         }
@@ -1586,9 +1633,7 @@ impl AgentLoop {
         } else {
             content.to_string()
         };
-        if stored.chars().count() < original_len
-            || spilled.truncated
-        {
+        if stored.chars().count() < original_len || spilled.truncated {
             // RLM escalate only when we dropped body without a spill path (char-cap path).
             if spilled.output_path.is_none() && stored.chars().count() < original_len {
                 stored = rlm_escalate::append_truncate_escalate_hint(name, &stored, original_len);
@@ -1653,11 +1698,13 @@ impl AgentLoop {
         // Serialize conversation for summarization with truncation
         let mut conv_text = String::new();
         for msg in &to_summarize {
-            if msg.role == Role::System && msg.content.iter().any(|c| {
-                c.text.as_deref().map_or(false, |t| {
-                    t.starts_with("[Compacted summary of earlier conversation]")
+            if msg.role == Role::System
+                && msg.content.iter().any(|c| {
+                    c.text.as_deref().map_or(false, |t| {
+                        t.starts_with("[Compacted summary of earlier conversation]")
+                    })
                 })
-            }) {
+            {
                 continue;
             }
             let role = match msg.role {
@@ -1669,7 +1716,11 @@ impl AgentLoop {
             for c in &msg.content {
                 let text = c.text.as_deref().unwrap_or("");
                 let truncated = if text.len() > TRUNCATE_LEN {
-                    format!("{}... [truncated {} chars]", &text[..TRUNCATE_LEN], text.len())
+                    format!(
+                        "{}... [truncated {} chars]",
+                        &text[..TRUNCATE_LEN],
+                        text.len()
+                    )
                 } else {
                     text.to_string()
                 };
@@ -1863,10 +1914,7 @@ impl AgentLoop {
         }
 
         if resolved_name == "handoff" {
-            let summary = args
-                .get("summary")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("");
             if let Err(msg) = self.hooks.before_handoff(summary) {
                 return ToolExecuteResult::error(msg);
             }
@@ -1968,8 +2016,8 @@ fn goal_likely_needs_tools(condition: &str) -> bool {
 
 #[cfg(test)]
 mod tool_output_truncation_tests {
-    use super::truncate_tool_output;
     use super::snap_compact_split;
+    use super::truncate_tool_output;
     use crate::ai::types::*;
 
     #[test]
@@ -2088,5 +2136,3 @@ mod tool_output_truncation_tests {
         let _ = out.len();
     }
 }
-
-

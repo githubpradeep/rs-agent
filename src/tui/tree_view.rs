@@ -117,11 +117,7 @@ pub fn parse_text_tree(text: &str) -> Vec<CallTreeNode> {
             expanded: indent < 6,
         };
 
-        while stack
-            .last()
-            .map(|(ind, _)| *ind >= indent)
-            .unwrap_or(false)
-        {
+        while stack.last().map(|(ind, _)| *ind >= indent).unwrap_or(false) {
             stack.pop();
         }
 
@@ -246,7 +242,11 @@ pub fn render_nodes(
                 "▸"
             };
             let body = status::ellipsize(
-                &format!("{indent}{expand} {} {}{count}{meta}", n.status.icon(), n.label),
+                &format!(
+                    "{indent}{expand} {} {}{count}{meta}",
+                    n.status.icon(),
+                    n.label
+                ),
                 max_width,
             );
             let color = n.status.color(palette);

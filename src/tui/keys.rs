@@ -43,10 +43,7 @@ impl KeyMap {
     }
 
     pub fn binding(&self, action: &str) -> &str {
-        self.map
-            .get(action)
-            .map(|s| s.as_str())
-            .unwrap_or("")
+        self.map.get(action).map(|s| s.as_str()).unwrap_or("")
     }
 
     /// True if this key event matches the configured binding for `action`

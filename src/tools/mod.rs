@@ -56,10 +56,22 @@ pub(crate) fn normalize_file_tool_args(args: Value) -> Value {
     let Value::Object(mut map) = args else {
         return args;
     };
-    alias_into(&mut map, "file_path", &["path", "file", "filename", "filepath"]);
+    alias_into(
+        &mut map,
+        "file_path",
+        &["path", "file", "filename", "filepath"],
+    );
     alias_into(&mut map, "content", &["contents", "text", "body", "data"]);
-    alias_into(&mut map, "old_string", &["old", "old_str", "oldString", "search"]);
-    alias_into(&mut map, "new_string", &["new", "new_str", "newString", "replace"]);
+    alias_into(
+        &mut map,
+        "old_string",
+        &["old", "old_str", "oldString", "search"],
+    );
+    alias_into(
+        &mut map,
+        "new_string",
+        &["new", "new_str", "newString", "replace"],
+    );
     // replace_all aliases
     if !map.contains_key("replace_all") {
         for alias in ["replaceAll", "all", "global"] {

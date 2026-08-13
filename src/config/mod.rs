@@ -245,12 +245,10 @@ impl Config {
         let path = Self::user_config_path();
         match std::fs::read_to_string(&path) {
             Err(_) => true,
-            Ok(content) => {
-                !content.lines().any(|l| {
-                    let t = l.trim();
-                    t.starts_with("provider") && !t.starts_with('#')
-                })
-            }
+            Ok(content) => !content.lines().any(|l| {
+                let t = l.trim();
+                t.starts_with("provider") && !t.starts_with('#')
+            }),
         }
     }
 
@@ -427,9 +425,18 @@ mod tests {
 
         base.merge(override_cfg);
 
-        assert_eq!(base.model_aliases.get("fast").map(|s| s.as_str()), Some("model-a2"));
-        assert_eq!(base.model_aliases.get("smart").map(|s| s.as_str()), Some("model-b"));
-        assert_eq!(base.model_aliases.get("cheap").map(|s| s.as_str()), Some("model-c"));
+        assert_eq!(
+            base.model_aliases.get("fast").map(|s| s.as_str()),
+            Some("model-a2")
+        );
+        assert_eq!(
+            base.model_aliases.get("smart").map(|s| s.as_str()),
+            Some("model-b")
+        );
+        assert_eq!(
+            base.model_aliases.get("cheap").map(|s| s.as_str()),
+            Some("model-c")
+        );
     }
 
     #[test]
@@ -480,7 +487,10 @@ mod tests {
     #[test]
     fn resolve_model_alias_passes_through_unknown_names() {
         let cfg = Config::default();
-        assert_eq!(cfg.resolve_model_alias("claude-sonnet-4-20250514"), "claude-sonnet-4-20250514");
+        assert_eq!(
+            cfg.resolve_model_alias("claude-sonnet-4-20250514"),
+            "claude-sonnet-4-20250514"
+        );
     }
 
     #[test]

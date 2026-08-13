@@ -1,8 +1,9 @@
 # Contributing to rs-agent
 
-Thanks for taking a look. rs-agent is an everyday coding agent in Rust (CLI/TUI, tools,
-providers, skills) with a Deep Context core (persistent Python REPL + `llm_query` / `agent_query`)
-so large context stays out of the model window when tasks get hard.
+Thanks for taking a look. rs-agent is a local overnight coding factory (Rust CLI/TUI,
+beads/fleet, skills) with a Deep Context core (persistent Python REPL + `llm_query` /
+`agent_query`) so large context stays out of the model window. Product sequence:
+[`docs/productize.md`](docs/productize.md). Trust model: [`docs/trust.md`](docs/trust.md).
 
 ## Getting set up
 

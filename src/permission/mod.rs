@@ -367,7 +367,11 @@ mod tests {
     #[test]
     fn path_allow_matches_under_prefix() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("permissions.json").to_string_lossy().to_string();
+        let path = tmp
+            .path()
+            .join("permissions.json")
+            .to_string_lossy()
+            .to_string();
         let store = PathAllowStore::for_path(path);
         let project = tmp.path().to_string_lossy().to_string();
         let src = tmp.path().join("src");
@@ -387,9 +391,6 @@ mod tests {
             extract_tool_path(r#"{"file_path":"/a/b.rs"}"#).as_deref(),
             Some("/a/b.rs")
         );
-        assert_eq!(
-            extract_tool_path(r#"{"path":"/x"}"#).as_deref(),
-            Some("/x")
-        );
+        assert_eq!(extract_tool_path(r#"{"path":"/x"}"#).as_deref(), Some("/x"));
     }
 }

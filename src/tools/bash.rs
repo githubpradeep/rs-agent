@@ -453,7 +453,11 @@ mod tests {
             .await
             .expect("join timed out")
             .expect("task panicked");
-        assert!(result.is_error, "expected cancelled error, got: {}", result.content);
+        assert!(
+            result.is_error,
+            "expected cancelled error, got: {}",
+            result.content
+        );
         assert!(
             result.content.to_lowercase().contains("cancel"),
             "unexpected: {}",

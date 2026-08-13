@@ -121,9 +121,7 @@ struct BeadsFile {
 }
 
 fn now_str() -> String {
-    chrono::Local::now()
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string()
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 fn now_unix() -> u64 {
@@ -280,11 +278,7 @@ pub fn list_ready(path: Option<&Path>) -> Result<Vec<Bead>, String> {
         .filter(|b| is_ready(&file, b))
         .cloned()
         .collect();
-    ready.sort_by(|a, b| {
-        a.priority
-            .cmp(&b.priority)
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    ready.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.id.cmp(&b.id)));
     Ok(ready)
 }
 
@@ -338,14 +332,7 @@ pub fn add_full(
 ) -> Result<Bead, String> {
     with_lock_path(path, |_p, file| {
         Ok(push_bead(
-            file,
-            title,
-            notes,
-            deps,
-            parent,
-            priority,
-            kind,
-            linked,
+            file, title, notes, deps, parent, priority, kind, linked,
         ))
     })
 }
@@ -719,7 +706,11 @@ fn spawn_next_stage(file: &mut BeadsFile, closed: &Bead) -> Option<Bead> {
     if already {
         return None;
     }
-    let title = if closed.title.to_lowercase().starts_with(&title_prefix.to_lowercase()) {
+    let title = if closed
+        .title
+        .to_lowercase()
+        .starts_with(&title_prefix.to_lowercase())
+    {
         closed.title.clone()
     } else {
         format!("{title_prefix}: {}", closed.title)
@@ -747,7 +738,11 @@ fn review_closed_for(file: &BeadsFile, implement_id: &str) -> bool {
 }
 
 /// Fail a review bead: mark it closed with fail note and reopen the linked implement.
-pub fn fail_review(path: Option<&Path>, id: &str, reason: &str) -> Result<(Bead, Option<Bead>), String> {
+pub fn fail_review(
+    path: Option<&Path>,
+    id: &str,
+    reason: &str,
+) -> Result<(Bead, Option<Bead>), String> {
     with_lock_path(path, |_p, file| {
         let idx = file
             .beads
@@ -906,12 +901,7 @@ pub fn format_fleet_status(path: Option<&Path>) -> String {
     if !blocked.is_empty() {
         out.push_str("Blocked/gated:\n");
         for b in blocked.iter().take(8) {
-            out.push_str(&format!(
-                "  {} [{}] {}\n",
-                b.id,
-                b.status.as_str(),
-                b.title
-            ));
+            out.push_str(&format!("  {} [{}] {}\n", b.id, b.status.as_str(), b.title));
         }
     }
     if out.is_empty() {
@@ -974,7 +964,9 @@ pub fn fail(
 pub fn is_terminal_fail(bead: &Bead) -> bool {
     bead.fail_kind
         .as_deref()
-        .map(|k| crate::orchestration::FailKind::parse(k) == crate::orchestration::FailKind::Terminal)
+        .map(|k| {
+            crate::orchestration::FailKind::parse(k) == crate::orchestration::FailKind::Terminal
+        })
         .unwrap_or(false)
 }
 
@@ -1140,12 +1132,7 @@ pub fn format_wake_block(limit: usize) -> Option<String> {
     if !non_ready.is_empty() {
         out.push_str("### In flight / blocked\n");
         for b in non_ready.iter().take(limit) {
-            out.push_str(&format!(
-                "- {} [{}] {}\n",
-                b.id,
-                b.status.as_str(),
-                b.title
-            ));
+            out.push_str(&format!("- {} [{}] {}\n", b.id, b.status.as_str(), b.title));
         }
     }
     Some(out)
@@ -1182,10 +1169,7 @@ pub fn evaluate_bead_condition(condition: &str) -> Option<(bool, String)> {
         if open.is_empty() {
             return Some((true, "no open beads".into()));
         }
-        return Some((
-            false,
-            format!("{} open bead(s) remain", open.len()),
-        ));
+        return Some((false, format!("{} open bead(s) remain", open.len())));
     }
     if let Some(rest) = lower.strip_prefix("bead:") {
         let id = rest.split_whitespace().next().unwrap_or("").trim();
@@ -1193,13 +1177,8 @@ pub fn evaluate_bead_condition(condition: &str) -> Option<(bool, String)> {
             return None;
         }
         match get(None, id) {
-            Ok(Some(b)) if b.status == BeadStatus::Closed => {
-                Some((true, format!("{id} closed")))
-            }
-            Ok(Some(b)) => Some((
-                false,
-                format!("{id} is {}", b.status.as_str()),
-            )),
+            Ok(Some(b)) if b.status == BeadStatus::Closed => Some((true, format!("{id} closed"))),
+            Ok(Some(b)) => Some((false, format!("{id} is {}", b.status.as_str()))),
             Ok(None) => Some((false, format!("bead `{id}` not found"))),
             Err(e) => Some((false, e)),
         }

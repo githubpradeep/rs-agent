@@ -64,11 +64,7 @@ impl SessionsPanelState {
         let bg = self.bg_running_id.clone();
 
         let mut rows: Vec<SessionRow> = Vec::new();
-        let project_label = self
-            .project_root
-            .as_deref()
-            .map(path_leaf)
-            .unwrap_or(".");
+        let project_label = self.project_root.as_deref().map(path_leaf).unwrap_or(".");
 
         let scope = if self.show_all {
             "ALL PROJECTS"
@@ -169,7 +165,11 @@ impl SessionsPanelState {
         }
         if !self.rows[self.selection].selectable() {
             self.move_sel(1);
-            if !self.rows.get(self.selection).is_some_and(|r| r.selectable()) {
+            if !self
+                .rows
+                .get(self.selection)
+                .is_some_and(|r| r.selectable())
+            {
                 self.move_sel(-1);
             }
         }
@@ -236,10 +236,7 @@ pub fn render_sessions_panel(
                 } else {
                     Style::default().fg(palette.accent)
                 };
-                lines.push(Line::from(Span::styled(
-                    format!("{prefix}{label}"),
-                    style,
-                )));
+                lines.push(Line::from(Span::styled(format!("{prefix}{label}"), style)));
             }
             SessionRow::Session { summary } => {
                 let active = summary.id == state.active_id;

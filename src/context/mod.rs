@@ -35,14 +35,21 @@ pub fn discover_context_files() -> Vec<ContextFile> {
         if let Ok(content) = std::fs::read_to_string(&global) {
             if !content.trim().is_empty() {
                 seen.insert(global.canonicalize().unwrap_or(global.clone()));
-                files.push(ContextFile { path: global, content });
+                files.push(ContextFile {
+                    path: global,
+                    content,
+                });
             }
         }
     }
 
     let cwd = std::env::current_dir().unwrap_or_default();
     let root = PathBuf::from("/");
-    let mut current = if cwd.exists() { cwd.canonicalize().unwrap_or(cwd) } else { return files };
+    let mut current = if cwd.exists() {
+        cwd.canonicalize().unwrap_or(cwd)
+    } else {
+        return files;
+    };
 
     let mut ancestors: Vec<ContextFile> = Vec::new();
     loop {
@@ -70,7 +77,8 @@ pub fn build_context_section(files: &[ContextFile]) -> String {
     if files.is_empty() {
         return String::new();
     }
-    let mut section = String::from("\n\n<project_context>\n\nProject-specific instructions and guidelines:\n\n");
+    let mut section =
+        String::from("\n\n<project_context>\n\nProject-specific instructions and guidelines:\n\n");
     for cf in files {
         let path_str = cf.path.display().to_string();
         section.push_str(&format!(
@@ -114,9 +122,12 @@ pub fn build_commands_section(commands: &[ContextFile]) -> String {
     if commands.is_empty() {
         return String::new();
     }
-    let mut section = String::from("\n\n<agent_commands>\nAvailable commands the user may reference:\n\n");
+    let mut section =
+        String::from("\n\n<agent_commands>\nAvailable commands the user may reference:\n\n");
     for cmd in commands {
-        let name = cmd.path.file_stem()
+        let name = cmd
+            .path
+            .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
         section.push_str(&format!(

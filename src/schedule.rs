@@ -37,8 +37,11 @@ pub fn save_all(items: &[Schedule]) -> Result<(), String> {
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    std::fs::write(&p, serde_json::to_vec_pretty(items).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())
+    std::fs::write(
+        &p,
+        serde_json::to_vec_pretty(items).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Very small cron matcher: supports `*` and exact numbers for each field.

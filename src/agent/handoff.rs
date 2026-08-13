@@ -26,9 +26,7 @@ impl HandoffNotes {
         beads_touched: Vec<String>,
     ) -> Self {
         Self {
-            written_at: chrono::Local::now()
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string(),
+            written_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             summary,
             open_threads,
             next_steps,
@@ -88,9 +86,7 @@ pub struct RoutingHandoffRecord {
 impl RoutingHandoffRecord {
     pub fn new(from: Option<&str>, to: &str, reason: &str) -> Self {
         Self {
-            written_at: chrono::Local::now()
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string(),
+            written_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             from_seat: from.map(|s| s.to_string()),
             to_seat: to.to_string(),
             reason: reason.to_string(),

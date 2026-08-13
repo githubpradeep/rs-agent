@@ -58,8 +58,7 @@ pub fn maybe_wrap_huge_output(file_path: &str, body: String, total_chars: usize)
     }
     let threshold = escalate_chars();
     let body_chars = body.chars().count();
-    let should = body_chars > threshold
-        || (total_chars > threshold && body_chars > PREVIEW_CHARS);
+    let should = body_chars > threshold || (total_chars > threshold && body_chars > PREVIEW_CHARS);
     if !should {
         return (body, false);
     }

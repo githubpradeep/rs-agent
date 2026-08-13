@@ -51,7 +51,10 @@ pub fn render_modal_shell(
         .style(Style::default().bg(palette.panel_bg).fg(palette.text));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(lines).style(Style::default().bg(palette.panel_bg)), inner);
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(palette.panel_bg)),
+        inner,
+    );
 }
 
 /// Primary / secondary action hint row: `[a] once` style pills.
@@ -78,7 +81,11 @@ pub fn action_hints(items: &[(&str, &str)], palette: &Palette) -> Line<'static> 
 
 /// Panel title block with accent border.
 pub fn panel_block<'a>(title: &'a str, palette: &Palette, focused: bool) -> Block<'a> {
-    let border = if focused { palette.accent } else { palette.border };
+    let border = if focused {
+        palette.accent
+    } else {
+        palette.border
+    };
     Block::default()
         .borders(Borders::ALL)
         .title(format!(" {title} "))
@@ -89,34 +96,32 @@ pub fn panel_block<'a>(title: &'a str, palette: &Palette, focused: bool) -> Bloc
 /// Style a call-tree / timeline line using Conductor status vocabulary.
 pub fn style_tree_line(line: &str, palette: &Palette) -> Line<'static> {
     let lower = line.to_lowercase();
-    let (icon, color) = if lower.contains("error")
-        || lower.contains("fail")
-        || lower.contains("blocked")
-    {
-        ("×", palette.state_blocked)
-    } else if lower.contains("run")
-        || lower.contains("active")
-        || lower.contains("working")
-        || lower.contains("…")
-        || lower.contains("...")
-    {
-        ("◐", palette.state_working)
-    } else if lower.contains("done")
-        || lower.contains("ok")
-        || lower.contains("complete")
-        || lower.contains("success")
-    {
-        ("✓", palette.state_done)
-    } else if lower.contains("idle") || lower.contains("wait") {
-        ("○", palette.state_idle)
-    } else if line.trim_start().starts_with("├")
-        || line.trim_start().starts_with("└")
-        || line.trim_start().starts_with("│")
-    {
-        ("", palette.tool)
-    } else {
-        ("·", palette.overlay1)
-    };
+    let (icon, color) =
+        if lower.contains("error") || lower.contains("fail") || lower.contains("blocked") {
+            ("×", palette.state_blocked)
+        } else if lower.contains("run")
+            || lower.contains("active")
+            || lower.contains("working")
+            || lower.contains("…")
+            || lower.contains("...")
+        {
+            ("◐", palette.state_working)
+        } else if lower.contains("done")
+            || lower.contains("ok")
+            || lower.contains("complete")
+            || lower.contains("success")
+        {
+            ("✓", palette.state_done)
+        } else if lower.contains("idle") || lower.contains("wait") {
+            ("○", palette.state_idle)
+        } else if line.trim_start().starts_with("├")
+            || line.trim_start().starts_with("└")
+            || line.trim_start().starts_with("│")
+        {
+            ("", palette.tool)
+        } else {
+            ("·", palette.overlay1)
+        };
 
     let max_preview = 120usize;
     let body: String = line.chars().take(max_preview).collect();

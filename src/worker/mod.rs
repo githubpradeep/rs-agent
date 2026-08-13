@@ -196,9 +196,7 @@ fn persist_session(
     bead: &Bead,
 ) {
     let s = agent.state();
-    let now = chrono::Local::now()
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string();
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let tree_snapshot = serde_json::to_value(agent.call_tree().snapshot()).ok();
     let mut data = SessionData {
         id: session_id.to_string(),
@@ -250,9 +248,7 @@ fn seed_session_file(
     if store.exists(session_id) {
         return;
     }
-    let now = chrono::Local::now()
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string();
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let mut data = SessionData {
         id: session_id.to_string(),
         title: Some(format!("{}: {}", bead.id, truncate(&bead.title, 40))),
@@ -270,7 +266,10 @@ fn seed_session_file(
         todos: Some(crate::tools::todowrite::snapshot()),
         goal: state.goal.clone(),
         seat: Some(seat.to_string()),
-        handoff: state.handoff.clone().or_else(crate::agent::handoff::snapshot),
+        handoff: state
+            .handoff
+            .clone()
+            .or_else(crate::agent::handoff::snapshot),
         project_root: SessionStore::current_project_root(),
     };
     data.ensure_title();
@@ -278,7 +277,10 @@ fn seed_session_file(
         eprintln!("[worker:{seat}] session seed failed: {e}");
         fleet::append_log(seat, &format!("session seed failed: {e}"));
     } else {
-        fleet::append_log(seat, &format!("session {session_id} seeded (attach/open ready)"));
+        fleet::append_log(
+            seat,
+            &format!("session {session_id} seeded (attach/open ready)"),
+        );
     }
 }
 
@@ -431,7 +433,10 @@ async fn run_one_bead(
         }
         fleet::append_log(
             claimant,
-            &format!("reloaded session {session_id} ({} msgs)", state.messages.len()),
+            &format!(
+                "reloaded session {session_id} ({} msgs)",
+                state.messages.len()
+            ),
         );
     }
 
@@ -614,9 +619,7 @@ async fn run_one_bead(
         claimant,
         bead,
     );
-    eprintln!(
-        "[worker:{claimant}] saved session `{session_id}` (resume with -r {session_id})"
-    );
+    eprintln!("[worker:{claimant}] saved session `{session_id}` (resume with -r {session_id})");
     fleet::append_log(claimant, &format!("saved session {session_id}"));
 
     let pausing = control.pause_requested.load(Ordering::SeqCst);
@@ -647,7 +650,10 @@ async fn run_one_bead(
         Err(e) => {
             let notes = HandoffNotes::new(
                 format!("interrupted: {e}"),
-                last_status_msg.lock().map(|m| m.clone()).unwrap_or_default(),
+                last_status_msg
+                    .lock()
+                    .map(|m| m.clone())
+                    .unwrap_or_default(),
                 format!("Retry bead {}", bead.id),
                 vec![bead.id.clone()],
             );
@@ -691,7 +697,10 @@ async fn wait_while_paused(
         if expired {
             fleet::append_log(
                 claimant,
-                &format!("pause TTL ({}s) expired — auto-resume", fleet::PAUSE_TTL_SECS),
+                &format!(
+                    "pause TTL ({}s) expired — auto-resume",
+                    fleet::PAUSE_TTL_SECS
+                ),
             );
             break;
         }
@@ -751,7 +760,11 @@ pub async fn run_worker(
         &claimant,
         &format!(
             "worker start loop={} budget={}m verbose={} model={} caste={}",
-            cfg.loop_mode, cfg.budget_minutes, cfg.verbose, model, caste.as_str()
+            cfg.loop_mode,
+            cfg.budget_minutes,
+            cfg.verbose,
+            model,
+            caste.as_str()
         ),
     );
     eprintln!(
@@ -799,10 +812,7 @@ pub async fn run_worker(
         }
 
         // If we still hold a claimed bead (paused mid-work / TUI detach), continue it.
-        let resume_session = status
-            .lock()
-            .ok()
-            .and_then(|st| st.session_id.clone());
+        let resume_session = status.lock().ok().and_then(|st| st.session_id.clone());
         if let Some(existing) = find_claimed_by(&claimant) {
             eprintln!(
                 "[worker:{claimant}] continuing claimed {} — {}",
@@ -853,10 +863,7 @@ pub async fn run_worker(
                 }
                 Err(e) => {
                     eprintln!("[worker:{claimant}] bead {} failed: {e}", existing.id);
-                    fleet::append_log(
-                        &claimant,
-                        &format!("bead {} failed: {e}", existing.id),
-                    );
+                    fleet::append_log(&claimant, &format!("bead {} failed: {e}", existing.id));
                     if control.pause_requested.load(Ordering::SeqCst) {
                         wait_while_paused(
                             &claimant,
@@ -951,10 +958,7 @@ pub async fn run_worker(
             bead.kind.as_str(),
             bead.title
         );
-        fleet::append_log(
-            &claimant,
-            &format!("claimed {} — {}", bead.id, bead.title),
-        );
+        fleet::append_log(&claimant, &format!("claimed {} — {}", bead.id, bead.title));
 
         match run_one_bead(
             provider.clone(),
@@ -1047,7 +1051,8 @@ pub fn format_status_for_tui() -> String {
 
 pub fn read_status() -> Option<crate::fleet::SeatStatus> {
     let seats = fleet::list_seat_statuses();
-    seats.into_iter().find(|s| s.running).or_else(|| {
-        fleet::list_seat_statuses().into_iter().next()
-    })
+    seats
+        .into_iter()
+        .find(|s| s.running)
+        .or_else(|| fleet::list_seat_statuses().into_iter().next())
 }

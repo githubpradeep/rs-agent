@@ -62,7 +62,12 @@ impl AgentTool for ReadTool {
 
         let content = match fs::read_to_string(&parsed.file_path).await {
             Ok(c) => c,
-            Err(e) => return ToolExecuteResult::error(format!("Failed to read {}: {}", parsed.file_path, e)),
+            Err(e) => {
+                return ToolExecuteResult::error(format!(
+                    "Failed to read {}: {}",
+                    parsed.file_path, e
+                ))
+            }
         };
 
         let lines: Vec<&str> = content.lines().collect();
@@ -88,10 +93,14 @@ impl AgentTool for ReadTool {
 
         let result = numbered.join("\n");
         let file_chars = content.chars().count();
-        let (result, _escalated) =
-            crate::agent::rlm_escalate::maybe_wrap_huge_output(&parsed.file_path, result, file_chars);
+        let (result, _escalated) = crate::agent::rlm_escalate::maybe_wrap_huge_output(
+            &parsed.file_path,
+            result,
+            file_chars,
+        );
         // Legacy soft cap still applies if somehow above 50k without escalate wrap
-        if result.len() > 50_000 && !result.contains(crate::agent::rlm_escalate::RLM_ESCALATE_MARKER)
+        if result.len() > 50_000
+            && !result.contains(crate::agent::rlm_escalate::RLM_ESCALATE_MARKER)
         {
             let truncated = result.chars().take(50_000).collect::<String>();
             ToolExecuteResult::ok(format!(

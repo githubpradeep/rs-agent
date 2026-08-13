@@ -11,7 +11,8 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn project_rs_agent() -> PathBuf {
     std::env::current_dir()
@@ -291,9 +292,7 @@ pub struct LogFollower {
 
 impl LogFollower {
     pub fn new(seat: &str) -> Self {
-        let offset = fs::metadata(log_path(seat))
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let offset = fs::metadata(log_path(seat)).map(|m| m.len()).unwrap_or(0);
         Self {
             seat: seat.to_string(),
             offset,
@@ -306,10 +305,7 @@ impl LogFollower {
         let text = fs::read_to_string(&path).unwrap_or_default();
         let all: Vec<&str> = text.lines().collect();
         let start = all.len().saturating_sub(max_lines);
-        let initial: Vec<ParsedLogLine> = all[start..]
-            .iter()
-            .map(|l| parse_log_line(l))
-            .collect();
+        let initial: Vec<ParsedLogLine> = all[start..].iter().map(|l| parse_log_line(l)).collect();
         let offset = text.len() as u64;
         (
             Self {
@@ -449,9 +445,7 @@ pub struct ParsedLogLine {
 }
 
 fn now_str() -> String {
-    chrono::Local::now()
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string()
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 fn ensure_fleet_dir() {
@@ -524,11 +518,7 @@ pub fn append_log(seat: &str, line: &str) {
     ensure_fleet_dir();
     let path = log_path(seat);
     let ts = now_str();
-    if let Ok(mut f) = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(f, "[{ts}] {line}");
     }
     // Cap log size (~2MB) by truncating head when oversized.
@@ -597,7 +587,7 @@ fn kill_pid(pid: u32) -> Result<(), String> {
     }
     #[cfg(unix)]
     {
-        let status = std::process::Command::new("kill")
+        let status = Command::new("kill")
             .args(["-TERM", &pid.to_string()])
             .status()
             .map_err(|e| format!("kill: {e}"))?;
@@ -607,7 +597,7 @@ fn kill_pid(pid: u32) -> Result<(), String> {
         // Brief wait; escalate to KILL if needed.
         std::thread::sleep(std::time::Duration::from_millis(400));
         if pid_alive(pid) {
-            let _ = std::process::Command::new("kill")
+            let _ = Command::new("kill")
                 .args(["-KILL", &pid.to_string()])
                 .status();
         }
@@ -630,6 +620,90 @@ pub struct FleetUpOpts {
     pub model: Option<String>,
     pub approve: bool,
     pub fail_fast: bool,
+    /// When true, all seats share the launcher cwd (can clobber files).
+    /// Default false: each seat gets a git worktree under `.rs-agent/worktrees/`.
+    pub shared_worktree: bool,
+}
+
+pub fn worktrees_dir() -> PathBuf {
+    project_rs_agent().join("worktrees")
+}
+
+pub fn seat_worktree_path(seat: &str) -> PathBuf {
+    worktrees_dir().join(seat_slug(seat))
+}
+
+fn git_ok() -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Point the worktree at the main project's `.rs-agent` so beads/fleet stay shared.
+fn link_project_rs_agent(worktree: &Path) -> Result<(), String> {
+    let link = worktree.join(".rs-agent");
+    if fs::symlink_metadata(&link).is_ok() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        // worktree is `.rs-agent/worktrees/<slug>`; `../..` is `.rs-agent`.
+        std::os::unix::fs::symlink("../..", &link)
+            .map_err(|e| format!("symlink {} → ../..: {e}", link.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = worktree;
+        Err("per-seat worktrees need symlink support (Unix). Use --shared-worktree.".into())
+    }
+}
+
+/// Create or reuse a git worktree for `seat`. Caller cwd must be the project root.
+pub fn ensure_seat_worktree(seat: &str) -> Result<PathBuf, String> {
+    if !git_ok() {
+        return Err(
+            "fleet up isolates seats with git worktrees, but this is not a git checkout.\n\
+             Run from a git repo, or pass --shared-worktree (seats will edit the same files)."
+                .into(),
+        );
+    }
+    let dest = seat_worktree_path(seat);
+    if dest.join(".git").exists() {
+        link_project_rs_agent(&dest)?;
+        return Ok(dest);
+    }
+    fs::create_dir_all(worktrees_dir()).map_err(|e| format!("mkdir worktrees: {e}"))?;
+    if dest.exists()
+        && dest
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false)
+    {
+        return Err(format!(
+            "worktree path {} exists and is not a git worktree — remove it or use --shared-worktree",
+            dest.display()
+        ));
+    }
+    let dest_str = dest
+        .to_str()
+        .ok_or_else(|| format!("worktree path not utf-8: {}", dest.display()))?;
+    let branch = format!("rs-agent/seat/{}", seat_slug(seat));
+    let out = Command::new("git")
+        .args(["worktree", "add", "-B", &branch, dest_str, "HEAD"])
+        .output()
+        .map_err(|e| format!("git worktree add: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "git worktree add `{seat}` failed: {}\n\
+             Pass --shared-worktree to run in this checkout (seats can clobber each other).",
+            err.trim()
+        ));
+    }
+    link_project_rs_agent(&dest)?;
+    Ok(dest)
 }
 
 fn current_exe() -> Result<PathBuf, String> {
@@ -667,7 +741,7 @@ pub fn spawn_worker(seat: &str, opts: &FleetUpOpts) -> Result<u32, String> {
         .try_clone()
         .map_err(|e| format!("spawn log clone: {e}"))?;
 
-    let mut cmd = std::process::Command::new("nohup");
+    let mut cmd = Command::new("nohup");
     cmd.arg(&exe);
     if opts.approve {
         cmd.arg("-a");
@@ -694,12 +768,19 @@ pub fn spawn_worker(seat: &str, opts: &FleetUpOpts) -> Result<u32, String> {
     if opts.fail_fast {
         cmd.arg("--fail-fast");
     }
+    if !opts.shared_worktree {
+        let wt = ensure_seat_worktree(seat)?;
+        cmd.current_dir(&wt);
+        append_log(seat, &format!("worktree {}", wt.display()));
+    }
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::from(spawn_file));
     cmd.stderr(std::process::Stdio::from(spawn_err));
     // nohup ignores SIGHUP when the launching terminal closes.
 
-    let child = cmd.spawn().map_err(|e| format!("spawn worker `{seat}`: {e}"))?;
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn worker `{seat}`: {e}"))?;
     let pid = child.id();
     // Note: nohup's pid is the nohup wrapper on some systems; worker is child.
     // Prefer reading status file later; also try to find worker via pgrep is overkill.
@@ -714,6 +795,7 @@ pub fn fleet_up(opts: FleetUpOpts) -> Result<String, String> {
     if opts.seats.is_empty() {
         return Err("fleet up requires --seats Fleet-1,Fleet-2".into());
     }
+    ensure_fleet_dir();
     let mut out = String::from("Fleet up:\n");
     for seat in &opts.seats {
         // Infer caste from name (Fleet-* → fleet, Crew-* → crew); default fleet.
@@ -728,6 +810,19 @@ pub fn fleet_up(opts: FleetUpOpts) -> Result<String, String> {
                 s.effective_caste().as_str()
             )),
             Err(e) => out.push_str(&format!("  WARN seat `{seat}` profile: {e}\n")),
+        }
+        if !opts.shared_worktree {
+            match ensure_seat_worktree(seat) {
+                Ok(p) => out.push_str(&format!("  worktree {} → {}\n", seat, p.display())),
+                Err(e) => {
+                    out.push_str(&format!("  FAIL {seat}: {e}\n"));
+                    continue;
+                }
+            }
+        } else {
+            out.push_str(&format!(
+                "  WARN {seat} --shared-worktree (same cwd; seats can overwrite each other)\n"
+            ));
         }
         match spawn_worker(seat, &opts) {
             Ok(pid) => out.push_str(&format!("  started {seat} pid={pid}\n")),
@@ -763,7 +858,10 @@ pub fn delete_seat(seat: &str) -> String {
         }
     }
     match crate::agent::seat::delete(seat) {
-        Ok(()) => out.push_str(&format!("Deleted seat `{seat}` (profile + {:?})\n", removed)),
+        Ok(()) => out.push_str(&format!(
+            "Deleted seat `{seat}` (profile + {:?})\n",
+            removed
+        )),
         Err(e) => out.push_str(&format!("Deleted fleet files for `{seat}`; profile: {e}\n")),
     }
     out
@@ -909,7 +1007,9 @@ impl SeatRow {
             _ => "stopped",
         }
         .to_string();
-        let caste = crate::agent::seat::resolve_caste(&s.seat).as_str().to_string();
+        let caste = crate::agent::seat::resolve_caste(&s.seat)
+            .as_str()
+            .to_string();
         Self {
             seat: s.seat.clone(),
             caste,
@@ -1059,9 +1159,7 @@ pub fn format_city_board(highlight: Option<&str>) -> String {
                 ));
             }
         }
-        out.push_str(
-            "\nCommands: /city | /seat follow|attach|detach|steer|abort|open <seat>\n",
-        );
+        out.push_str("\nCommands: /city | /seat follow|attach|detach|steer|abort|open <seat>\n");
     }
 
     out.push('\n');
@@ -1232,6 +1330,53 @@ mod tests {
             assert!(board.contains("Fleet-1"), "{board}");
             assert!(board.contains("→ "), "{board}");
             assert!(board.contains("b1"), "{board}");
+        });
+    }
+
+    fn git(args: &[&str]) {
+        let st = Command::new("git")
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "rs-agent")
+            .env("GIT_AUTHOR_EMAIL", "rs-agent@test")
+            .env("GIT_COMMITTER_NAME", "rs-agent")
+            .env("GIT_COMMITTER_EMAIL", "rs-agent@test")
+            .status()
+            .expect("git");
+        assert!(st.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn seat_worktrees_are_isolated() {
+        crate::with_temp_cwd(|root| {
+            git(&["init"]);
+            git(&["config", "user.email", "t@t"]);
+            git(&["config", "user.name", "t"]);
+            fs::write(root.join("shared.txt"), "base").unwrap();
+            git(&["add", "shared.txt"]);
+            git(&["commit", "-m", "init"]);
+
+            let a = ensure_seat_worktree("Fleet-1").expect("wt a");
+            let b = ensure_seat_worktree("Fleet-2").expect("wt b");
+            assert_ne!(a, b);
+            fs::write(a.join("shared.txt"), "from-a").unwrap();
+            let b_txt = fs::read_to_string(b.join("shared.txt")).unwrap();
+            assert_eq!(b_txt, "base", "Fleet-2 must not see Fleet-1 edits");
+
+            fs::create_dir_all(root.join(".rs-agent")).unwrap();
+            fs::write(root.join(".rs-agent").join("beads.json"), "{\"beads\":[]}").unwrap();
+            let via_link = a.join(".rs-agent").join("beads.json");
+            assert!(
+                via_link.exists(),
+                "worktree should share .rs-agent via symlink"
+            );
+        });
+    }
+
+    #[test]
+    fn ensure_worktree_requires_git() {
+        crate::with_temp_cwd(|_| {
+            let err = ensure_seat_worktree("Fleet-1").unwrap_err();
+            assert!(err.contains("not a git"), "{err}");
         });
     }
 }

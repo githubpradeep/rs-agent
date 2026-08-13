@@ -10,17 +10,9 @@ pub trait Provider: Send + Sync {
     fn api_key_env_var(&self) -> &str;
     fn base_url(&self) -> &str;
 
-    async fn chat(
-        &self,
-        api_key: &str,
-        request: ChatRequest,
-    ) -> ProviderResult<AssistantMessage>;
+    async fn chat(&self, api_key: &str, request: ChatRequest) -> ProviderResult<AssistantMessage>;
 
-    async fn chat_stream(
-        &self,
-        api_key: &str,
-        request: ChatRequest,
-    ) -> ProviderResult<BoxStream>;
+    async fn chat_stream(&self, api_key: &str, request: ChatRequest) -> ProviderResult<BoxStream>;
 
     async fn fetch_models(&self, _api_key: &str) -> ProviderResult<Vec<String>> {
         Ok(Vec::new())

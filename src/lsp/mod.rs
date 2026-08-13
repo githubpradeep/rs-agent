@@ -106,7 +106,9 @@ pub struct LspClient {
 
 impl LspClient {
     /// Start `rust-analyzer` (or `RS_AGENT_LSP` override) for `root`.
-    pub async fn start_rust_analyzer(root: PathBuf) -> Result<(Self, tokio::task::JoinHandle<()>), String> {
+    pub async fn start_rust_analyzer(
+        root: PathBuf,
+    ) -> Result<(Self, tokio::task::JoinHandle<()>), String> {
         let cmd = std::env::var("RS_AGENT_LSP").unwrap_or_else(|_| "rust-analyzer".into());
         Self::start(cmd, root).await
     }
@@ -202,11 +204,16 @@ impl LspClient {
     }
 
     pub fn snapshot(&self) -> DiagnosticSnapshot {
-        self.diagnostics.lock().map(|g| g.clone()).unwrap_or_default()
+        self.diagnostics
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
-        let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let msg = json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -294,9 +301,7 @@ fn apply_publish_diagnostics(store: SharedDiagnostics, params: &Value) {
 }
 
 fn uri_to_path(uri: &str) -> String {
-    uri.strip_prefix("file://")
-        .unwrap_or(uri)
-        .to_string()
+    uri.strip_prefix("file://").unwrap_or(uri).to_string()
 }
 
 async fn read_message(reader: &mut BufReader<ChildStdout>) -> Result<Value, String> {

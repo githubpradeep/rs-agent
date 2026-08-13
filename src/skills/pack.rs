@@ -33,11 +33,7 @@ pub fn export_pack(names: &[String], out_path: &Path) -> Result<String, String> 
     } else {
         names
             .iter()
-            .filter_map(|n| {
-                skills
-                    .iter()
-                    .find(|s| s.name.eq_ignore_ascii_case(n))
-            })
+            .filter_map(|n| skills.iter().find(|s| s.name.eq_ignore_ascii_case(n)))
             .collect()
     };
     if selected.is_empty() {

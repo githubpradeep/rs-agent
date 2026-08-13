@@ -76,22 +76,118 @@ pub struct ModelPricing {
 
 static MODEL_PRICING: LazyLock<Vec<(&str, ModelPricing)>> = LazyLock::new(|| {
     vec![
-        ("claude-opus-4", ModelPricing { input_per_mtok: 15.0, output_per_mtok: 75.0 }),
-        ("claude-sonnet-4", ModelPricing { input_per_mtok: 3.0, output_per_mtok: 15.0 }),
-        ("claude-3-5-sonnet", ModelPricing { input_per_mtok: 3.0, output_per_mtok: 15.0 }),
-        ("claude-3-5-haiku", ModelPricing { input_per_mtok: 0.80, output_per_mtok: 4.0 }),
-        ("claude-3-opus", ModelPricing { input_per_mtok: 15.0, output_per_mtok: 75.0 }),
-        ("claude-haiku", ModelPricing { input_per_mtok: 0.80, output_per_mtok: 4.0 }),
-        ("gpt-4o-mini", ModelPricing { input_per_mtok: 0.15, output_per_mtok: 0.60 }),
-        ("gpt-4o", ModelPricing { input_per_mtok: 2.50, output_per_mtok: 10.0 }),
-        ("gpt-4-turbo", ModelPricing { input_per_mtok: 10.0, output_per_mtok: 30.0 }),
-        ("gpt-4", ModelPricing { input_per_mtok: 30.0, output_per_mtok: 60.0 }),
-        ("o1", ModelPricing { input_per_mtok: 15.0, output_per_mtok: 60.0 }),
-        ("o3-mini", ModelPricing { input_per_mtok: 1.10, output_per_mtok: 4.40 }),
-        ("deepseek", ModelPricing { input_per_mtok: 0.27, output_per_mtok: 1.10 }),
-        ("gemini-1.5-pro", ModelPricing { input_per_mtok: 1.25, output_per_mtok: 5.0 }),
-        ("gemini-1.5-flash", ModelPricing { input_per_mtok: 0.075, output_per_mtok: 0.30 }),
-        ("gemini-2.0-flash", ModelPricing { input_per_mtok: 0.10, output_per_mtok: 0.40 }),
+        (
+            "claude-opus-4",
+            ModelPricing {
+                input_per_mtok: 15.0,
+                output_per_mtok: 75.0,
+            },
+        ),
+        (
+            "claude-sonnet-4",
+            ModelPricing {
+                input_per_mtok: 3.0,
+                output_per_mtok: 15.0,
+            },
+        ),
+        (
+            "claude-3-5-sonnet",
+            ModelPricing {
+                input_per_mtok: 3.0,
+                output_per_mtok: 15.0,
+            },
+        ),
+        (
+            "claude-3-5-haiku",
+            ModelPricing {
+                input_per_mtok: 0.80,
+                output_per_mtok: 4.0,
+            },
+        ),
+        (
+            "claude-3-opus",
+            ModelPricing {
+                input_per_mtok: 15.0,
+                output_per_mtok: 75.0,
+            },
+        ),
+        (
+            "claude-haiku",
+            ModelPricing {
+                input_per_mtok: 0.80,
+                output_per_mtok: 4.0,
+            },
+        ),
+        (
+            "gpt-4o-mini",
+            ModelPricing {
+                input_per_mtok: 0.15,
+                output_per_mtok: 0.60,
+            },
+        ),
+        (
+            "gpt-4o",
+            ModelPricing {
+                input_per_mtok: 2.50,
+                output_per_mtok: 10.0,
+            },
+        ),
+        (
+            "gpt-4-turbo",
+            ModelPricing {
+                input_per_mtok: 10.0,
+                output_per_mtok: 30.0,
+            },
+        ),
+        (
+            "gpt-4",
+            ModelPricing {
+                input_per_mtok: 30.0,
+                output_per_mtok: 60.0,
+            },
+        ),
+        (
+            "o1",
+            ModelPricing {
+                input_per_mtok: 15.0,
+                output_per_mtok: 60.0,
+            },
+        ),
+        (
+            "o3-mini",
+            ModelPricing {
+                input_per_mtok: 1.10,
+                output_per_mtok: 4.40,
+            },
+        ),
+        (
+            "deepseek",
+            ModelPricing {
+                input_per_mtok: 0.27,
+                output_per_mtok: 1.10,
+            },
+        ),
+        (
+            "gemini-1.5-pro",
+            ModelPricing {
+                input_per_mtok: 1.25,
+                output_per_mtok: 5.0,
+            },
+        ),
+        (
+            "gemini-1.5-flash",
+            ModelPricing {
+                input_per_mtok: 0.075,
+                output_per_mtok: 0.30,
+            },
+        ),
+        (
+            "gemini-2.0-flash",
+            ModelPricing {
+                input_per_mtok: 0.10,
+                output_per_mtok: 0.40,
+            },
+        ),
     ]
 });
 

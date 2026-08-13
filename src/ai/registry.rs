@@ -7,8 +7,8 @@
 use crate::ai::anthropic::AnthropicProvider;
 use crate::ai::bedrock::BedrockProvider;
 use crate::ai::catalog::{self, CatalogModel};
-use crate::ai::opencode_cli::OpenCodeCliProvider;
 use crate::ai::openai::OpenAIProvider;
+use crate::ai::opencode_cli::OpenCodeCliProvider;
 use crate::ai::provider::Provider;
 use std::sync::Arc;
 
@@ -124,10 +124,7 @@ pub fn default_model_for(provider: &str) -> String {
         {
             return m.id.clone();
         }
-        if let Some(m) = models
-            .iter()
-            .find(|m| m.id.starts_with("us.anthropic."))
-        {
+        if let Some(m) = models.iter().find(|m| m.id.starts_with("us.anthropic.")) {
             return m.id.clone();
         }
         return "us.anthropic.claude-opus-4-8".to_string();
@@ -364,16 +361,19 @@ pub fn provider_picker_rows() -> Vec<String> {
         if ready {
             rows.push(format!("{p}  [{mark}]  {n} models"));
         } else if url.is_empty() {
-            rows.push(format!(
-                "{p}  [{mark}]  set {}",
-                api_key_env_for(&p)
-            ));
+            rows.push(format!("{p}  [{mark}]  set {}", api_key_env_for(&p)));
         } else {
             rows.push(format!("{p}  [{mark}]  {url}"));
         }
     }
     // Ensure core ones always appear even if catalog empty
-    for p in ["anthropic", "openai", "openrouter", "opencode-cli", "bedrock"] {
+    for p in [
+        "anthropic",
+        "openai",
+        "openrouter",
+        "opencode-cli",
+        "bedrock",
+    ] {
         if !rows.iter().any(|r| r.starts_with(&format!("{p} "))) && supports_runtime(p) {
             let ready = has_configured_auth(p);
             let mark = if ready { "ready" } else { "needs key" };
@@ -388,10 +388,7 @@ pub fn provider_picker_rows() -> Vec<String> {
 
 /// Extract provider id from a picker row (`"openrouter  [needs key]  https://..."`).
 pub fn provider_from_picker_row(row: &str) -> String {
-    row.split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_lowercase()
+    row.split_whitespace().next().unwrap_or("").to_lowercase()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -473,10 +470,7 @@ pub fn provider_client_needs_recreate(
 ///
 /// When `opts.default_model` is set, uses that model's catalog `api` + `base_url`
 /// (critical for OpenCode Zen: OpenAI `/zen/v1` vs Anthropic `/zen`).
-pub fn create_provider(
-    name: &str,
-    opts: CreateProviderOpts,
-) -> Result<Arc<dyn Provider>, String> {
+pub fn create_provider(name: &str, opts: CreateProviderOpts) -> Result<Arc<dyn Provider>, String> {
     let p = canonicalize_provider(name);
     let timeout = if opts.timeout_secs == 0 {
         300
@@ -498,12 +492,13 @@ pub fn create_provider(
     }
 
     let sample = catalog_entry_for(&p, opts.default_model.as_deref());
-    let api = sample.map(|m| m.api.as_str()).unwrap_or("openai-completions");
-    let catalog_url = opts.base_url.clone().or_else(|| {
-        sample
-            .map(|m| m.base_url.clone())
-            .filter(|u| !u.is_empty())
-    });
+    let api = sample
+        .map(|m| m.api.as_str())
+        .unwrap_or("openai-completions");
+    let catalog_url = opts
+        .base_url
+        .clone()
+        .or_else(|| sample.map(|m| m.base_url.clone()).filter(|u| !u.is_empty()));
 
     match api {
         "openai-completions" | "openai-responses" | "mistral-conversations" => {
@@ -830,14 +825,8 @@ mod tests {
         assert!(has_configured_auth("opencode"));
         assert!(has_configured_auth("opencode-go"));
         export_opencode_auth_from_file();
-        assert_eq!(
-            std::env::var("OPENCODE_API_KEY").unwrap(),
-            "zen-test-key"
-        );
-        assert_eq!(
-            std::env::var("OPENCODE_GO_API_KEY").unwrap(),
-            "go-test-key"
-        );
+        assert_eq!(std::env::var("OPENCODE_API_KEY").unwrap(), "zen-test-key");
+        assert_eq!(std::env::var("OPENCODE_GO_API_KEY").unwrap(), "go-test-key");
 
         match before_key {
             Some(v) => std::env::set_var("OPENCODE_API_KEY", v),

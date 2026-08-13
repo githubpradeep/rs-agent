@@ -19,5 +19,9 @@ pub fn load_system_prompt() -> String {
 pub fn resolve_prompt_path(name: &str) -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     let path = cwd.join(PROMPTS_DIR).join(name);
-    if path.exists() { Some(path) } else { None }
+    if path.exists() {
+        Some(path)
+    } else {
+        None
+    }
 }

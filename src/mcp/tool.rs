@@ -106,10 +106,7 @@ pub async fn register_mcp_servers(
                     register_one(agent, &server_slug, &info, client.clone());
                     count += 1;
                 }
-                status.push(format!(
-                    "MCP `{}`: connected, {count} tool(s)",
-                    cfg.name
-                ));
+                status.push(format!("MCP `{}`: connected, {count} tool(s)", cfg.name));
             }
             Err(e) => status.push(format!("MCP `{}`: {e}", cfg.name)),
         }

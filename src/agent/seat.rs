@@ -54,10 +54,7 @@ impl SeatCaste {
         match self {
             Self::Fleet => matches!(kind, BeadKind::Implement | BeadKind::Task),
             Self::Review => matches!(kind, BeadKind::Review),
-            Self::Crew => matches!(
-                kind,
-                BeadKind::Design | BeadKind::Review | BeadKind::Task
-            ),
+            Self::Crew => matches!(kind, BeadKind::Design | BeadKind::Review | BeadKind::Task),
             Self::Marshal | Self::Seneschal | Self::Role | Self::Any => true,
         }
     }
@@ -124,9 +121,7 @@ impl SeatProfile {
             provider: None,
             diary: Vec::new(),
             laurels: Vec::new(),
-            created_at: chrono::Local::now()
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string(),
+            created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         }
     }
 

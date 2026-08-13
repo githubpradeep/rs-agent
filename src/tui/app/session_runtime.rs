@@ -120,9 +120,7 @@ impl SessionRuntimeConfig {
             system_prompt,
             permission_tx,
             id: SessionStore::generate_id(),
-            created_at: chrono::Local::now()
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string(),
+            created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             title: None,
             parent_id: None,
             branch_label: None,

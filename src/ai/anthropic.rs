@@ -47,7 +47,10 @@ impl AnthropicProvider {
     }
 }
 
-fn convert_to_anthropic_messages(messages: &[Message], system: &Option<String>) -> (Option<String>, Vec<serde_json::Value>) {
+fn convert_to_anthropic_messages(
+    messages: &[Message],
+    system: &Option<String>,
+) -> (Option<String>, Vec<serde_json::Value>) {
     let mut system_text = system.clone();
     let mut anthropic_messages = Vec::new();
 
@@ -58,7 +61,11 @@ fn convert_to_anthropic_messages(messages: &[Message], system: &Option<String>) 
             Role::Tool => "user",
             Role::System => {
                 if let Some(c) = msg.content.first() {
-                    system_text = Some(format!("{}\n{}", system_text.as_deref().unwrap_or(""), c.text.as_deref().unwrap_or("")));
+                    system_text = Some(format!(
+                        "{}\n{}",
+                        system_text.as_deref().unwrap_or(""),
+                        c.text.as_deref().unwrap_or("")
+                    ));
                 }
                 continue;
             }
@@ -167,7 +174,8 @@ impl Provider for AnthropicProvider {
             .build()
             .map_err(|e| ProviderError::Other(e.to_string()))?;
 
-        let (system_text, anthropic_messages) = convert_to_anthropic_messages(&request.messages, &request.system);
+        let (system_text, anthropic_messages) =
+            convert_to_anthropic_messages(&request.messages, &request.system);
 
         let mut body = serde_json::json!({
             "model": request.model,
@@ -236,17 +244,14 @@ impl Provider for AnthropicProvider {
         parse_anthropic_response(data)
     }
 
-    async fn chat_stream(
-        &self,
-        api_key: &str,
-        request: ChatRequest,
-    ) -> ProviderResult<BoxStream> {
+    async fn chat_stream(&self, api_key: &str, request: ChatRequest) -> ProviderResult<BoxStream> {
         let client = Client::builder()
             .timeout(Duration::from_secs(300))
             .build()
             .map_err(|e| ProviderError::Other(e.to_string()))?;
 
-        let (system_text, anthropic_messages) = convert_to_anthropic_messages(&request.messages, &request.system);
+        let (system_text, anthropic_messages) =
+            convert_to_anthropic_messages(&request.messages, &request.system);
 
         let mut body = serde_json::json!({
             "model": request.model,
@@ -370,9 +375,9 @@ fn parse_anthropic_response(data: serde_json::Value) -> ProviderResult<Assistant
                         input: None,
                         tool_use_id: None,
                         content: None,
-                    signature: None,
-                    thinking: None,
-                    is_error: false,
+                        signature: None,
+                        thinking: None,
+                        is_error: false,
                     });
                 }
                 Some("tool_use") => {
@@ -384,9 +389,9 @@ fn parse_anthropic_response(data: serde_json::Value) -> ProviderResult<Assistant
                         input: Some(block["input"].clone()),
                         tool_use_id: None,
                         content: None,
-                    signature: None,
-                    thinking: None,
-                    is_error: false,
+                        signature: None,
+                        thinking: None,
+                        is_error: false,
                     });
                 }
                 Some("thinking") => {
@@ -398,9 +403,9 @@ fn parse_anthropic_response(data: serde_json::Value) -> ProviderResult<Assistant
                         input: None,
                         tool_use_id: None,
                         content: None,
-                    signature: block["signature"].as_str().map(|s| s.to_string()),
-                    thinking: block["thinking"].as_str().map(|s| s.to_string()),
-                    is_error: false,
+                        signature: block["signature"].as_str().map(|s| s.to_string()),
+                        thinking: block["thinking"].as_str().map(|s| s.to_string()),
+                        is_error: false,
                     });
                 }
                 _ => {}
@@ -419,12 +424,8 @@ fn parse_anthropic_response(data: serde_json::Value) -> ProviderResult<Assistant
     let usage = data["usage"].as_object().map(|u| Usage {
         input_tokens: u["input_tokens"].as_u64().unwrap_or(0) as u32,
         output_tokens: u["output_tokens"].as_u64().unwrap_or(0) as u32,
-        cache_read_input_tokens: u["cache_read_input_tokens"]
-            .as_u64()
-            .map(|v| v as u32),
-        cache_creation_input_tokens: u["cache_creation_input_tokens"]
-            .as_u64()
-            .map(|v| v as u32),
+        cache_read_input_tokens: u["cache_read_input_tokens"].as_u64().map(|v| v as u32),
+        cache_creation_input_tokens: u["cache_creation_input_tokens"].as_u64().map(|v| v as u32),
     });
 
     Ok(AssistantMessage {
@@ -463,19 +464,28 @@ fn parse_anthropic_stream_event(line: &str) -> Option<StreamDelta> {
                     Some("thinking_delta") => Some(StreamDelta {
                         content_index: index,
                         r#type: DeltaType::Thinking {
-                            thinking: value["delta"]["thinking"].as_str().unwrap_or("").to_string(),
+                            thinking: value["delta"]["thinking"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string(),
                         },
                     }),
                     Some("signature_delta") => Some(StreamDelta {
                         content_index: index,
                         r#type: DeltaType::Signature {
-                            signature: value["delta"]["signature"].as_str().unwrap_or("").to_string(),
+                            signature: value["delta"]["signature"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string(),
                         },
                     }),
                     Some("input_json_delta") => Some(StreamDelta {
                         content_index: index,
                         r#type: DeltaType::ToolCallDelta {
-                            input: value["delta"]["partial_json"].as_str().unwrap_or("").to_string(),
+                            input: value["delta"]["partial_json"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string(),
                         },
                     }),
                     _ => None,
@@ -487,8 +497,14 @@ fn parse_anthropic_stream_event(line: &str) -> Option<StreamDelta> {
                     Some("tool_use") => Some(StreamDelta {
                         content_index: index,
                         r#type: DeltaType::ToolCallStart {
-                            id: value["content_block"]["id"].as_str().unwrap_or("").to_string(),
-                            name: value["content_block"]["name"].as_str().unwrap_or("").to_string(),
+                            id: value["content_block"]["id"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string(),
+                            name: value["content_block"]["name"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string(),
                             input: String::new(),
                         },
                     }),
@@ -496,13 +512,15 @@ fn parse_anthropic_stream_event(line: &str) -> Option<StreamDelta> {
                 }
             }
             Some("message_delta") => {
-                let stop_reason = value["delta"]["stop_reason"].as_str().and_then(|r| match r {
-                    "end_turn" => Some(StopReason::EndTurn),
-                    "tool_use" => Some(StopReason::ToolUse),
-                    "max_tokens" => Some(StopReason::MaxTokens),
-                    "stop_sequence" => Some(StopReason::StopSequence),
-                    r => Some(StopReason::Other(r.to_string())),
-                });
+                let stop_reason = value["delta"]["stop_reason"]
+                    .as_str()
+                    .and_then(|r| match r {
+                        "end_turn" => Some(StopReason::EndTurn),
+                        "tool_use" => Some(StopReason::ToolUse),
+                        "max_tokens" => Some(StopReason::MaxTokens),
+                        "stop_sequence" => Some(StopReason::StopSequence),
+                        r => Some(StopReason::Other(r.to_string())),
+                    });
                 Some(StreamDelta {
                     content_index: 0,
                     r#type: DeltaType::Stop { stop_reason },

@@ -231,10 +231,7 @@ fn format_parsed_log(line: &ParsedLogLine) -> String {
 
 impl CityPanelState {
     pub fn refresh(&mut self) {
-        let prev_key = self
-            .board_rows
-            .get(self.selection)
-            .map(|r| r.key());
+        let prev_key = self.board_rows.get(self.selection).map(|r| r.key());
 
         let mut seats = fleet::list_seat_statuses();
         seats.sort_by_key(|s| SeatAttention::from_status(s).priority());
@@ -271,10 +268,7 @@ impl CityPanelState {
                 if seen.insert(bid.clone()) {
                     flow.push(FlowItem {
                         id: bid.clone(),
-                        title: s
-                            .last_title
-                            .clone()
-                            .unwrap_or_else(|| bid.clone()),
+                        title: s.last_title.clone().unwrap_or_else(|| bid.clone()),
                         stage: FlowStage::Doing,
                         kind: BeadKind::Implement,
                     });
@@ -306,9 +300,8 @@ impl CityPanelState {
 
         // Refresh inspector seat status
         if let Some(seat) = self.selected_seat.clone() {
-            self.detail_seat = fleet::read_seat_status(&seat).or_else(|| {
-                self.seats.iter().find(|s| s.seat == seat).cloned()
-            });
+            self.detail_seat = fleet::read_seat_status(&seat)
+                .or_else(|| self.seats.iter().find(|s| s.seat == seat).cloned());
         }
     }
 
@@ -405,9 +398,7 @@ impl CityPanelState {
     pub fn log_scroll_by(&mut self, delta: isize) {
         let max = self.log_lines.len().saturating_sub(1);
         if delta < 0 {
-            self.log_scroll = (self.log_scroll as isize - delta)
-                .min(max as isize)
-                .max(0) as usize;
+            self.log_scroll = (self.log_scroll as isize - delta).min(max as isize).max(0) as usize;
         } else {
             self.log_scroll = self.log_scroll.saturating_sub(delta as usize);
         }
@@ -502,11 +493,7 @@ pub fn render_city_panel(
     palette: &Palette,
     focus: FocusZone,
 ) {
-    let title = format!(
-        "City · {}w · focus:{}",
-        state.seats.len(),
-        focus.label()
-    );
+    let title = format!("City · {}w · focus:{}", state.seats.len(), focus.label());
     let block = widgets::panel_block(&title, palette, focus.is_city());
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -520,8 +507,20 @@ pub fn render_city_panel(
         ])
         .split(inner);
 
-    render_wish_composer(frame, chunks[0], state, palette, focus == FocusZone::CityWish);
-    render_board(frame, chunks[1], state, palette, focus == FocusZone::CityBoard);
+    render_wish_composer(
+        frame,
+        chunks[0],
+        state,
+        palette,
+        focus == FocusZone::CityWish,
+    );
+    render_board(
+        frame,
+        chunks[1],
+        state,
+        palette,
+        focus == FocusZone::CityBoard,
+    );
     render_inspector(frame, chunks[2], state, palette, focus);
 }
 
@@ -702,11 +701,7 @@ fn render_inspector(
                 Style::default().fg(att.color(palette)),
             ),
             Span::styled(
-                format!(
-                    "{seat_name} [{}] {}",
-                    caste_badge(seat_name),
-                    s.state
-                ),
+                format!("{seat_name} [{}] {}", caste_badge(seat_name), s.state),
                 Style::default()
                     .fg(if insp_focus {
                         palette.text

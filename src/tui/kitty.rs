@@ -20,7 +20,10 @@ pub fn find_image_paths(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for token in text.split_whitespace() {
         let cleaned = token.trim_matches(|c: char| {
-            matches!(c, '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}')
+            matches!(
+                c,
+                '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}'
+            )
         });
         if is_image_path(cleaned) && Path::new(cleaned).is_file() {
             if !out.iter().any(|p| p == cleaned) {
@@ -44,7 +47,11 @@ pub fn write_kitty_image(out: &mut dyn Write, path: &str, max_cols: u16) -> std:
     let meta = fs::metadata(path)?;
     // Cap at 4MB raw to avoid flooding the terminal.
     if meta.len() > 4 * 1024 * 1024 {
-        writeln!(out, "[image too large for Kitty display: {}]", path.display())?;
+        writeln!(
+            out,
+            "[image too large for Kitty display: {}]",
+            path.display()
+        )?;
         return Ok(false);
     }
     let bytes = fs::read(path)?;
@@ -61,10 +68,7 @@ pub fn write_kitty_image(out: &mut dyn Write, path: &str, max_cols: u16) -> std:
         let more = if end < b64.len() { 1 } else { 0 };
         if first {
             // a=T place+transmit, f=100 PNG auto, m=more, c=columns
-            write!(
-                out,
-                "\x1b_Ga=T,f=100,m={more},c={cols};{chunk}\x1b\\"
-            )?;
+            write!(out, "\x1b_Ga=T,f=100,m={more},c={cols};{chunk}\x1b\\")?;
             first = false;
         } else {
             write!(out, "\x1b_Gm={more};{chunk}\x1b\\")?;
@@ -79,13 +83,17 @@ pub fn write_kitty_image(out: &mut dyn Write, path: &str, max_cols: u16) -> std:
 /// Detect whether TERM / env suggests Kitty or a compatible graphics terminal.
 pub fn kitty_graphics_likely() -> bool {
     let term = std::env::var("TERM").unwrap_or_default().to_lowercase();
-    let program = std::env::var("TERM_PROGRAM").unwrap_or_default().to_lowercase();
+    let program = std::env::var("TERM_PROGRAM")
+        .unwrap_or_default()
+        .to_lowercase();
     term.contains("kitty")
         || program.contains("kitty")
         || program.contains("wezterm")
         || program.contains("ghostty")
         || std::env::var("KITTY_WINDOW_ID").is_ok()
-        || std::env::var("RS_AGENT_KITTY").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false)
+        || std::env::var("RS_AGENT_KITTY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
 }
 
 #[cfg(test)]

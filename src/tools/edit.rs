@@ -290,10 +290,7 @@ enum Bom {
 
 fn strip_bom(raw: &[u8]) -> (Bom, String) {
     if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        (
-            Bom::Utf8,
-            String::from_utf8_lossy(&raw[3..]).into_owned(),
-        )
+        (Bom::Utf8, String::from_utf8_lossy(&raw[3..]).into_owned())
     } else {
         (Bom::None, String::from_utf8_lossy(raw).into_owned())
     }
@@ -322,7 +319,10 @@ fn encode_with_bom_newline(content: &str, bom: Bom, newline: &str) -> Vec<u8> {
 }
 
 /// Progressive soft apply: exact → line-trim → whitespace-normalize → indent-flexible.
-fn apply_hunk_soft(content: &str, hunk: &EditHunk) -> Result<(String, usize, &'static str), String> {
+fn apply_hunk_soft(
+    content: &str,
+    hunk: &EditHunk,
+) -> Result<(String, usize, &'static str), String> {
     if hunk.old_string.is_empty() {
         return Err("old_string must not be empty".into());
     }
@@ -331,8 +331,12 @@ fn apply_hunk_soft(content: &str, hunk: &EditHunk) -> Result<(String, usize, &'s
     }
 
     // 1. Exact
-    if let Ok((next, n)) = apply_exact(content, &hunk.old_string, &hunk.new_string, hunk.replace_all)
-    {
+    if let Ok((next, n)) = apply_exact(
+        content,
+        &hunk.old_string,
+        &hunk.new_string,
+        hunk.replace_all,
+    ) {
         return Ok((next, n, "exact"));
     }
 
@@ -344,16 +348,22 @@ fn apply_hunk_soft(content: &str, hunk: &EditHunk) -> Result<(String, usize, &'s
     }
 
     // 3. Whitespace-normalized
-    if let Some((next, n)) =
-        apply_whitespace_normalized(content, &hunk.old_string, &hunk.new_string, hunk.replace_all)
-    {
+    if let Some((next, n)) = apply_whitespace_normalized(
+        content,
+        &hunk.old_string,
+        &hunk.new_string,
+        hunk.replace_all,
+    ) {
         return Ok((next, n, "whitespace"));
     }
 
     // 4. Indentation-flexible
-    if let Some((next, n)) =
-        apply_indent_flexible(content, &hunk.old_string, &hunk.new_string, hunk.replace_all)
-    {
+    if let Some((next, n)) = apply_indent_flexible(
+        content,
+        &hunk.old_string,
+        &hunk.new_string,
+        hunk.replace_all,
+    ) {
         return Ok((next, n, "indent"));
     }
 

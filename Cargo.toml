@@ -2,7 +2,7 @@
 name = "rs-agent"
 version = "0.1.0"
 edition = "2021"
-description = "Everyday coding agent with Deep Context: unified LLM API, agent loop, TUI, and a persistent-REPL recursive context core"
+description = "Overnight coding factory with Deep Context: TUI, fleet workers, and a persistent-REPL so huge files stay out of the window"
 license = "MIT"
 repository = "https://github.com/githubpradeep/rs-agent"
 homepage = "https://github.com/githubpradeep/rs-agent"

@@ -55,10 +55,7 @@ pub fn cycle_focus(current: FocusZone, visible: &[FocusZone], dir: i32) -> Focus
     if visible.is_empty() {
         return current;
     }
-    let idx = visible
-        .iter()
-        .position(|&z| z == current)
-        .unwrap_or(0) as i32;
+    let idx = visible.iter().position(|&z| z == current).unwrap_or(0) as i32;
     let n = visible.len() as i32;
     let next = (idx + dir).rem_euclid(n) as usize;
     visible[next]

@@ -1,7 +1,10 @@
 # Overnight factory
 
-Run unattended bead work while you sleep. Phase 1 of the “chariot → city” loop:
-**beads ready queue → claim with lease → implement → verify → close**, with crash recovery so a dropped provider stream does not wedge the factory.
+Run unattended bead work while you sleep:
+**ready queue → claim with lease → implement → verify → close**, with crash recovery so a dropped provider stream does not wedge the factory.
+
+YOLO is required (`-a` / worker always auto-approves). Read [`trust.md`](trust.md) first.
+`fleet up` isolates seats with git worktrees; `--shared-worktree` if you want one checkout.
 
 ## Prerequisites
 
@@ -38,6 +41,8 @@ Status for the TUI: `.rs-agent/worker-status.json` (read via `/worker`).
 ### Concurrency
 
 Two workers cannot claim the same bead: claims use a lockfile beside `beads.json` and a **lease** (`claimant` + `lease_expires`). Stale leases are reclaimable (`bead reclaim` / worker reclaim on start).
+
+`fleet up` gives each seat a **git worktree** under `.rs-agent/worktrees/<seat>` so edits do not collide. Beads/fleet state stay shared via a symlink to `.rs-agent`. Pass `--shared-worktree` only if you intentionally want every seat in the same checkout.
 
 ## Beads v2 (ready queue)
 
@@ -176,17 +181,16 @@ bead land id=b2                          # OK only after a passed review
 
 TUI/tool: create with `kind`, close advances the pipeline; `fail` on review reopens implement.
 
-### Thin fleet
+### Fleet
 
-Run multiple workers with different seats (leases prevent double-claim):
+`fleet up` starts named workers, each in its own git worktree:
 
 ```bash
-# Strong designer seat (optional model override on the seat profile)
-rs-agent -a worker --loop --seat Fleet-1 --budget-minutes 480
-rs-agent -a worker --loop --seat Fleet-2 --budget-minutes 480
+rs-agent -a fleet up --seats Fleet-1,Fleet-2 --budget-minutes 480
+# same checkout (can clobber):  --shared-worktree
 ```
 
-In TUI: `/seat Fleet-1` then `/seat model claude-sonnet-4-20250514` (and `/seat role marshal` for the admin seat). Worker loads seat `model` / `provider` overrides.
+Seat `model` / `provider` overrides still apply (`/seat Fleet-1` then `/seat model …`).
 
 ### Marshal
 

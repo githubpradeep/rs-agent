@@ -7,8 +7,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use std::time::{Duration, Instant};
 
-use super::theme::Palette;
 use super::status::SessionUiState;
+use super::theme::Palette;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToastKind {
@@ -112,7 +112,9 @@ pub fn render_toast(frame: &mut Frame, area: Rect, toast: &Toast, palette: &Pale
             ),
             Span::styled(
                 toast.title.clone(),
-                Style::default().fg(palette.text).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(palette.text)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(Span::styled(
@@ -125,7 +127,9 @@ pub fn render_toast(frame: &mut Frame, area: Rect, toast: &Toast, palette: &Pale
         .border_style(Style::default().fg(color))
         .style(Style::default().bg(palette.panel_bg));
     frame.render_widget(
-        Paragraph::new(lines).block(block).style(Style::default().bg(palette.panel_bg)),
+        Paragraph::new(lines)
+            .block(block)
+            .style(Style::default().bg(palette.panel_bg)),
         area,
     );
 }

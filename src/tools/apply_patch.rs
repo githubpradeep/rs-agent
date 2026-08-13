@@ -55,11 +55,9 @@ impl AgentTool for ApplyPatchTool {
         let args = normalize_patch_args(args);
         let parsed: ApplyPatchArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => {
-                return ToolExecuteResult::error(format!(
-                    "Invalid apply_patch args: {e}. Expected {{patch: \"...\", file_path?: \"...\"}}."
-                ))
-            }
+            Err(e) => return ToolExecuteResult::error(format!(
+                "Invalid apply_patch args: {e}. Expected {{patch: \"...\", file_path?: \"...\"}}."
+            )),
         };
         if parsed.patch.trim().is_empty() {
             return ToolExecuteResult::error("patch must not be empty");
@@ -85,9 +83,7 @@ impl AgentTool for ApplyPatchTool {
 
             let original = match fs::read_to_string(&path).await {
                 Ok(c) => c,
-                Err(e) => {
-                    return ToolExecuteResult::error(format!("Failed to read {path}: {e}"))
-                }
+                Err(e) => return ToolExecuteResult::error(format!("Failed to read {path}: {e}")),
             };
 
             let updated = match apply_hunks(&original, &hunks) {
@@ -326,10 +322,7 @@ pub fn preview_apply_patch(args: &Value) -> Option<String> {
     let args = normalize_patch_args(args.clone());
     let parsed: ApplyPatchArgs = serde_json::from_value(args).ok()?;
     let (header_path, hunks) = parse_unified_diff(&parsed.patch).ok()?;
-    let path = parsed
-        .file_path
-        .filter(|s| !s.is_empty())
-        .or(header_path)?;
+    let path = parsed.file_path.filter(|s| !s.is_empty()).or(header_path)?;
     let original = std::fs::read_to_string(&path).ok()?;
     let updated = apply_hunks(&original, &hunks).ok()?;
     Some(crate::tools::diffutil::unified_diff_capped(

@@ -111,18 +111,11 @@ pub fn set_focused(focused: bool) {
 }
 
 pub fn is_focused() -> bool {
-    bus()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .focused
+    bus().lock().unwrap_or_else(|e| e.into_inner()).focused
 }
 
 pub fn snapshot() -> LifecycleSnapshot {
-    bus()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .snap
-        .clone()
+    bus().lock().unwrap_or_else(|e| e.into_inner()).snap.clone()
 }
 
 pub fn seq() -> u64 {

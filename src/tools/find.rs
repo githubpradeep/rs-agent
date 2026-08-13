@@ -74,9 +74,10 @@ impl AgentTool for FindTool {
         }
 
         let mut results: Vec<String> = Vec::new();
-        for entry in walker.into_iter().filter_entry(|e| {
-            !e.file_name().to_string_lossy().starts_with('.')
-        }) {
+        for entry in walker
+            .into_iter()
+            .filter_entry(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        {
             let entry = match entry {
                 Ok(e) => e,
                 _ => continue,

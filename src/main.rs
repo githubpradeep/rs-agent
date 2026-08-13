@@ -9,7 +9,12 @@ use rs_agent::tui::App;
 use std::io::Write;
 use std::sync::Arc;
 
-fn get_provider(name: &str, base_url: Option<&str>, default_model: Option<&str>, timeout_secs: u64) -> Result<Arc<dyn Provider>, String> {
+fn get_provider(
+    name: &str,
+    base_url: Option<&str>,
+    default_model: Option<&str>,
+    timeout_secs: u64,
+) -> Result<Arc<dyn Provider>, String> {
     registry::create_provider(
         name,
         CreateProviderOpts {
@@ -84,7 +89,10 @@ fn read_line_prompt(prompt: &str) -> std::io::Result<String> {
 
 /// Interactive first-run setup when config has no provider and stdin is a TTY.
 /// Skipped for `-p`, list modes, and non-interactive environments.
-fn maybe_run_first_launch_wizard(cli: &mut Cli, cfg: &mut Config) -> Result<(), Box<dyn std::error::Error>> {
+fn maybe_run_first_launch_wizard(
+    cli: &mut Cli,
+    cfg: &mut Config,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::IsTerminal;
 
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
@@ -115,7 +123,9 @@ fn maybe_run_first_launch_wizard(cli: &mut Cli, cfg: &mut Config) -> Result<(), 
     eprintln!("(Press Enter to accept defaults; Ctrl-C to cancel)\n");
 
     let provider = {
-        let raw = read_line_prompt("Provider [anthropic/openai/opencode/opencode-cli/bedrock] (anthropic): ")?;
+        let raw = read_line_prompt(
+            "Provider [anthropic/openai/opencode/opencode-cli/bedrock] (anthropic): ",
+        )?;
         if raw.is_empty() {
             "anthropic".to_string()
         } else {
@@ -158,10 +168,7 @@ fn maybe_run_first_launch_wizard(cli: &mut Cli, cfg: &mut Config) -> Result<(), 
     ) && std::env::var(&env_name).is_err()
     {
         // OpenCode Zen: reuse local `auth.json` when present.
-        if matches!(
-            provider.to_lowercase().as_str(),
-            "opencode" | "opencode-go"
-        ) {
+        if matches!(provider.to_lowercase().as_str(), "opencode" | "opencode-go") {
             rs_agent::ai::registry::export_opencode_auth_from_file();
         }
     }
@@ -173,15 +180,14 @@ fn maybe_run_first_launch_wizard(cli: &mut Cli, cfg: &mut Config) -> Result<(), 
     {
         eprintln!("\nNo {} in the environment yet.", env_name);
         eprintln!("  export {}=...", env_name);
-        if matches!(
-            provider.to_lowercase().as_str(),
-            "opencode" | "opencode-go"
-        ) {
+        if matches!(provider.to_lowercase().as_str(), "opencode" | "opencode-go") {
             eprintln!("  (or sign in with OpenCode — keys are read from ~/.local/share/opencode/auth.json)");
         }
         let smoke = read_line_prompt("Run a tiny smoke prompt after you set the key? [y/N]: ")?;
         if smoke.eq_ignore_ascii_case("y") || smoke.eq_ignore_ascii_case("yes") {
-            eprintln!("Re-run rs-agent after exporting the key; smoke prompt: -p \"reply with pong\"");
+            eprintln!(
+                "Re-run rs-agent after exporting the key; smoke prompt: -p \"reply with pong\""
+            );
         }
     } else if matches!(
         provider.to_lowercase().as_str(),
@@ -231,10 +237,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command.take() {
         Some(rs_agent::cli::Commands::Marshal(margs)) => {
             if let Some(ref bead) = margs.assign {
-                let seat = margs
-                    .seat
-                    .clone()
-                    .ok_or("--assign requires --seat")?;
+                let seat = margs.seat.clone().ok_or("--assign requires --seat")?;
                 match rs_agent::marshal::assign_bead(bead, &seat) {
                     Ok(b) => println!("Assigned {} → {} — {}", b.id, seat, b.title),
                     Err(e) => {
@@ -303,6 +306,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     sleep_secs,
                     quiet,
                     fail_fast,
+                    shared_worktree,
                 } => {
                     let opts = rs_agent::fleet::FleetUpOpts {
                         seats: rs_agent::fleet::parse_seat_list(&seats),
@@ -313,6 +317,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         model: cli.model.clone(),
                         approve: true, // fleet is unattended
                         fail_fast,
+                        shared_worktree,
                     };
                     match rs_agent::fleet::fleet_up(opts) {
                         Ok(msg) => println!("{msg}"),
@@ -395,7 +400,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             match rs_agent::runtime::socket::call(&path, &req) {
                 Ok(resp) => {
-                    println!("{}", serde_json::to_string_pretty(&resp).unwrap_or_default());
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&resp).unwrap_or_default()
+                    );
                     if !resp.ok {
                         std::process::exit(1);
                     }
@@ -430,7 +438,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         id: Some(serde_json::json!(1)),
                     };
                     match rs_agent::runtime::socket::call(&path, &req) {
-                        Ok(resp) => println!("{}", serde_json::to_string_pretty(&resp).unwrap_or_default()),
+                        Ok(resp) => println!(
+                            "{}",
+                            serde_json::to_string_pretty(&resp).unwrap_or_default()
+                        ),
                         Err(e) => {
                             // Fallback: write stop flag even if connect fails mid-shutdown.
                             let _ = std::fs::write(path.with_extension("stop"), "1\n");
@@ -582,9 +593,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Missing API key for {}.", provider_lower);
         eprintln!("  export {}=sk-...", env_name);
         if matches!(provider_lower.as_str(), "opencode" | "opencode-go") {
-            eprintln!(
-                "  Or sign in with OpenCode (reads ~/.local/share/opencode/auth.json)."
-            );
+            eprintln!("  Or sign in with OpenCode (reads ~/.local/share/opencode/auth.json).");
         }
         eprintln!("Or paste a key via /provider|/login (saved to ~/.rs-agent/secrets.toml).");
         std::process::exit(1);
@@ -645,14 +654,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "rs-agent worker — loop={} budget={}m seat={:?}",
             wcfg.loop_mode, wcfg.budget_minutes, wcfg.seat
         );
-        rs_agent::worker::run_worker(
-            provider,
-            model,
-            provider_name,
-            system_prompt,
-            wcfg,
-        )
-        .await?;
+        rs_agent::worker::run_worker(provider, model, provider_name, system_prompt, wcfg).await?;
         return Ok(());
     }
 
@@ -673,15 +675,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let base_prompt = cli.system_prompt.clone().unwrap_or_else(|| {
-        rs_agent::agent::default_system_prompt()
-    });
+    let base_prompt = cli
+        .system_prompt
+        .clone()
+        .unwrap_or_else(|| rs_agent::agent::default_system_prompt());
 
     let mut system_prompt = base_prompt;
 
     for arg in &cli.append_system_prompt {
-        let resolved = context::resolve_append_arg(arg)
-            .unwrap_or_else(|e| { eprintln!("Warning: {}", e); String::new() });
+        let resolved = context::resolve_append_arg(arg).unwrap_or_else(|e| {
+            eprintln!("Warning: {}", e);
+            String::new()
+        });
         if !resolved.is_empty() {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&resolved);
@@ -847,8 +852,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     if let Some(latest) = sessions.first() {
                         println!();
-                        println!(
-                            "Resume latest:  rs-agent -r latest");
+                        println!("Resume latest:  rs-agent -r latest");
                         println!(
                             "Resume this:    rs-agent -r {}",
                             SessionStore::short_id(&latest.id)

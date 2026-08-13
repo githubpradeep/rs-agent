@@ -31,8 +31,11 @@ fn save(path: &Path, items: &[QueueItem]) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(items).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    std::fs::write(
+        &tmp,
+        serde_json::to_vec_pretty(items).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
     std::fs::rename(tmp, path).map_err(|e| e.to_string())
 }
 
@@ -50,7 +53,11 @@ pub fn push(id: &str, priority: i32, payload: &str, postpone_secs: u64) -> Resul
         available_at: now() + postpone_secs as i64,
         payload: payload.to_string(),
     });
-    items.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.available_at.cmp(&b.available_at)));
+    items.sort_by(|a, b| {
+        b.priority
+            .cmp(&a.priority)
+            .then(a.available_at.cmp(&b.available_at))
+    });
     save(&path, &items)
 }
 

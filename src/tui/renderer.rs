@@ -1,10 +1,10 @@
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use std::sync::OnceLock;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::FontStyle;
 use syntect::parsing::SyntaxSet;
-use std::sync::OnceLock;
 
 use super::theme::Palette;
 
@@ -77,11 +77,7 @@ fn highlight_code(code: &str, lang: &str, syntect_theme: &str) -> Vec<Line<'stat
 
 /// Renders markdown to styled ratatui lines, syntax-highlighting fenced code
 /// blocks using `syntect_theme`.
-pub fn render_markdown(
-    text: &str,
-    syntect_theme: &str,
-    md: MarkdownStyle,
-) -> Vec<Line<'static>> {
+pub fn render_markdown(text: &str, syntect_theme: &str, md: MarkdownStyle) -> Vec<Line<'static>> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TABLES);
@@ -169,10 +165,7 @@ pub fn render_markdown(
                         let highlighted = highlight_code(&code_text, &code_lang, syntect_theme);
                         for hl_line in highlighted {
                             let mut s = Vec::with_capacity(hl_line.spans.len() + 1);
-                            s.push(Span::styled(
-                                " │ ",
-                                Style::default().fg(md.code_gutter),
-                            ));
+                            s.push(Span::styled(" │ ", Style::default().fg(md.code_gutter)));
                             s.extend(hl_line.spans);
                             lines.push(Line::from(s));
                         }

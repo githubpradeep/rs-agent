@@ -99,7 +99,10 @@ pub fn backoff_delay(attempt: u32, base_ms: u64, max_ms: u64, jitter_ms: u64) ->
         0
     } else {
         // Cheap deterministic jitter from attempt (avoid pulling rand).
-        (attempt as u64).wrapping_mul(1103515245).wrapping_add(12345) % (jitter_ms + 1)
+        (attempt as u64)
+            .wrapping_mul(1103515245)
+            .wrapping_add(12345)
+            % (jitter_ms + 1)
     };
     Duration::from_millis(capped.saturating_add(jitter))
 }

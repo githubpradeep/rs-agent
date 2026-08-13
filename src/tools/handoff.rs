@@ -108,10 +108,7 @@ impl AgentTool for HandoffTool {
             }
         }
 
-        ToolExecuteResult::terminate(format!(
-            "Handoff recorded.\n{}",
-            notes.format_block()
-        ))
+        ToolExecuteResult::terminate(format!("Handoff recorded.\n{}", notes.format_block()))
     }
 }
 

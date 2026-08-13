@@ -80,9 +80,7 @@ impl AgentTool for MailTool {
                     Err(e) => ToolExecuteResult::error(e),
                 }
             }
-            "read" | "inbox" | "list" => {
-                ToolExecuteResult::ok(mail::format_inbox(Some(&from)))
-            }
+            "read" | "inbox" | "list" => ToolExecuteResult::ok(mail::format_inbox(Some(&from))),
             "ack" => {
                 let id = parsed.id.unwrap_or_default();
                 if id.is_empty() {

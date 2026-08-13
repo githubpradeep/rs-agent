@@ -93,14 +93,11 @@ impl RlmHost {
                     .first()
                     .and_then(|v| v.as_str())
                     .ok_or("agent_query requires a task string")?;
-                let tools_filter = kwargs
-                    .get("tools")
-                    .and_then(|t| t.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect::<Vec<_>>()
-                    });
+                let tools_filter = kwargs.get("tools").and_then(|t| t.as_array()).map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<_>>()
+                });
                 let text = self.agent_query(task, tools_filter).await?;
                 Ok(Value::String(text))
             }
@@ -218,9 +215,13 @@ impl RlmHost {
             Ok(()) => {
                 // Prefer last assistant text from state if stream was empty.
                 if final_text.trim().is_empty() {
-                    if let Some(msg) = agent.state().messages.iter().rev().find(|m| {
-                        m.role == Role::Assistant
-                    }) {
+                    if let Some(msg) = agent
+                        .state()
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|m| m.role == Role::Assistant)
+                    {
                         for c in &msg.content {
                             if let Some(t) = &c.text {
                                 final_text.push_str(t);

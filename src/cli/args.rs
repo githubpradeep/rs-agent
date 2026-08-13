@@ -1,7 +1,11 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "rs-agent", version, about = "Everyday coding agent with Deep Context")]
+#[command(
+    name = "rs-agent",
+    version,
+    about = "Overnight coding factory with Deep Context"
+)]
 pub struct Cli {
     /// Provider: anthropic (recommended), openai, opencode, opencode-cli (experimental), bedrock.
     /// Omit to use the last selection from `~/.rs-agent/config.toml` (default: anthropic).
@@ -284,6 +288,9 @@ pub enum FleetCommand {
         quiet: bool,
         #[arg(long, default_value = "false")]
         fail_fast: bool,
+        /// Run all seats in this checkout (they can overwrite each other). Default: one git worktree per seat.
+        #[arg(long, default_value = "false")]
+        shared_worktree: bool,
     },
     /// Stop fleet workers (all, or --seats …).
     Down {

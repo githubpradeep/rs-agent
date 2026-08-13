@@ -103,9 +103,7 @@ pub fn track(path: &str) -> Result<(), String> {
     let abs = if p.is_absolute() {
         p.to_path_buf()
     } else {
-        std::env::current_dir()
-            .map_err(|e| e.to_string())?
-            .join(p)
+        std::env::current_dir().map_err(|e| e.to_string())?.join(p)
     };
     let key = abs.to_string_lossy().to_string();
 

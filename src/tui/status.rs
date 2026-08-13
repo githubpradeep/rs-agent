@@ -129,13 +129,22 @@ pub fn render_header_line(
     palette: &Palette,
 ) -> Line<'static> {
     let mut left: Vec<Span<'static>> = state_chip(state, palette);
-    left.push(Span::styled(" · ".to_string(), Style::default().fg(palette.overlay0)));
+    left.push(Span::styled(
+        " · ".to_string(),
+        Style::default().fg(palette.overlay0),
+    ));
     left.push(Span::styled(
         format!("{provider}/{model}"),
         Style::default().fg(palette.subtext),
     ));
-    left.push(Span::styled(" · ".to_string(), Style::default().fg(palette.overlay0)));
-    left.push(Span::styled(mode.to_string(), Style::default().fg(palette.accent)));
+    left.push(Span::styled(
+        " · ".to_string(),
+        Style::default().fg(palette.overlay0),
+    ));
+    left.push(Span::styled(
+        mode.to_string(),
+        Style::default().fg(palette.accent),
+    ));
     if depth > 0 {
         left.push(Span::styled(
             format!(" d{depth}"),
@@ -194,7 +203,10 @@ pub fn render_header_line(
         // Drop left content to keep right visible.
         let budget = max_width.saturating_sub(right_w).saturating_sub(1);
         let truncated = ellipsize(&left_plain, budget);
-        spans = vec![Span::styled(truncated, Style::default().fg(palette.subtext))];
+        spans = vec![Span::styled(
+            truncated,
+            Style::default().fg(palette.subtext),
+        )];
         let gap = max_width
             .saturating_sub(spans[0].content.chars().count())
             .saturating_sub(right_w);

@@ -101,10 +101,7 @@ pub async fn atomic_write_bytes(path: &str, content: &[u8]) -> Result<(), String
     let parent = p.parent().filter(|x| !x.as_os_str().is_empty());
     let tmp = match parent {
         Some(dir) => {
-            let name = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("file");
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("file");
             dir.join(format!(".{name}.rs-agent.tmp"))
         }
         None => std::path::PathBuf::from(format!(".{path}.rs-agent.tmp")),

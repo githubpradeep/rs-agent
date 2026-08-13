@@ -115,18 +115,14 @@ pub fn collect_pins_from_messages(messages: &[Message]) -> CompactPins {
             match c.content_type {
                 ContentType::ToolUse => {
                     let name = c.name.as_deref().unwrap_or("").to_string();
-                    let path = c
-                        .input
-                        .as_ref()
-                        .and_then(|v| {
-                            extract_tool_path(&v.to_string())
-                                .or_else(|| {
-                                    v.get("file_path")
-                                        .or_else(|| v.get("path"))
-                                        .and_then(|x| x.as_str())
-                                        .map(|s| s.to_string())
-                                })
-                        });
+                    let path = c.input.as_ref().and_then(|v| {
+                        extract_tool_path(&v.to_string()).or_else(|| {
+                            v.get("file_path")
+                                .or_else(|| v.get("path"))
+                                .and_then(|x| x.as_str())
+                                .map(|s| s.to_string())
+                        })
+                    });
                     if let Some(ref p) = path {
                         pins.paths.insert(p.clone());
                     }
@@ -230,7 +226,9 @@ mod tests {
                     content_type: ContentType::ToolUse,
                     id: Some("1".into()),
                     name: Some("edit".into()),
-                    input: Some(json!({"file_path": "src/main.rs", "old_string": "a", "new_string": "b"})),
+                    input: Some(
+                        json!({"file_path": "src/main.rs", "old_string": "a", "new_string": "b"}),
+                    ),
                     ..Default::default()
                 }],
             },

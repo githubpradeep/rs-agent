@@ -1,7 +1,7 @@
 //! Free helpers used by the TUI app (kept out of the giant App impl).
 
-use crate::ai::types::Message;
 use super::ChatMessage;
+use crate::ai::types::Message;
 
 pub(super) fn summarize_api_messages(messages: &[Message]) -> Vec<(usize, String)> {
     messages
@@ -140,7 +140,10 @@ pub(super) fn parse_fork_args(arg: &str) -> (Option<usize>, Option<String>) {
 pub(super) fn extract_saved_file_path(tool_result: &str) -> Option<String> {
     for token in tool_result.split_whitespace() {
         let cleaned = token.trim_matches(|c: char| {
-            matches!(c, '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}')
+            matches!(
+                c,
+                '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}'
+            )
         });
         if cleaned.contains('/') || cleaned.contains('.') {
             let p = std::path::Path::new(cleaned);
@@ -177,10 +180,7 @@ mod fuzzy_tests {
 
     #[test]
     fn fuzzy_prefers_prefix() {
-        let items = vec![
-            "claude-sonnet-4".into(),
-            "x-claude-extra".into(),
-        ];
+        let items = vec!["claude-sonnet-4".into(), "x-claude-extra".into()];
         let hit = App::rank_and_filter(&items, "claude", 10);
         assert_eq!(hit[0], "claude-sonnet-4");
     }
@@ -188,7 +188,10 @@ mod fuzzy_tests {
     #[test]
     fn parse_fork_at_and_label() {
         assert_eq!(super::parse_fork_args(""), (None, None));
-        assert_eq!(super::parse_fork_args("hotfix"), (None, Some("hotfix".into())));
+        assert_eq!(
+            super::parse_fork_args("hotfix"),
+            (None, Some("hotfix".into()))
+        );
         assert_eq!(super::parse_fork_args("@3"), (Some(3), None));
         assert_eq!(
             super::parse_fork_args("@3 try again"),

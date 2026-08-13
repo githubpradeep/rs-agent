@@ -85,7 +85,10 @@ fn split_frontmatter(content: &str) -> (Option<&str>, &str) {
         return (None, content);
     };
     // Frontmatter delimiter must be on its own line.
-    let rest = match rest.strip_prefix('\n').or_else(|| rest.strip_prefix("\r\n")) {
+    let rest = match rest
+        .strip_prefix('\n')
+        .or_else(|| rest.strip_prefix("\r\n"))
+    {
         Some(r) => r,
         None => return (None, content),
     };
@@ -118,7 +121,10 @@ fn parse_skill(path: &Path, content: &str) -> Skill {
         .unwrap_or("skill")
         .to_string();
 
-    let name = frontmatter.name.filter(|s| !s.trim().is_empty()).unwrap_or(file_stem);
+    let name = frontmatter
+        .name
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(file_stem);
 
     let body_trimmed = body.trim_start_matches(['\n', '\r']).to_string();
 
@@ -237,10 +243,15 @@ Second paragraph.
 "#;
         let skill = parse_skill(Path::new("/tmp/pr-review.md"), content);
         assert_eq!(skill.name, "pr-review");
-        assert_eq!(skill.description, "Review a pull request for bugs and style");
+        assert_eq!(
+            skill.description,
+            "Review a pull request for bugs and style"
+        );
         assert_eq!(skill.triggers, vec!["pr", "pull request", "review"]);
         assert_eq!(skill.tools, vec!["read", "grep", "ls", "bash"]);
-        assert!(skill.body.starts_with("Skill body instructions for the model..."));
+        assert!(skill
+            .body
+            .starts_with("Skill body instructions for the model..."));
         assert!(skill.body.contains("Second paragraph."));
     }
 

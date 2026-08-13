@@ -30,7 +30,11 @@ impl BedrockProvider {
     }
 
     fn api_url(&self, model: &str, stream: bool) -> String {
-        let path = if stream { "converse-stream" } else { "converse" };
+        let path = if stream {
+            "converse-stream"
+        } else {
+            "converse"
+        };
         // Newer Bedrock models require an inference-profile ID (us./eu./… prefix),
         // not the bare foundation-model ID. Also percent-encode `:` etc. in the path.
         let model = normalize_bedrock_model_id(model, &self.region);
@@ -48,7 +52,8 @@ impl BedrockProvider {
             .map_err(|e| ProviderError::Other(e.to_string()))?;
 
         let body = build_converse_body(&request)?;
-        let body_bytes = serde_json::to_vec(&body).map_err(|e| ProviderError::Other(e.to_string()))?;
+        let body_bytes =
+            serde_json::to_vec(&body).map_err(|e| ProviderError::Other(e.to_string()))?;
 
         let url = self.api_url(&request.model, false);
 
@@ -97,17 +102,15 @@ impl BedrockProvider {
         parse_converse_response(data)
     }
 
-    async fn send_converse_stream(
-        &self,
-        request: ChatRequest,
-    ) -> ProviderResult<BoxStream> {
+    async fn send_converse_stream(&self, request: ChatRequest) -> ProviderResult<BoxStream> {
         let http_client = HttpClient::builder()
             .timeout(Duration::from_secs(300))
             .build()
             .map_err(|e| ProviderError::Other(e.to_string()))?;
 
         let body = build_converse_body(&request)?;
-        let body_bytes = serde_json::to_vec(&body).map_err(|e| ProviderError::Other(e.to_string()))?;
+        let body_bytes =
+            serde_json::to_vec(&body).map_err(|e| ProviderError::Other(e.to_string()))?;
 
         let url = self.api_url(&request.model, true);
 
@@ -204,11 +207,7 @@ impl Provider for BedrockProvider {
         self.send_converse(request).await
     }
 
-    async fn chat_stream(
-        &self,
-        _api_key: &str,
-        request: ChatRequest,
-    ) -> ProviderResult<BoxStream> {
+    async fn chat_stream(&self, _api_key: &str, request: ChatRequest) -> ProviderResult<BoxStream> {
         self.send_converse_stream(request).await
     }
 
@@ -305,7 +304,9 @@ fn aws_credentials_path() -> std::path::PathBuf {
             let home = std::env::var("HOME")
                 .or_else(|_| std::env::var("USERPROFILE"))
                 .unwrap_or_else(|_| ".".to_string());
-            std::path::PathBuf::from(home).join(".aws").join("credentials")
+            std::path::PathBuf::from(home)
+                .join(".aws")
+                .join("credentials")
         })
 }
 
@@ -345,9 +346,7 @@ fn is_inference_profile_id(model: &str) -> bool {
         return true;
     }
     // System-defined geo / global prefixes (catalog has us./eu./au./jp./global./apac.).
-    const PREFIXES: &[&str] = &[
-        "us.", "eu.", "au.", "jp.", "apac.", "ap.", "ca.", "global.",
-    ];
+    const PREFIXES: &[&str] = &["us.", "eu.", "au.", "jp.", "apac.", "ap.", "ca.", "global."];
     PREFIXES.iter().any(|p| m.starts_with(p))
 }
 
@@ -387,8 +386,7 @@ fn read_region_from_config() -> Result<String, std::env::VarError> {
     } else {
         format!("profile {}", profile)
     };
-    parse_ini_value(&text, &section, "region")
-        .ok_or(std::env::VarError::NotPresent)
+    parse_ini_value(&text, &section, "region").ok_or(std::env::VarError::NotPresent)
 }
 
 pub fn export_credentials_from_file() {
@@ -428,11 +426,17 @@ fn load_credentials() -> ProviderResult<AwsCredentials> {
 
     let from_env = || -> Option<AwsCredentials> {
         let access_key_id = std::env::var("AWS_ACCESS_KEY_ID")
-            .or_else(|_| std::env::var("AWS_ACCESS_KEY")).ok()?;
+            .or_else(|_| std::env::var("AWS_ACCESS_KEY"))
+            .ok()?;
         let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY")
-            .or_else(|_| std::env::var("AWS_SECRET_KEY")).ok()?;
+            .or_else(|_| std::env::var("AWS_SECRET_KEY"))
+            .ok()?;
         let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
-        Some(AwsCredentials { access_key_id, secret_access_key, session_token })
+        Some(AwsCredentials {
+            access_key_id,
+            secret_access_key,
+            session_token,
+        })
     };
 
     from_env().or_else(from_file).ok_or_else(|| {
@@ -485,8 +489,7 @@ fn sign_request(
     let timestamp = format_timestamp(now);
     let date = &timestamp[..8];
 
-    let parsed_url = reqwest::Url::parse(url)
-        .map_err(|e| ProviderError::Other(e.to_string()))?;
+    let parsed_url = reqwest::Url::parse(url).map_err(|e| ProviderError::Other(e.to_string()))?;
     let host = parsed_url.host_str().unwrap_or("").to_string();
     let canonical_query = parsed_url.query().unwrap_or("");
 
@@ -654,9 +657,12 @@ fn build_converse_body(request: &ChatRequest) -> ProviderResult<serde_json::Valu
                 })
             })
             .collect();
-        body.insert("toolConfig".to_string(), serde_json::json!({
-            "tools": tools
-        }));
+        body.insert(
+            "toolConfig".to_string(),
+            serde_json::json!({
+                "tools": tools
+            }),
+        );
     }
 
     if let Some(thinking) = &request.thinking {
@@ -686,7 +692,8 @@ fn convert_messages(
     // coalesce consecutive tool results here.
     let mut pending_tool_results: Vec<serde_json::Value> = Vec::new();
 
-    let flush_tool_results = |out: &mut Vec<serde_json::Value>, pending: &mut Vec<serde_json::Value>| {
+    let flush_tool_results = |out: &mut Vec<serde_json::Value>,
+                              pending: &mut Vec<serde_json::Value>| {
         if pending.is_empty() {
             return;
         }
@@ -1130,10 +1137,7 @@ fn parse_converse_stream_event(data: &[u8]) -> Option<StreamDelta> {
                 Some(StreamDelta {
                     content_index: index,
                     r#type: DeltaType::ToolCallDelta {
-                        input: delta["toolUse"]["input"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string(),
+                        input: delta["toolUse"]["input"].as_str().unwrap_or("").to_string(),
                     },
                 })
             } else {

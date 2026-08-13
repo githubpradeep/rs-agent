@@ -1,5 +1,9 @@
 # rs-agent: Gap Analysis & Roadmap
 
+**What we execute now:** [`docs/productize.md`](docs/productize.md) (overnight
+factory + Deep Context, freeze City offices, ship v0.1). This file is the older
+pi / OpenCode feature-gap list — mostly landed; do not use it as the backlog.
+
 Based on thorough comparison against **pi** (badlogic/pi-mono) and **opencode**
 (anomalyco/opencode). See `reference/` for the full source dumps.
 
@@ -157,6 +161,6 @@ sees summaries, not subtree dumps.
 
 ## 5. The One-Sentence Pitch
 
-> **Everyday coding agent with Deep Context — load 100KB of source once,
-> query it 100 times, never hit a limit.** Same edit/bash/search as other
-> agents; Deep Context kicks in automatically when the window isn't enough.
+> **You close the laptop. Work continues. Big context never blows the window.**
+> Local overnight factory (wish → workers → review) plus Deep Context for files
+> that don't fit. Daily TUI is the on-ramp. See [`docs/productize.md`](docs/productize.md).

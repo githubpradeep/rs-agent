@@ -1,9 +1,9 @@
 //! Tabbed settings modal (herdr settings pattern).
 
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
-use ratatui::layout::Rect;
 
 use super::theme::{Palette, ThemeName};
 use super::widgets;

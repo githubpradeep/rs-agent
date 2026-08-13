@@ -138,7 +138,10 @@ mod tests {
         clear();
         let tool = EscalateTool;
         let r = tool
-            .execute("1", json!({"reason": "needs API key", "needs": "credentials"}))
+            .execute(
+                "1",
+                json!({"reason": "needs API key", "needs": "credentials"}),
+            )
             .await;
         assert!(r.terminate);
         let p = take_pending().unwrap();

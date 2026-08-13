@@ -61,7 +61,10 @@ fn split_frontmatter(content: &str) -> (Option<&str>, &str) {
     let Some(rest) = trimmed.strip_prefix("---") else {
         return (None, content);
     };
-    let rest = match rest.strip_prefix('\n').or_else(|| rest.strip_prefix("\r\n")) {
+    let rest = match rest
+        .strip_prefix('\n')
+        .or_else(|| rest.strip_prefix("\r\n"))
+    {
         Some(r) => r,
         None => return (None, content),
     };
@@ -89,7 +92,10 @@ fn parse_template(path: &Path, content: &str) -> Template {
         .unwrap_or("template")
         .to_string();
 
-    let name = frontmatter.name.filter(|s| !s.trim().is_empty()).unwrap_or(file_stem);
+    let name = frontmatter
+        .name
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(file_stem);
     let body_trimmed = body.trim_start_matches(['\n', '\r']).to_string();
 
     let description = frontmatter
@@ -117,7 +123,8 @@ fn parse_template(path: &Path, content: &str) -> Template {
 /// Later directories override earlier ones when two templates share a `name`.
 /// Search order: `~/.rs-agent/prompts/`, then `./.rs-agent/prompts/`.
 pub fn discover_templates() -> Vec<Template> {
-    let mut by_name: std::collections::BTreeMap<String, Template> = std::collections::BTreeMap::new();
+    let mut by_name: std::collections::BTreeMap<String, Template> =
+        std::collections::BTreeMap::new();
     let mut order: Vec<String> = Vec::new();
 
     for dir in template_search_dirs() {
@@ -206,7 +213,10 @@ mod tests {
             "Review the current diff for bugs.\n\nfocus on security"
         );
         assert_eq!(render_template(&t, ""), "Review the current diff for bugs.");
-        assert_eq!(render_template(&t, "   "), "Review the current diff for bugs.");
+        assert_eq!(
+            render_template(&t, "   "),
+            "Review the current diff for bugs."
+        );
     }
 
     #[test]

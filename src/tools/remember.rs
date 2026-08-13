@@ -60,10 +60,7 @@ impl AgentTool for RememberTool {
         let action = parsed.action.trim().to_lowercase();
         match action.as_str() {
             "remember" | "add" => {
-                let text = parsed
-                    .text
-                    .or(parsed.query)
-                    .unwrap_or_default();
+                let text = parsed.text.or(parsed.query).unwrap_or_default();
                 match brain::remember(&text) {
                     Ok(f) => ToolExecuteResult::ok(format!(
                         "Remembered {} — {}",

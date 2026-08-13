@@ -44,7 +44,9 @@ pub fn unified_diff_capped(path: &str, old: &str, new: &str, max_lines: usize) -
         count += 1;
     }
     if truncated {
-        out.push_str(&format!("… (diff truncated after {max_lines} changed lines)\n"));
+        out.push_str(&format!(
+            "… (diff truncated after {max_lines} changed lines)\n"
+        ));
     }
     if count == 0 {
         // Only whitespace/line-ending changes that similar collapsed oddly

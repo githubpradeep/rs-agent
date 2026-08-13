@@ -80,10 +80,7 @@ impl CallTreeInner {
 
 /// Collapse whitespace/newlines and cap length so Call Tree panel stays readable.
 fn sanitize_task_label(task: &str, max_chars: usize) -> String {
-    let collapsed = task
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let collapsed = task.split_whitespace().collect::<Vec<_>>().join(" ");
     let truncated: String = collapsed.chars().take(max_chars).collect();
     if collapsed.chars().count() > max_chars {
         format!("{truncated}…")
@@ -124,12 +121,7 @@ impl CallTree {
         id
     }
 
-    pub fn spawn(
-        &self,
-        parent_id: Option<&str>,
-        kind: CallKind,
-        task: &str,
-    ) -> String {
+    pub fn spawn(&self, parent_id: Option<&str>, kind: CallKind, task: &str) -> String {
         let mut g = self.inner.lock().unwrap();
         let id = format!(
             "{}_{}",
@@ -199,12 +191,7 @@ impl CallTree {
             return "(empty call tree)".to_string();
         }
         let mut out = String::new();
-        fn walk(
-            nodes: &[CallNode],
-            parent: Option<&str>,
-            depth: usize,
-            out: &mut String,
-        ) {
+        fn walk(nodes: &[CallNode], parent: Option<&str>, depth: usize, out: &mut String) {
             for n in nodes.iter().filter(|n| n.parent_id.as_deref() == parent) {
                 let indent = "  ".repeat(depth);
                 let status = match n.status {
@@ -259,9 +246,7 @@ impl CallTree {
         // `attach_repl_tool` / `attach_task_tool` call ensure_root("session") at
         // startup, which leaves a lone Running root forever. That is not active
         // Deep Context — treat it as idle so the TUI does not show `[D]` / `root`.
-        if running.is_empty()
-            || (running.len() == 1 && running[0].kind == CallKind::Root)
-        {
+        if running.is_empty() || (running.len() == 1 && running[0].kind == CallKind::Root) {
             return "idle".to_string();
         }
         running
@@ -326,7 +311,9 @@ mod tests {
         let rendered = tree.render();
         // Each node label itself must be single-line: no raw "import textwrap" line.
         assert!(
-            !rendered.lines().any(|l| l.trim_start().starts_with("import ")),
+            !rendered
+                .lines()
+                .any(|l| l.trim_start().starts_with("import ")),
             "multiline code leaked into tree:\n{rendered}"
         );
         assert!(rendered.contains("[repl]"));
@@ -371,11 +358,12 @@ mod tests {
             .await
             .expect("start repl");
         let out = repl
-            .exec_with_host("print(1+1)", |_m, _a, _k| async { Ok(serde_json::Value::Null) })
+            .exec_with_host("print(1+1)", |_m, _a, _k| async {
+                Ok(serde_json::Value::Null)
+            })
             .await
             .expect("exec");
         assert!(out.ok, "stdout={} stderr={}", out.stdout, out.stderr);
         assert!(out.stdout.contains('2'));
     }
 }
-

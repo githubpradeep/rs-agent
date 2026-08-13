@@ -48,7 +48,8 @@ impl OpenCodeCliProvider {
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
-        let tool_call_example = "<tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call>";
+        let tool_call_example =
+            "<tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call>";
         sections.push(
             format!(
                 "# rs-agent bridge instructions\n\n\
@@ -69,10 +70,7 @@ impl OpenCodeCliProvider {
 
         if let Some(system) = &request.system {
             if !system.is_empty() {
-                sections.push(format!(
-                    "# rs-agent system prompt\n\n{}",
-                    system
-                ));
+                sections.push(format!("# rs-agent system prompt\n\n{}", system));
             }
         }
 
@@ -93,10 +91,7 @@ impl OpenCodeCliProvider {
                 serde_json::to_string_pretty(&tools_json).unwrap_or_default()
             ));
         } else {
-            sections.push(
-                "# Available tools\n\nNo tools are available for this turn."
-                    .to_string(),
-            );
+            sections.push("# Available tools\n\nNo tools are available for this turn.".to_string());
         }
 
         if !request.messages.is_empty() {
@@ -164,10 +159,7 @@ impl OpenCodeCliProvider {
                 ));
             }
         } else {
-            sections.push(
-                "# Conversation transcript\n\n(no prior messages)"
-                    .to_string(),
-            );
+            sections.push("# Conversation transcript\n\n(no prior messages)".to_string());
         }
 
         sections.push(
@@ -347,7 +339,8 @@ impl OpenCodeCliProvider {
         let mut calls = Vec::new();
         for cap in re.captures_iter(text) {
             if let Some(json_str) = cap.get(1) {
-                if let Some(call) = Self::parse_json_tool_call_body(json_str.as_str(), calls.len()) {
+                if let Some(call) = Self::parse_json_tool_call_body(json_str.as_str(), calls.len())
+                {
                     calls.push(call);
                 }
             }
@@ -377,7 +370,9 @@ impl OpenCodeCliProvider {
                     if let Some(call) = Self::parse_json_tool_call_body(&json_str, 0) {
                         calls.push(call);
                     }
-                } else if let Some(call) = Self::parse_json_tool_call_body(&stripped[m.start()..], 0) {
+                } else if let Some(call) =
+                    Self::parse_json_tool_call_body(&stripped[m.start()..], 0)
+                {
                     // Unbalanced / truncated — try brace repair on the suffix.
                     calls.push(call);
                 }
@@ -414,7 +409,10 @@ impl OpenCodeCliProvider {
         // newlines outside of strings is hard — first try removing all
         // newlines (keys like "na\nme" → "name") while keeping spaces in values
         // by only deleting newlines.
-        let no_nl: String = trimmed.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+        let no_nl: String = trimmed
+            .chars()
+            .filter(|c| *c != '\n' && *c != '\r')
+            .collect();
         if no_nl != trimmed {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&no_nl) {
                 return Some(v);
@@ -544,7 +542,10 @@ impl OpenCodeCliProvider {
         let mut in_string = false;
         let mut escaped = false;
         for i in brace_pos..bytes.len() {
-            if escaped { escaped = false; continue; }
+            if escaped {
+                escaped = false;
+                continue;
+            }
             match bytes[i] {
                 b'"' if !in_string => in_string = true,
                 b'"' if in_string => in_string = false,
@@ -575,11 +576,14 @@ impl OpenCodeCliProvider {
             if !tool_name.is_empty() {
                 for args_cap in &args_matches {
                     let args_start = args_cap.get(0).unwrap().end();
-                    if let Some((obj_end, json_str)) = Self::find_balanced_json_in(text, args_start) {
+                    if let Some((obj_end, json_str)) = Self::find_balanced_json_in(text, args_start)
+                    {
                         let after = text[obj_end..].trim();
                         if after.starts_with("</tool_arguments>") {
-                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                                let id = value.get("id")
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str)
+                            {
+                                let id = value
+                                    .get("id")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("call_0")
                                     .to_string();
@@ -602,7 +606,8 @@ impl OpenCodeCliProvider {
                     let name = if has_name_args {
                         value["name"].as_str().unwrap().to_string()
                     } else {
-                        name_re.captures(text)
+                        name_re
+                            .captures(text)
                             .and_then(|c| c.get(1))
                             .map(|m| m.as_str().trim().to_string())
                             .unwrap_or_default()
@@ -613,10 +618,7 @@ impl OpenCodeCliProvider {
                         } else {
                             value.clone()
                         };
-                        let id = value["id"]
-                            .as_str()
-                            .unwrap_or("call_0")
-                            .to_string();
+                        let id = value["id"].as_str().unwrap_or("call_0").to_string();
                         calls.push((id, name, args));
                         return calls;
                     }
@@ -634,15 +636,30 @@ impl OpenCodeCliProvider {
                 }
                 if let Some((obj_end, json_str)) = Self::find_balanced_json_in(text, name_end) {
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                        let has_name = value.get("name").and_then(|v| v.as_str()).map_or(false, |n| !n.is_empty());
-                        let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("call_0").to_string();
+                        let has_name = value
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .map_or(false, |n| !n.is_empty());
+                        let id = value
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("call_0")
+                            .to_string();
                         if has_name && value.get("arguments").map_or(false, |a| a.is_object()) {
-                            calls.push((id, value["name"].as_str().unwrap().to_string(), value["arguments"].clone()));
+                            calls.push((
+                                id,
+                                value["name"].as_str().unwrap().to_string(),
+                                value["arguments"].clone(),
+                            ));
                         } else {
                             calls.push((id, tool_name, value));
                         }
                         // Continue scanning after this JSON for more tool calls
-                        let remaining = if obj_end < text.len() { &text[obj_end..] } else { "" };
+                        let remaining = if obj_end < text.len() {
+                            &text[obj_end..]
+                        } else {
+                            ""
+                        };
                         if !remaining.trim().is_empty() {
                             let extra = Self::parse_native_tool_calls(remaining);
                             calls.extend(extra);
@@ -672,9 +689,12 @@ impl OpenCodeCliProvider {
         // Strategy 4: opencode-native <tool_request> XML format
         // <tool_request id="N" tool="name"><parameters><key>value</key>...</parameters></tool_request>
         if calls.is_empty() {
-            let tool_req_re = Regex::new(r#"(?s)<tool_request\s+id="([^"]*)"\s+tool="([^"]*)"\s*>"#).unwrap();
+            let tool_req_re =
+                Regex::new(r#"(?s)<tool_request\s+id="([^"]*)"\s+tool="([^"]*)"\s*>"#).unwrap();
             let params_re = Regex::new(r"(?s)<parameters>(.*?)</parameters>").unwrap();
-            let param_re = Regex::new(r"(?s)<([a-zA-Z_][a-zA-Z0-9_]*)>(.*?)</[a-zA-Z_][a-zA-Z0-9_]*>").unwrap();
+            let param_re =
+                Regex::new(r"(?s)<([a-zA-Z_][a-zA-Z0-9_]*)>(.*?)</[a-zA-Z_][a-zA-Z0-9_]*>")
+                    .unwrap();
 
             for req_cap in tool_req_re.captures_iter(text) {
                 let id = req_cap.get(1).unwrap().as_str().to_string();
@@ -692,9 +712,10 @@ impl OpenCodeCliProvider {
                         let val: serde_json::Value = if let Ok(n) = raw_val.parse::<i64>() {
                             serde_json::Value::Number(n.into())
                         } else if let Ok(f) = raw_val.parse::<f64>() {
-                            serde_json::Value::Number(serde_json::Number::from_f64(f).unwrap_or(
-                                serde_json::Number::from_f64(0.0).unwrap()
-                            ))
+                            serde_json::Value::Number(
+                                serde_json::Number::from_f64(f)
+                                    .unwrap_or(serde_json::Number::from_f64(0.0).unwrap()),
+                            )
                         } else {
                             serde_json::Value::String(raw_val.to_string())
                         };
@@ -793,11 +814,7 @@ impl OpenCodeCliProvider {
             for (k, v) in keys.iter().zip(vals.iter()) {
                 args.insert(k.clone(), Self::coerce_xml_arg_value(v));
             }
-            calls.push((
-                format!("call_{idx}"),
-                name,
-                serde_json::Value::Object(args),
-            ));
+            calls.push((format!("call_{idx}"), name, serde_json::Value::Object(args)));
         }
 
         calls
@@ -905,7 +922,10 @@ impl OpenCodeCliProvider {
 
             let tokens: Vec<String> = bare
                 .split_whitespace()
-                .map(|t| t.trim_matches(|c: char| c == '"' || c == '\'' || c == '`').to_string())
+                .map(|t| {
+                    t.trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
+                        .to_string()
+                })
                 .filter(|t| !t.is_empty())
                 .collect();
 
@@ -935,11 +955,7 @@ impl OpenCodeCliProvider {
                 .collect();
 
             Self::assign_positional_tool_args(&name, &mut args, &leftovers);
-            calls.push((
-                format!("call_{idx}"),
-                name,
-                serde_json::Value::Object(args),
-            ));
+            calls.push((format!("call_{idx}"), name, serde_json::Value::Object(args)));
         }
 
         calls
@@ -1053,17 +1069,18 @@ impl Provider for OpenCodeCliProvider {
                             id: Some(id),
                             name: Some(name),
                             input: Some(
-                                serde_json::from_str(&input)
-                                    .unwrap_or(serde_json::Value::Null),
+                                serde_json::from_str(&input).unwrap_or(serde_json::Value::Null),
                             ),
                             tool_use_id: None,
                             content: None,
-                        signature: None,
-                        thinking: None,
-                        is_error: false,
+                            signature: None,
+                            thinking: None,
+                            is_error: false,
                         });
                     }
-                    DeltaType::Stop { stop_reason: reason } => {
+                    DeltaType::Stop {
+                        stop_reason: reason,
+                    } => {
                         stop_reason = reason;
                     }
                     _ => {}
@@ -1099,11 +1116,7 @@ impl Provider for OpenCodeCliProvider {
         })
     }
 
-    async fn chat_stream(
-        &self,
-        _api_key: &str,
-        request: ChatRequest,
-    ) -> ProviderResult<BoxStream> {
+    async fn chat_stream(&self, _api_key: &str, request: ChatRequest) -> ProviderResult<BoxStream> {
         let prompt = self.build_prompt(&request);
         let model = request.model.clone();
         let bin = self.bin.clone();
@@ -1182,7 +1195,9 @@ impl Provider for OpenCodeCliProvider {
             let stderr_handle = tokio::spawn(async move {
                 let mut buf = String::new();
                 while let Ok(Some(line)) = stderr_lines.next_line().await {
-                    if !buf.is_empty() { buf.push('\n'); }
+                    if !buf.is_empty() {
+                        buf.push('\n');
+                    }
                     buf.push_str(&line);
                 }
                 buf
@@ -1585,7 +1600,10 @@ impl Provider for OpenCodeCliProvider {
                     let msg = if stderr_out.is_empty() {
                         format!("opencode process exited with code {}", exit_code)
                     } else {
-                        format!("opencode process exited with code {}: {}", exit_code, stderr_out)
+                        format!(
+                            "opencode process exited with code {}: {}",
+                            exit_code, stderr_out
+                        )
                     };
                     let _ = tx.send(Err(ProviderError::Other(msg)));
                 }
@@ -1683,7 +1701,8 @@ mod tests {
     #[test]
     fn test_parse_native_tool_name_bare_json() {
         // Format: <tool_name>name</tool_name>\n\n{<json>}
-        let text = "<tool_name>bash</tool_name>\n\n{\n\"command\": \"ls\",\n\"timeout\": 30000\n}\n";
+        let text =
+            "<tool_name>bash</tool_name>\n\n{\n\"command\": \"ls\",\n\"timeout\": 30000\n}\n";
         let calls = OpenCodeCliProvider::parse_native_tool_calls(text);
         assert_eq!(calls.len(), 1, "should find one tool call");
         assert_eq!(calls[0].1, "bash");
@@ -1728,7 +1747,11 @@ mod tests {
         // Verify parse_tool_calls calls parse_native_tool_calls as fallback
         let text = "<tool_name>bash</tool_name>\n{\"command\":\"ls\"}\n";
         let calls = OpenCodeCliProvider::parse_tool_calls(text);
-        assert_eq!(calls.len(), 1, "parse_tool_calls should find native format via fallback");
+        assert_eq!(
+            calls.len(),
+            1,
+            "parse_tool_calls should find native format via fallback"
+        );
         assert_eq!(calls[0].1, "bash");
     }
 
@@ -1768,7 +1791,11 @@ mod tests {
 
         // Now verify parse_tool_calls handles the wrapped form
         let calls = OpenCodeCliProvider::parse_tool_calls(text);
-        assert_eq!(calls.len(), 1, "wrapped form should be parseable via parse_tool_calls");
+        assert_eq!(
+            calls.len(),
+            1,
+            "wrapped form should be parseable via parse_tool_calls"
+        );
         assert_eq!(calls[0].1, "ls");
     }
 
@@ -1785,7 +1812,10 @@ mod tests {
         let calls = OpenCodeCliProvider::parse_native_tool_calls(text);
         assert_eq!(calls.len(), 1, "should find one tool call in XML format");
         assert_eq!(calls[0].1, "read");
-        assert_eq!(calls[0].2["file_path"], "/Users/pradeep.borado/work/scripts/metal-operators/tests/pca_test.rs");
+        assert_eq!(
+            calls[0].2["file_path"],
+            "/Users/pradeep.borado/work/scripts/metal-operators/tests/pca_test.rs"
+        );
         assert_eq!(calls[0].2["limit"], 50);
         assert_eq!(calls[0].2["offset"], 1);
     }
@@ -1819,7 +1849,11 @@ mod tests {
 </tool_request>
 </tool_call>"#;
         let calls = OpenCodeCliProvider::parse_tool_calls(text);
-        assert_eq!(calls.len(), 1, "should extract XML from <tool_call> wrapper");
+        assert_eq!(
+            calls.len(),
+            1,
+            "should extract XML from <tool_call> wrapper"
+        );
         assert_eq!(calls[0].1, "read");
     }
 
@@ -1833,7 +1867,11 @@ mod tests {
 <arg_value>30</arg_value>
 </tool_call>"#;
         let calls = OpenCodeCliProvider::parse_tool_calls(text);
-        assert_eq!(calls.len(), 1, "should parse arg_key/arg_value webfetch call");
+        assert_eq!(
+            calls.len(),
+            1,
+            "should parse arg_key/arg_value webfetch call"
+        );
         assert_eq!(calls[0].1, "webfetch");
         assert_eq!(
             calls[0].2["url"],
@@ -1942,13 +1980,17 @@ read
             "cd /Users/pradeep.borado/work/scripts/metal-operators && cargo test --test logistic_regression_test 2>&1 | tail -50"
         );
         assert_eq!(calls[0].2["timeout"], 120000);
-        assert!(calls[0].2.get("name").is_none(), "name must not stay in args");
+        assert!(
+            calls[0].2.get("name").is_none(),
+            "name must not stay in args"
+        );
         assert!(calls[0].2.get("id").is_none(), "id must not stay in args");
     }
 
     #[test]
     fn test_json_tool_call_arguments_first_valid() {
-        let text = r#"<tool_call>{"arguments":{"command":"ls"},"id":"call_0","name":"bash"}</tool_call>"#;
+        let text =
+            r#"<tool_call>{"arguments":{"command":"ls"},"id":"call_0","name":"bash"}</tool_call>"#;
         let calls = OpenCodeCliProvider::parse_tool_calls(text);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1, "bash");
@@ -1990,10 +2032,10 @@ read
 
     #[test]
     fn drops_leaked_tool_json_fragments() {
-        assert!(OpenCodeCliProvider::sanitize_bridge_text(
-            r#"","id":"call_0","name":"repl"}"#
-        )
-        .is_none());
+        assert!(
+            OpenCodeCliProvider::sanitize_bridge_text(r#"","id":"call_0","name":"repl"}"#)
+                .is_none()
+        );
         assert!(OpenCodeCliProvider::sanitize_bridge_text(
             r#"{"name":"repl","arguments":{"code":"print(1)"},"id":"call_0"}"#
         )
@@ -2002,10 +2044,8 @@ read
 
     #[test]
     fn unescapes_literal_backslash_n() {
-        let kept = OpenCodeCliProvider::sanitize_bridge_text(
-            r#"Line one\nLine two\nDone."#,
-        )
-        .unwrap();
+        let kept =
+            OpenCodeCliProvider::sanitize_bridge_text(r#"Line one\nLine two\nDone."#).unwrap();
         assert!(kept.contains("Line one\nLine two"));
         assert!(!kept.contains("\\n"));
     }
@@ -2033,7 +2073,10 @@ read
             thinking: None,
         };
         let prompt = provider.build_prompt(&req);
-        assert!(!prompt.contains("\n---\n"), "prompt should not use --- separators");
+        assert!(
+            !prompt.contains("\n---\n"),
+            "prompt should not use --- separators"
+        );
         assert!(prompt.contains("<turn role=\"user\">"));
         assert!(prompt.contains("Never echo"));
     }

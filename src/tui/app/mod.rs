@@ -3,19 +3,18 @@ use crate::agent::AgentMode;
 use crate::ai::provider::Provider;
 use crate::ai::types::Message;
 use crate::context::{
-    build_commands_section, build_context_section, discover_agent_commands,
-    discover_context_files,
+    build_commands_section, build_context_section, discover_agent_commands, discover_context_files,
 };
 use crate::permission::{
     extract_tool_path, path_allow_prefix, PathAllowStore, PendingPermission, PermissionReply,
     TrustStore,
 };
-use crate::tools::question::{PendingQuestion, QuestionReply};
 use crate::session::{self, SessionData, SessionStore};
 use crate::skills::{
     discover_skills, discover_templates, find_skill, find_template, format_skill_injection,
     list_skills_summary, render_template,
 };
+use crate::tools::question::{PendingQuestion, QuestionReply};
 use crossbeam_channel as channel;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -30,18 +29,18 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::Frame;
 
 use super::fleet_panel::{self, BoardRow, FleetPanelState};
-use super::ui::FocusZone;
-use super::sessions_panel::{self, SessionRow, SessionsPanelState};
 use super::help::{self, HelpOverlay};
 use super::hit::{HitMap, HitTarget};
 use super::keys::{merge_keybindings, KeyMap};
 use super::layout::{compute_view, LayoutOpts};
 use super::renderer::{render_markdown, MarkdownStyle};
+use super::sessions_panel::{self, SessionRow, SessionsPanelState};
 use super::settings::{self, SettingsState};
 use super::status::{self, SessionUiState};
 use super::theme::{Palette, ThemeName};
 use super::toast::{self, Toast};
 use super::tree_view::{self, SidePanelMode};
+use super::ui::FocusZone;
 use super::widgets;
 use crate::lifecycle::{self, Lifecycle};
 use crate::notify::{self, NotifyMode};
@@ -109,8 +108,12 @@ enum PickerMode {
 
 #[allow(dead_code)]
 pub(super) enum AppCommand {
-    Submit { text: String },
-    Steer { text: String },
+    Submit {
+        text: String,
+    },
+    Steer {
+        text: String,
+    },
     Abort,
     Compact,
     NewSession,
@@ -121,18 +124,32 @@ pub(super) enum AppCommand {
     },
     /// Refresh `/timeline` entries from the live agent transcript.
     RequestTimeline,
-    SetModel { model: String },
+    SetModel {
+        model: String,
+    },
     /// Mid-session provider+model swap (pi parity).
     SetProvider {
         provider: Arc<dyn Provider>,
         model: String,
     },
-    SetMode { mode: AgentMode },
-    SetSkillTools { tools: Vec<String> },
-    SetTitle { title: String },
-    SetSystemPrompt { prompt: String },
-    Init { messages: Vec<Message> },
-    GoalSet { condition: String },
+    SetMode {
+        mode: AgentMode,
+    },
+    SetSkillTools {
+        tools: Vec<String>,
+    },
+    SetTitle {
+        title: String,
+    },
+    SetSystemPrompt {
+        prompt: String,
+    },
+    Init {
+        messages: Vec<Message>,
+    },
+    GoalSet {
+        condition: String,
+    },
     GoalClear,
     GoalPause,
     GoalResume,
@@ -140,11 +157,17 @@ pub(super) enum AppCommand {
     /// Request a consenting handoff (injects user message).
     HandoffRequest,
     /// Bind or clear seat identity (`None` = clear).
-    SetSeat { name: Option<String> },
+    SetSeat {
+        name: Option<String>,
+    },
     /// Replace agent state with a worker/TUI session (fleet attach).
-    LoadSession { data: SessionData },
+    LoadSession {
+        data: SessionData,
+    },
     /// Persist the current session, then load another (atomic session switch).
-    SwitchSession { data: SessionData },
+    SwitchSession {
+        data: SessionData,
+    },
     /// Force-save current session to disk (fleet detach).
     PersistSession,
     Exit,
@@ -359,7 +382,18 @@ enum LspCmd {
 }
 
 impl App {
-    pub fn new(provider: Arc<dyn Provider>, model: String, timeout_secs: u64, approve: bool, resume: Option<SessionData>, system_prompt: Option<String>, max_iterations: usize, auto_mode: bool, rlm_depth: u32, thinking_budget: Option<u32>) -> Self {
+    pub fn new(
+        provider: Arc<dyn Provider>,
+        model: String,
+        timeout_secs: u64,
+        approve: bool,
+        resume: Option<SessionData>,
+        system_prompt: Option<String>,
+        max_iterations: usize,
+        auto_mode: bool,
+        rlm_depth: u32,
+        thinking_budget: Option<u32>,
+    ) -> Self {
         let cfg = crate::config::Config::load();
         let theme_name = match cfg.theme.as_deref() {
             None | Some("auto") => ThemeName::from_host(),
@@ -405,8 +439,8 @@ impl App {
                                     } else {
                                         summary
                                     };
-                                    let _ =
-                                        event_tx_lsp.send((0, AgentEvent::LspUpdate { summary: msg }));
+                                    let _ = event_tx_lsp
+                                        .send((0, AgentEvent::LspUpdate { summary: msg }));
                                 }
                                 Err(e) => {
                                     let _ = event_tx_lsp.send((
@@ -456,12 +490,15 @@ impl App {
 
         let provider_name = provider.name().to_string();
         let provider_name_for_banner = provider_name.clone();
-        let session_id =
-            resume.as_ref().map(|s| s.id.clone()).unwrap_or_else(SessionStore::generate_id);
+        let session_id = resume
+            .as_ref()
+            .map(|s| s.id.clone())
+            .unwrap_or_else(SessionStore::generate_id);
         crate::tools::turn_snapshot::set_session(&session_id);
-        let created_at = resume.as_ref().map(|s| s.created_at.clone()).unwrap_or_else(|| {
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
-        });
+        let created_at = resume
+            .as_ref()
+            .map(|s| s.created_at.clone())
+            .unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
         let title = resume.as_ref().and_then(|s| s.title.clone());
 
         let runtime_cfg = if let Some(ref data) = resume {
@@ -518,11 +555,11 @@ impl App {
         let mut initial_msgs = vec![ChatMessage {
             role: "system".to_string(),
             text: format!(
-                "**rs-agent** · Deep Context coding agent\n\
+                "**rs-agent** · overnight factory + Deep Context\n\
                  `{provider}` / `{model}` · session `{session}`\n\n\
-                 Type to start · `/` commands · `@` files · `#` dirs\n\
-                 Header chip: ○ idle · ◐ working · ● blocked · ✓ done\n\
-                     Esc abort (kills bash) · Tab cycle tool outputs · Enter steer while working · `/tree` call graph",
+                 Leave a wish (`c` cockpit) · workers implement · review in the morning\n\
+                 Huge files stay in `/tree` — they don't blow the window\n\
+                 Type to start · `/` commands · `@` files · Esc abort · Enter steer",
                 provider = provider_banner,
                 model = model,
                 session = SessionStore::short_id(&session_id),
@@ -564,9 +601,19 @@ impl App {
             for msg in &resume_data.messages {
                 match &msg.role {
                     crate::ai::types::Role::User => {
-                        let text = msg.content.first().and_then(|c| c.text.as_deref()).unwrap_or("");
+                        let text = msg
+                            .content
+                            .first()
+                            .and_then(|c| c.text.as_deref())
+                            .unwrap_or("");
                         if !text.is_empty() {
-                            initial_msgs.push(ChatMessage { role: "user".to_string(), text: text.to_string(), thinking: None, show_thinking: false, tool_blocks: Vec::new() });
+                            initial_msgs.push(ChatMessage {
+                                role: "user".to_string(),
+                                text: text.to_string(),
+                                thinking: None,
+                                show_thinking: false,
+                                tool_blocks: Vec::new(),
+                            });
                         }
                     }
                     crate::ai::types::Role::Assistant => {
@@ -581,7 +628,8 @@ impl App {
                                 }
                                 crate::ai::types::ContentType::ToolUse => {
                                     let name = c.name.as_deref().unwrap_or("tool");
-                                    let input = c.input.as_ref().map(|v| v.to_string()).unwrap_or_default();
+                                    let input =
+                                        c.input.as_ref().map(|v| v.to_string()).unwrap_or_default();
                                     let preview: String = input.chars().take(120).collect();
                                     text.push_str(&format!("\n🛠 {} {}\n", name, preview));
                                 }
@@ -594,15 +642,38 @@ impl App {
                             }
                         }
                         if !text.is_empty() {
-                            initial_msgs.push(ChatMessage { role: "assistant".to_string(), text, thinking: thinking.clone(), show_thinking: thinking.as_ref().map(|t| !t.is_empty()).unwrap_or(false), tool_blocks: Vec::new() });
+                            initial_msgs.push(ChatMessage {
+                                role: "assistant".to_string(),
+                                text,
+                                thinking: thinking.clone(),
+                                show_thinking: thinking
+                                    .as_ref()
+                                    .map(|t| !t.is_empty())
+                                    .unwrap_or(false),
+                                tool_blocks: Vec::new(),
+                            });
                         }
                     }
                     crate::ai::types::Role::Tool => {
-                        let name = msg.content.first().and_then(|c| c.name.as_deref()).unwrap_or("tool");
-                        let result = msg.content.first().and_then(|c| c.text.as_deref()).unwrap_or("");
+                        let name = msg
+                            .content
+                            .first()
+                            .and_then(|c| c.name.as_deref())
+                            .unwrap_or("tool");
+                        let result = msg
+                            .content
+                            .first()
+                            .and_then(|c| c.text.as_deref())
+                            .unwrap_or("");
                         let preview: String = result.chars().take(200).collect();
                         if !preview.is_empty() {
-                            initial_msgs.push(ChatMessage { role: "tool".to_string(), text: format!("✅ [{}] {}", name, preview), thinking: None, show_thinking: false, tool_blocks: Vec::new() });
+                            initial_msgs.push(ChatMessage {
+                                role: "tool".to_string(),
+                                text: format!("✅ [{}] {}", name, preview),
+                                thinking: None,
+                                show_thinking: false,
+                                tool_blocks: Vec::new(),
+                            });
                         }
                     }
                     _ => {}
@@ -649,14 +720,8 @@ impl App {
             auto_mode,
             token_used: 0,
             token_limit: crate::ai::token_count::get_context_limit(&model),
-            session_input_tokens: resume
-                .as_ref()
-                .map(|s| s.total_input_tokens)
-                .unwrap_or(0),
-            session_output_tokens: resume
-                .as_ref()
-                .map(|s| s.total_output_tokens)
-                .unwrap_or(0),
+            session_input_tokens: resume.as_ref().map(|s| s.total_input_tokens).unwrap_or(0),
+            session_output_tokens: resume.as_ref().map(|s| s.total_output_tokens).unwrap_or(0),
             near_limit: false,
             session_id,
             session_title: title,
@@ -864,11 +929,8 @@ impl App {
                 let is_trusted = self.approved || self.trust_store.is_trusted(&cwd);
                 let path_ok = {
                     let target = extract_tool_path(&pending.request.tool_input);
-                    self.path_allows.allows(
-                        &cwd,
-                        &pending.request.tool_name,
-                        target.as_deref(),
-                    )
+                    self.path_allows
+                        .allows(&cwd, &pending.request.tool_name, target.as_deref())
                 };
                 if is_trusted || path_ok || self.auto_allow(&pending.request.tool_name) {
                     let _ = pending.reply_tx.send(PermissionReply::AllowOnce);
@@ -906,8 +968,10 @@ impl App {
             if self.tree_breadcrumb == "idle" && self.show_tree_with_city && self.show_fleet_panel {
                 // Keep drawer until user toggles; do not auto-hide (less surprising).
             }
-            if self.show_sessions_panel && self.fleet_refresh_at.elapsed() >= Duration::from_secs(2) {
-                self.sessions_panel.refresh(&self.session_id, self.bg_running_session.as_deref());
+            if self.show_sessions_panel && self.fleet_refresh_at.elapsed() >= Duration::from_secs(2)
+            {
+                self.sessions_panel
+                    .refresh(&self.session_id, self.bg_running_session.as_deref());
                 self.fleet_refresh_at = Instant::now();
             }
 
@@ -929,10 +993,7 @@ impl App {
         }
         // Alternate screen is gone — print a durable resume hint.
         let short = SessionStore::short_id(&self.session_id);
-        let title = self
-            .session_title
-            .as_deref()
-            .unwrap_or("untitled");
+        let title = self.session_title.as_deref().unwrap_or("untitled");
         eprintln!("Session saved: {} ({title})", self.session_id);
         eprintln!("Resume:  rs-agent -r {short}");
         eprintln!("Or:      rs-agent -r latest");
@@ -954,10 +1015,7 @@ impl App {
                 | AgentEvent::ReplOutput { .. }
                 | AgentEvent::TurnEnd { .. }
         );
-        if streaming
-            && self.input_mode != InputMode::Waiting
-            && self.tool_in_progress.is_none()
-        {
+        if streaming && self.input_mode != InputMode::Waiting && self.tool_in_progress.is_none() {
             return;
         }
         match event {
@@ -1120,8 +1178,7 @@ impl App {
                     || message.to_lowercase().contains("connection");
                 let exhausted = message.to_lowercase().contains("auto-retry exhausted");
                 if transport && !exhausted && self.provider_auto_continues < 3 {
-                    self.provider_auto_continues =
-                        self.provider_auto_continues.saturating_add(1);
+                    self.provider_auto_continues = self.provider_auto_continues.saturating_add(1);
                     let n = self.provider_auto_continues;
                     self.push_system(format!(
                         "Provider hiccup: {message}\nAuto-continuing ({n}/3)…"
@@ -1223,7 +1280,11 @@ impl App {
                 self.append_tool_tab_output(&name, &chunk);
                 self.show_repl_panel = true;
             }
-            AgentEvent::ContextWarning { fraction: _, used, limit } => {
+            AgentEvent::ContextWarning {
+                fraction: _,
+                used,
+                limit,
+            } => {
                 self.token_used = used;
                 self.token_limit = limit;
                 self.near_limit = true;
@@ -1253,9 +1314,7 @@ impl App {
                             self.provider_auto_continues =
                                 self.provider_auto_continues.saturating_add(1);
                             let n = self.provider_auto_continues;
-                            self.push_system(format!(
-                                "stream failed — auto-continuing ({n}/3)…"
-                            ));
+                            self.push_system(format!("stream failed — auto-continuing ({n}/3)…"));
                             self.input_mode = InputMode::Waiting;
                             self.tool_in_progress = None;
                             self.status = "thinking...".to_string();
@@ -1360,8 +1419,11 @@ impl App {
                     MouseEventKind::ScrollUp => {
                         self.scroll_offset = self.scroll_offset.saturating_sub(3);
                     }
-                    MouseEventKind::Down(button) if button == crossterm::event::MouseButton::Left => {
-                        if let Some(target) = self.hit_map.hit_at(mouse.column, mouse.row).cloned() {
+                    MouseEventKind::Down(button)
+                        if button == crossterm::event::MouseButton::Left =>
+                    {
+                        if let Some(target) = self.hit_map.hit_at(mouse.column, mouse.row).cloned()
+                        {
                             match target {
                                 HitTarget::Thinking { msg_idx } => {
                                     if let Some(msg) = self.messages.get_mut(msg_idx) {
@@ -1486,12 +1548,13 @@ impl App {
                         },
                     }
                 }
-            },
+            }
             Event::Paste(text) => {
                 if self.pending_permission.is_some() {
                     // ignore paste while a permission prompt is up
                 } else if self.picker_active {
-                    self.picker_query.push_str(text.replace(['\n', '\r'], "").as_str());
+                    self.picker_query
+                        .push_str(text.replace(['\n', '\r'], "").as_str());
                     self.update_picker_results();
                 } else {
                     match self.input_mode {
@@ -1499,8 +1562,7 @@ impl App {
                         | InputMode::Waiting
                         | InputMode::ApiKey
                         | InputMode::Question => {
-                            self.input
-                                .push_str(text.replace(['\n', '\r'], "").as_str());
+                            self.input.push_str(text.replace(['\n', '\r'], "").as_str());
                         }
                         InputMode::Normal => {}
                     }
@@ -1535,7 +1597,9 @@ impl App {
                     let text = std::mem::take(&mut self.input);
                     self.queued_steers += 1;
                     self.steer_queue.push(text.clone());
-                    let _ = self.command_tx.send(AppCommand::Steer { text: text.clone() });
+                    let _ = self
+                        .command_tx
+                        .send(AppCommand::Steer { text: text.clone() });
                     self.messages.push(ChatMessage {
                         role: "user".to_string(),
                         text: format!("[steer] {}", text),
@@ -1824,11 +1888,7 @@ impl App {
         let seat = attach.seat.clone();
         match attach.phase {
             FleetAttachPhase::Follow | FleetAttachPhase::Attaching => {
-                crate::fleet::append_control(
-                    &seat,
-                    crate::fleet::ControlOp::Steer,
-                    Some(text),
-                );
+                crate::fleet::append_control(&seat, crate::fleet::ControlOp::Steer, Some(text));
                 self.push_system(format!("Steer → `{seat}`: {text}"));
             }
             FleetAttachPhase::Attached => {
@@ -1992,8 +2052,7 @@ impl App {
             // Tree can coexist via show_tree_with_city; keep tree panel flag for drawer.
             self.fleet_panel.refresh();
             self.focus_zone = FocusZone::CityWish;
-            self.fleet_panel.status_line =
-                "wish→spawn→select→follow — Tab zones".into();
+            self.fleet_panel.status_line = "wish→spawn→select→follow — Tab zones".into();
         } else {
             self.city_overlay = CityOverlay::None;
             self.city_detail_follower = None;
@@ -2155,20 +2214,17 @@ impl App {
                             self.focus_zone = FocusZone::CityBoard;
                         }
                     }
-                    CityDeleteTarget::Bead { id, title } => {
-                        match crate::beads::delete(None, &id) {
-                            Ok(b) => {
-                                self.push_toast(Toast::finished("deleted", &b.id));
-                                self.fleet_panel.status_line =
-                                    format!("deleted bead {} ({})", b.id, title);
-                                if self.fleet_panel.selected_flow_id.as_deref() == Some(id.as_str())
-                                {
-                                    self.fleet_panel.selected_flow_id = None;
-                                }
+                    CityDeleteTarget::Bead { id, title } => match crate::beads::delete(None, &id) {
+                        Ok(b) => {
+                            self.push_toast(Toast::finished("deleted", &b.id));
+                            self.fleet_panel.status_line =
+                                format!("deleted bead {} ({})", b.id, title);
+                            if self.fleet_panel.selected_flow_id.as_deref() == Some(id.as_str()) {
+                                self.fleet_panel.selected_flow_id = None;
                             }
-                            Err(e) => self.fleet_panel.status_line = e,
                         }
-                    }
+                        Err(e) => self.fleet_panel.status_line = e,
+                    },
                 }
                 self.fleet_panel.refresh();
                 self.status = "ready".into();
@@ -2181,8 +2237,7 @@ impl App {
                             "assigned",
                             &format!("{bead_id} → {seat}"),
                         ));
-                        self.fleet_panel.status_line =
-                            format!("assigned {} to {seat}", b.id);
+                        self.fleet_panel.status_line = format!("assigned {} to {seat}", b.id);
                         self.fleet_panel.refresh();
                     }
                     Err(e) => self.fleet_panel.status_line = e,
@@ -2245,7 +2300,8 @@ impl App {
             self.show_timeline_panel = false;
             self.show_tree_panel = false;
             self.show_tree_with_city = false;
-            self.sessions_panel.refresh(&self.session_id, self.bg_running_session.as_deref());
+            self.sessions_panel
+                .refresh(&self.session_id, self.bg_running_session.as_deref());
             self.focus_zone = FocusZone::Sessions;
         } else if self.focus_zone == FocusZone::Sessions {
             self.focus_zone = FocusZone::Chat;
@@ -2279,7 +2335,9 @@ impl App {
         self.session_title = data.title.clone().filter(|t| !t.is_empty());
         self.session_input_tokens = data.total_input_tokens;
         self.session_output_tokens = data.total_output_tokens;
-        self.token_used = data.total_input_tokens.saturating_add(data.total_output_tokens);
+        self.token_used = data
+            .total_input_tokens
+            .saturating_add(data.total_output_tokens);
         self.apply_transcript_messages(&data.messages);
         self.goal_indicator = match &data.goal {
             Some(g)
@@ -2305,7 +2363,8 @@ impl App {
         crate::tools::turn_snapshot::set_session(&self.session_id);
         lifecycle::set_session(Some(self.session_id.clone()), None);
         if self.show_sessions_panel {
-            self.sessions_panel.refresh(&self.session_id, self.bg_running_session.as_deref());
+            self.sessions_panel
+                .refresh(&self.session_id, self.bg_running_session.as_deref());
         }
     }
 
@@ -2637,10 +2696,7 @@ impl App {
 
     fn switch_to_session_id(&mut self, id: &str) {
         if id == self.session_id {
-            self.push_system(format!(
-                "Already on session {}",
-                SessionStore::short_id(id)
-            ));
+            self.push_system(format!("Already on session {}", SessionStore::short_id(id)));
             return;
         }
 
@@ -2677,10 +2733,7 @@ impl App {
                 return;
             }
         };
-        let title = data
-            .title
-            .clone()
-            .unwrap_or_else(|| "(untitled)".into());
+        let title = data.title.clone().unwrap_or_else(|| "(untitled)".into());
         let short = SessionStore::short_id(&data.id).to_string();
         let msg_count = data.messages.len();
         let cfg = self.spawn_config_for(&data);
@@ -2697,9 +2750,7 @@ impl App {
         self.status = "ready".into();
         self.agent_turn_active = false;
         self.tool_in_progress = None;
-        self.push_system(format!(
-            "Switched to {short} — {title} ({msg_count} msgs)"
-        ));
+        self.push_system(format!("Switched to {short} — {title} ({msg_count} msgs)"));
         if self.show_sessions_panel {
             self.sessions_panel
                 .refresh(&self.session_id, self.bg_running_session.as_deref());
@@ -2716,7 +2767,8 @@ impl App {
             }
             Some(SessionRow::Action { id, .. }) if id == "toggle_scope" => {
                 self.sessions_panel.show_all = !self.sessions_panel.show_all;
-                self.sessions_panel.refresh(&self.session_id, self.bg_running_session.as_deref());
+                self.sessions_panel
+                    .refresh(&self.session_id, self.bg_running_session.as_deref());
             }
             _ => {
                 self.push_system("Nothing selected — ↑↓ to a session or action.");
@@ -2791,7 +2843,10 @@ impl App {
             self.fleet_abort_remote();
             return true;
         }
-        if let Some(rest) = lower.strip_prefix("logs ").or_else(|| lower.strip_prefix("log ")) {
+        if let Some(rest) = lower
+            .strip_prefix("logs ")
+            .or_else(|| lower.strip_prefix("log "))
+        {
             let seat = raw.split_whitespace().nth(1).unwrap_or(rest.trim());
             if seat.is_empty() {
                 self.push_system("Usage: /seat logs <seat>");
@@ -2937,7 +2992,11 @@ impl App {
                     match crate::agent::handoff::route_to_seat(
                         None,
                         to,
-                        if reason.is_empty() { "routed from TUI" } else { &reason },
+                        if reason.is_empty() {
+                            "routed from TUI"
+                        } else {
+                            &reason
+                        },
                         &self.allowed_transitions,
                     ) {
                         Ok(rec) => self.push_system(rec.format_block()),
@@ -2955,9 +3014,15 @@ impl App {
                         let mut out = String::from("Input history (most recent, newest last):\n");
                         for (i, entry) in self.input_history.iter().enumerate().skip(start) {
                             let preview: String = entry.chars().take(100).collect();
-                            out.push_str(&format!("  {:>3}  {}\n", i + 1, preview.replace('\n', " ⏎ ")));
+                            out.push_str(&format!(
+                                "  {:>3}  {}\n",
+                                i + 1,
+                                preview.replace('\n', " ⏎ ")
+                            ));
                         }
-                        out.push_str("\n/history <query> to search · /history <n> to edit that entry");
+                        out.push_str(
+                            "\n/history <query> to search · /history <n> to edit that entry",
+                        );
                         self.push_system(out);
                     }
                 } else if let Ok(n) = arg.parse::<usize>() {
@@ -2986,7 +3051,11 @@ impl App {
                         let mut out = format!("History matches for `{}`:\n", arg);
                         for (i, entry) in matches.iter().take(20) {
                             let preview: String = entry.chars().take(100).collect();
-                            out.push_str(&format!("  {:>3}  {}\n", i + 1, preview.replace('\n', " ⏎ ")));
+                            out.push_str(&format!(
+                                "  {:>3}  {}\n",
+                                i + 1,
+                                preview.replace('\n', " ⏎ ")
+                            ));
                         }
                         out.push_str("\n/history <n> to edit an entry");
                         self.push_system(out);
@@ -2997,11 +3066,15 @@ impl App {
                 if arg.is_empty() {
                     self.push_system(format!(
                         "Current title: {}\nUsage: /rename <title>",
-                        self.session_title.clone().unwrap_or_else(|| "(untitled)".to_string())
+                        self.session_title
+                            .clone()
+                            .unwrap_or_else(|| "(untitled)".to_string())
                     ));
                 } else {
                     self.session_title = Some(arg.to_string());
-                    let _ = self.command_tx.send(AppCommand::SetTitle { title: arg.to_string() });
+                    let _ = self.command_tx.send(AppCommand::SetTitle {
+                        title: arg.to_string(),
+                    });
                     self.push_system(format!("Session renamed to \"{}\"", arg));
                 }
             }
@@ -3045,9 +3118,7 @@ impl App {
                 }
             }
             "/handoff" => {
-                self.push_system(
-                    "Requesting handoff — agent will write notes then end the turn.",
-                );
+                self.push_system("Requesting handoff — agent will write notes then end the turn.");
                 let _ = self.command_tx.send(AppCommand::HandoffRequest);
             }
             "/seat" => {
@@ -3068,171 +3139,171 @@ impl App {
                 if is_ops {
                     let _ = self.handle_seat_ops(raw);
                 } else {
-                match crate::agent::parse_seat_arg(arg) {
-                    Ok(crate::agent::SeatCommand::Status) => {
-                        self.push_system(
+                    match crate::agent::parse_seat_arg(arg) {
+                        Ok(crate::agent::SeatCommand::Status) => {
+                            self.push_system(
                             "Usage: /seat <name> | clear | list | pronouns … | role … | caste … | orders … | model … | rename …\n\
                              Ops: /city | /seat follow|attach|detach|steer|abort|open <seat>",
                         );
-                    }
-                    Ok(crate::agent::SeatCommand::Clear) => {
-                        let _ = self.command_tx.send(AppCommand::SetSeat { name: None });
-                        self.push_system("Seat cleared");
-                    }
-                    Ok(crate::agent::SeatCommand::List) => {
-                        let names = crate::agent::seat::list_names();
-                        if names.is_empty() {
-                            self.push_system("No seats yet. Create with /seat <name>");
-                        } else {
-                            self.push_system(format!("Seats: {}", names.join(", ")));
                         }
-                    }
-                    Ok(crate::agent::SeatCommand::Bind(name)) => {
-                        match crate::agent::seat::load_or_create(&name) {
-                            Ok(seat) => {
-                                let _ = self.command_tx.send(AppCommand::SetSeat {
-                                    name: Some(seat.name.clone()),
-                                });
-                                self.push_system(format!(
-                                    "Seat `{}` bound{}",
-                                    seat.name,
-                                    if seat.role.is_empty() {
-                                        " — set role with /seat role …".to_string()
-                                    } else {
-                                        format!(" ({})", seat.role)
-                                    }
-                                ));
+                        Ok(crate::agent::SeatCommand::Clear) => {
+                            let _ = self.command_tx.send(AppCommand::SetSeat { name: None });
+                            self.push_system("Seat cleared");
+                        }
+                        Ok(crate::agent::SeatCommand::List) => {
+                            let names = crate::agent::seat::list_names();
+                            if names.is_empty() {
+                                self.push_system("No seats yet. Create with /seat <name>");
+                            } else {
+                                self.push_system(format!("Seats: {}", names.join(", ")));
                             }
-                            Err(e) => self.push_system(e),
                         }
-                    }
-                    Ok(crate::agent::SeatCommand::SetPronouns(p)) => {
-                        if let Some(name) = crate::tools::handoff::active_seat() {
-                            match crate::agent::seat::load(&name) {
-                                Ok(mut seat) => {
-                                    seat.pronouns = p;
-                                    if let Err(e) = crate::agent::seat::save(&seat) {
-                                        self.push_system(e);
-                                    } else {
-                                        let _ = self.command_tx.send(AppCommand::SetSeat {
-                                            name: Some(seat.name),
-                                        });
-                                        self.push_system("Pronouns updated");
-                                    }
-                                }
-                                Err(e) => self.push_system(e),
-                            }
-                        } else {
-                            self.push_system("Bind a seat first: /seat <name>");
-                        }
-                    }
-                    Ok(crate::agent::SeatCommand::SetRole(role)) => {
-                        if let Some(name) = crate::tools::handoff::active_seat() {
-                            match crate::agent::seat::load(&name) {
-                                Ok(mut seat) => {
-                                    seat.role = role;
-                                    if let Err(e) = crate::agent::seat::save(&seat) {
-                                        self.push_system(e);
-                                    } else {
-                                        let _ = self.command_tx.send(AppCommand::SetSeat {
-                                            name: Some(seat.name),
-                                        });
-                                        self.push_system("Role updated");
-                                    }
-                                }
-                                Err(e) => self.push_system(e),
-                            }
-                        } else {
-                            self.push_system("Bind a seat first: /seat <name>");
-                        }
-                    }
-                    Ok(crate::agent::SeatCommand::SetCaste(caste)) => {
-                        if let Some(name) = crate::tools::handoff::active_seat() {
-                            match crate::agent::seat::load(&name) {
-                                Ok(mut seat) => {
-                                    seat.caste = caste;
-                                    if let Err(e) = crate::agent::seat::save(&seat) {
-                                        self.push_system(e);
-                                    } else {
-                                        let _ = self.command_tx.send(AppCommand::SetSeat {
-                                            name: Some(seat.name.clone()),
-                                        });
-                                        self.push_system(format!(
-                                            "Caste set to `{}` (effective: {})",
-                                            caste.as_str(),
-                                            seat.effective_caste().as_str()
-                                        ));
-                                    }
-                                }
-                                Err(e) => self.push_system(e),
-                            }
-                        } else {
-                            self.push_system("Bind a seat first: /seat <name>");
-                        }
-                    }
-                    Ok(crate::agent::SeatCommand::SetOrders(orders)) => {
-                        if let Some(name) = crate::tools::handoff::active_seat() {
-                            match crate::agent::seat::load(&name) {
-                                Ok(mut seat) => {
-                                    seat.standing_orders = orders;
-                                    if let Err(e) = crate::agent::seat::save(&seat) {
-                                        self.push_system(e);
-                                    } else {
-                                        let _ = self.command_tx.send(AppCommand::SetSeat {
-                                            name: Some(seat.name),
-                                        });
-                                        self.push_system("Standing orders updated");
-                                    }
-                                }
-                                Err(e) => self.push_system(e),
-                            }
-                        } else {
-                            self.push_system("Bind a seat first: /seat <name>");
-                        }
-                    }
-                    Ok(crate::agent::SeatCommand::SetModel(model)) => {
-                        if let Some(name) = crate::tools::handoff::active_seat() {
-                            match crate::agent::seat::load(&name) {
-                                Ok(mut seat) => {
-                                    seat.model = model.clone();
-                                    if let Err(e) = crate::agent::seat::save(&seat) {
-                                        self.push_system(e);
-                                    } else {
-                                        let _ = self.command_tx.send(AppCommand::SetSeat {
-                                            name: Some(seat.name),
-                                        });
-                                        self.push_system(match model {
-                                            Some(m) => format!("Seat model set to {m}"),
-                                            None => "Seat model cleared".into(),
-                                        });
-                                    }
-                                }
-                                Err(e) => self.push_system(e),
-                            }
-                        } else {
-                            self.push_system("Bind a seat first: /seat <name>");
-                        }
-                    }
-                    Ok(crate::agent::SeatCommand::Rename(new_name)) => {
-                        if let Some(old) = crate::tools::handoff::active_seat() {
-                            match crate::agent::seat::rename(&old, &new_name) {
+                        Ok(crate::agent::SeatCommand::Bind(name)) => {
+                            match crate::agent::seat::load_or_create(&name) {
                                 Ok(seat) => {
                                     let _ = self.command_tx.send(AppCommand::SetSeat {
                                         name: Some(seat.name.clone()),
                                     });
                                     self.push_system(format!(
-                                        "Renamed seat → {} (history preserved)",
-                                        seat.name
+                                        "Seat `{}` bound{}",
+                                        seat.name,
+                                        if seat.role.is_empty() {
+                                            " — set role with /seat role …".to_string()
+                                        } else {
+                                            format!(" ({})", seat.role)
+                                        }
                                     ));
                                 }
                                 Err(e) => self.push_system(e),
                             }
-                        } else {
-                            self.push_system("Bind a seat first: /seat <name>");
                         }
+                        Ok(crate::agent::SeatCommand::SetPronouns(p)) => {
+                            if let Some(name) = crate::tools::handoff::active_seat() {
+                                match crate::agent::seat::load(&name) {
+                                    Ok(mut seat) => {
+                                        seat.pronouns = p;
+                                        if let Err(e) = crate::agent::seat::save(&seat) {
+                                            self.push_system(e);
+                                        } else {
+                                            let _ = self.command_tx.send(AppCommand::SetSeat {
+                                                name: Some(seat.name),
+                                            });
+                                            self.push_system("Pronouns updated");
+                                        }
+                                    }
+                                    Err(e) => self.push_system(e),
+                                }
+                            } else {
+                                self.push_system("Bind a seat first: /seat <name>");
+                            }
+                        }
+                        Ok(crate::agent::SeatCommand::SetRole(role)) => {
+                            if let Some(name) = crate::tools::handoff::active_seat() {
+                                match crate::agent::seat::load(&name) {
+                                    Ok(mut seat) => {
+                                        seat.role = role;
+                                        if let Err(e) = crate::agent::seat::save(&seat) {
+                                            self.push_system(e);
+                                        } else {
+                                            let _ = self.command_tx.send(AppCommand::SetSeat {
+                                                name: Some(seat.name),
+                                            });
+                                            self.push_system("Role updated");
+                                        }
+                                    }
+                                    Err(e) => self.push_system(e),
+                                }
+                            } else {
+                                self.push_system("Bind a seat first: /seat <name>");
+                            }
+                        }
+                        Ok(crate::agent::SeatCommand::SetCaste(caste)) => {
+                            if let Some(name) = crate::tools::handoff::active_seat() {
+                                match crate::agent::seat::load(&name) {
+                                    Ok(mut seat) => {
+                                        seat.caste = caste;
+                                        if let Err(e) = crate::agent::seat::save(&seat) {
+                                            self.push_system(e);
+                                        } else {
+                                            let _ = self.command_tx.send(AppCommand::SetSeat {
+                                                name: Some(seat.name.clone()),
+                                            });
+                                            self.push_system(format!(
+                                                "Caste set to `{}` (effective: {})",
+                                                caste.as_str(),
+                                                seat.effective_caste().as_str()
+                                            ));
+                                        }
+                                    }
+                                    Err(e) => self.push_system(e),
+                                }
+                            } else {
+                                self.push_system("Bind a seat first: /seat <name>");
+                            }
+                        }
+                        Ok(crate::agent::SeatCommand::SetOrders(orders)) => {
+                            if let Some(name) = crate::tools::handoff::active_seat() {
+                                match crate::agent::seat::load(&name) {
+                                    Ok(mut seat) => {
+                                        seat.standing_orders = orders;
+                                        if let Err(e) = crate::agent::seat::save(&seat) {
+                                            self.push_system(e);
+                                        } else {
+                                            let _ = self.command_tx.send(AppCommand::SetSeat {
+                                                name: Some(seat.name),
+                                            });
+                                            self.push_system("Standing orders updated");
+                                        }
+                                    }
+                                    Err(e) => self.push_system(e),
+                                }
+                            } else {
+                                self.push_system("Bind a seat first: /seat <name>");
+                            }
+                        }
+                        Ok(crate::agent::SeatCommand::SetModel(model)) => {
+                            if let Some(name) = crate::tools::handoff::active_seat() {
+                                match crate::agent::seat::load(&name) {
+                                    Ok(mut seat) => {
+                                        seat.model = model.clone();
+                                        if let Err(e) = crate::agent::seat::save(&seat) {
+                                            self.push_system(e);
+                                        } else {
+                                            let _ = self.command_tx.send(AppCommand::SetSeat {
+                                                name: Some(seat.name),
+                                            });
+                                            self.push_system(match model {
+                                                Some(m) => format!("Seat model set to {m}"),
+                                                None => "Seat model cleared".into(),
+                                            });
+                                        }
+                                    }
+                                    Err(e) => self.push_system(e),
+                                }
+                            } else {
+                                self.push_system("Bind a seat first: /seat <name>");
+                            }
+                        }
+                        Ok(crate::agent::SeatCommand::Rename(new_name)) => {
+                            if let Some(old) = crate::tools::handoff::active_seat() {
+                                match crate::agent::seat::rename(&old, &new_name) {
+                                    Ok(seat) => {
+                                        let _ = self.command_tx.send(AppCommand::SetSeat {
+                                            name: Some(seat.name.clone()),
+                                        });
+                                        self.push_system(format!(
+                                            "Renamed seat → {} (history preserved)",
+                                            seat.name
+                                        ));
+                                    }
+                                    Err(e) => self.push_system(e),
+                                }
+                            } else {
+                                self.push_system("Bind a seat first: /seat <name>");
+                            }
+                        }
+                        Err(e) => self.push_system(e),
                     }
-                    Err(e) => self.push_system(e),
-                }
                 } // end else identity
             }
             "/beads" => {
@@ -3294,10 +3365,8 @@ impl App {
                         self.push_system("Usage: /marshal assign <bead> <seat>");
                     } else {
                         match crate::marshal::assign_bead(bead, seat) {
-                            Ok(b) => self.push_system(format!(
-                                "Assigned {} → {} — {}",
-                                b.id, seat, b.title
-                            )),
+                            Ok(b) => self
+                                .push_system(format!("Assigned {} → {} — {}", b.id, seat, b.title)),
                             Err(e) => self.push_system(e),
                         }
                     }
@@ -3323,17 +3392,15 @@ impl App {
                     if to.is_empty() || body.is_empty() {
                         self.push_system("Usage: /mail send <to> <body>");
                     } else {
-                        let from = crate::tools::handoff::active_seat()
-                            .unwrap_or_else(|| "human".into());
+                        let from =
+                            crate::tools::handoff::active_seat().unwrap_or_else(|| "human".into());
                         match crate::mail::send(&from, to, body, vec![]) {
                             Ok(m) => self.push_system(format!("Sent {} → {}", m.id, m.to)),
                             Err(e) => self.push_system(e),
                         }
                     }
                 } else {
-                    self.push_system(
-                        "Usage: /mail | /mail send <to> <body> | /mail ack <id>",
-                    );
+                    self.push_system("Usage: /mail | /mail send <to> <body> | /mail ack <id>");
                 }
             }
             "/wish" => {
@@ -3360,8 +3427,8 @@ impl App {
                     let mut parts = rest.splitn(2, char::is_whitespace);
                     let id = parts.next().unwrap_or("");
                     let text = parts.next().unwrap_or("").trim();
-                    let from = crate::tools::handoff::active_seat()
-                        .unwrap_or_else(|| "human".into());
+                    let from =
+                        crate::tools::handoff::active_seat().unwrap_or_else(|| "human".into());
                     match crate::moot::append(id, &from, text) {
                         Ok(m) => self.push_system(format!(
                             "Appended to {} ({} entries)",
@@ -3397,14 +3464,14 @@ impl App {
                          Add with /laurel <praise text>.",
                     );
                 } else {
-                    let mut out = String::from(
-                        "## Laurels (sit with these — no work attached)\n",
-                    );
+                    let mut out = String::from("## Laurels (sit with these — no work attached)\n");
                     for l in &items {
                         let seat = l.seat.as_deref().unwrap_or("—");
                         out.push_str(&format!(
                             "- [{}] ({}) {}\n",
-                            l.written_at, seat, l.text.trim()
+                            l.written_at,
+                            seat,
+                            l.text.trim()
                         ));
                     }
                     self.push_system(out);
@@ -3456,6 +3523,7 @@ impl App {
                         model: Some(self.model_name.clone()),
                         approve: true,
                         fail_fast: false,
+                        shared_worktree: false,
                     };
                     match crate::fleet::fleet_up(opts) {
                         Ok(msg) => self.push_system(msg),
@@ -3535,8 +3603,7 @@ impl App {
                     self.push_system("Usage: /laurel <praise text>");
                 } else {
                     let seat = crate::tools::handoff::active_seat();
-                    let laurel =
-                        crate::agent::laurel::Laurel::new(text.to_string(), seat.clone());
+                    let laurel = crate::agent::laurel::Laurel::new(text.to_string(), seat.clone());
                     if let Err(e) = crate::agent::laurel::append(&laurel) {
                         self.push_system(e);
                     } else {
@@ -3546,63 +3613,57 @@ impl App {
                                 let _ = crate::agent::seat::save(&s);
                             }
                         }
-                        self.push_system(format!(
-                            "Laurel recorded (recognition only): {text}"
-                        ));
+                        self.push_system(format!("Laurel recorded (recognition only): {text}"));
                     }
                 }
             }
-            "/context" => {
-                match arg.to_lowercase().as_str() {
-                    "on" | "off" | "toggle" => {
-                        self.context_enabled = match arg.to_lowercase().as_str() {
-                            "on" => true,
-                            "off" => false,
-                            _ => !self.context_enabled,
-                        };
-                        let prompt = self.rebuild_system_prompt();
-                        let _ = self
-                            .command_tx
-                            .send(AppCommand::SetSystemPrompt { prompt });
-                        self.push_system(format!(
-                            "Project context inclusion: {}. System prompt rebuilt.",
-                            if self.context_enabled { "on" } else { "off" }
-                        ));
-                    }
-                    _ => {
-                        let files = discover_context_files();
-                        let cmds = discover_agent_commands();
-                        let mut out = format!(
-                            "Context inclusion: {} (/context on|off to toggle)\n\nLoaded context:\n",
-                            if self.context_enabled { "on" } else { "off" }
-                        );
-                        if files.is_empty() {
-                            out.push_str("  (no AGENTS.md / CLAUDE.md)\n");
-                        } else {
-                            for f in &files {
-                                out.push_str(&format!(
-                                    "  {} ({} chars)\n",
-                                    f.path.display(),
-                                    f.content.len()
-                                ));
-                            }
-                        }
-                        out.push_str("Commands (.rs-agent/commands):\n");
-                        if cmds.is_empty() {
-                            out.push_str("  (none)\n");
-                        } else {
-                            for c in &cmds {
-                                out.push_str(&format!(
-                                    "  {} ({} chars)\n",
-                                    c.path.display(),
-                                    c.content.len()
-                                ));
-                            }
-                        }
-                        self.push_system(out);
-                    }
+            "/context" => match arg.to_lowercase().as_str() {
+                "on" | "off" | "toggle" => {
+                    self.context_enabled = match arg.to_lowercase().as_str() {
+                        "on" => true,
+                        "off" => false,
+                        _ => !self.context_enabled,
+                    };
+                    let prompt = self.rebuild_system_prompt();
+                    let _ = self.command_tx.send(AppCommand::SetSystemPrompt { prompt });
+                    self.push_system(format!(
+                        "Project context inclusion: {}. System prompt rebuilt.",
+                        if self.context_enabled { "on" } else { "off" }
+                    ));
                 }
-            }
+                _ => {
+                    let files = discover_context_files();
+                    let cmds = discover_agent_commands();
+                    let mut out = format!(
+                        "Context inclusion: {} (/context on|off to toggle)\n\nLoaded context:\n",
+                        if self.context_enabled { "on" } else { "off" }
+                    );
+                    if files.is_empty() {
+                        out.push_str("  (no AGENTS.md / CLAUDE.md)\n");
+                    } else {
+                        for f in &files {
+                            out.push_str(&format!(
+                                "  {} ({} chars)\n",
+                                f.path.display(),
+                                f.content.len()
+                            ));
+                        }
+                    }
+                    out.push_str("Commands (.rs-agent/commands):\n");
+                    if cmds.is_empty() {
+                        out.push_str("  (none)\n");
+                    } else {
+                        for c in &cmds {
+                            out.push_str(&format!(
+                                "  {} ({} chars)\n",
+                                c.path.display(),
+                                c.content.len()
+                            ));
+                        }
+                    }
+                    self.push_system(out);
+                }
+            },
             "/commands" => {
                 let cmds = discover_agent_commands();
                 if cmds.is_empty() {
@@ -3610,11 +3671,7 @@ impl App {
                 } else {
                     let mut out = String::from("Project commands:\n");
                     for c in &cmds {
-                        let name = c
-                            .path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("?");
+                        let name = c.path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
                         out.push_str(&format!("  /{} — {}\n", name, c.path.display()));
                     }
                     self.push_system(out);
@@ -3649,10 +3706,7 @@ impl App {
                                 injection
                             ));
                         }
-                        None => self.push_system(format!(
-                            "Unknown skill `{}`. Try /skills.",
-                            arg
-                        )),
+                        None => self.push_system(format!("Unknown skill `{}`. Try /skills.", arg)),
                     }
                 }
             }
@@ -3689,9 +3743,7 @@ impl App {
                 let n = discover_skills().len();
                 let t = discover_templates().len();
                 let prompt = self.rebuild_system_prompt();
-                let _ = self
-                    .command_tx
-                    .send(AppCommand::SetSystemPrompt { prompt });
+                let _ = self.command_tx.send(AppCommand::SetSystemPrompt { prompt });
                 self.push_system(format!(
                     "Reloaded {} skill(s), {} template(s); system prompt rebuilt.",
                     n, t
@@ -3787,7 +3839,9 @@ impl App {
                 let home = std::env::var("HOME")
                     .or_else(|_| std::env::var("USERPROFILE"))
                     .unwrap_or_else(|_| ".".to_string());
-                let dir = std::path::Path::new(&home).join(".rs-agent").join("exports");
+                let dir = std::path::Path::new(&home)
+                    .join(".rs-agent")
+                    .join("exports");
                 let _ = std::fs::create_dir_all(&dir);
                 let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
                 let path = dir.join(format!("export_{}.{}", ts, fmt));
@@ -3884,20 +3938,18 @@ impl App {
                 let _ = self.command_tx.send(AppCommand::Compact);
                 self.status = "compacting...".to_string();
             }
-            "/revert" => {
-                match crate::tools::turn_snapshot::restore_last_turn() {
-                    Ok(n) => {
-                        self.status = format!("restored {n} file(s) from turn");
-                        self.push_system(format!(
-                            "Reverted last turn snapshot ({n} file(s) restored)."
-                        ));
-                    }
-                    Err(e) => {
-                        self.status = "revert failed".into();
-                        self.push_system(format!("Revert failed: {e}"));
-                    }
+            "/revert" => match crate::tools::turn_snapshot::restore_last_turn() {
+                Ok(n) => {
+                    self.status = format!("restored {n} file(s) from turn");
+                    self.push_system(format!(
+                        "Reverted last turn snapshot ({n} file(s) restored)."
+                    ));
                 }
-            }
+                Err(e) => {
+                    self.status = "revert failed".into();
+                    self.push_system(format!("Revert failed: {e}"));
+                }
+            },
             "/new" => {
                 self.start_new_project_session();
             }
@@ -3955,7 +4007,9 @@ impl App {
                     }
                     "status" | "" => {
                         if self.lsp_summary.is_empty() {
-                            self.push_system("LSP idle. Use `/lsp start` (requires rust-analyzer on PATH).");
+                            self.push_system(
+                                "LSP idle. Use `/lsp start` (requires rust-analyzer on PATH).",
+                            );
                         } else {
                             self.push_system(format!("LSP:{}", self.lsp_summary.trim()));
                         }
@@ -4060,7 +4114,11 @@ impl App {
                     self.show_tree_panel = true;
                     self.side_mode = SidePanelMode::Tree;
                 }
-                let panel_note = if self.show_tree_panel { "shown" } else { "hidden" };
+                let panel_note = if self.show_tree_panel {
+                    "shown"
+                } else {
+                    "hidden"
+                };
                 if self.tree_breadcrumb != "idle" {
                     self.push_system(format!(
                         "Call tree panel {}.\nCall tree: {}\n(depth max {})",
@@ -4071,7 +4129,9 @@ impl App {
                         .load(&self.session_id)
                         .ok()
                         .and_then(|data| data.call_tree)
-                        .and_then(|v| serde_json::from_value::<crate::rlm::tree::CallTreeInner>(v).ok())
+                        .and_then(|v| {
+                            serde_json::from_value::<crate::rlm::tree::CallTreeInner>(v).ok()
+                        })
                         .map(|inner| inner.summary());
                     match saved_summary {
                         Some(summary) => {
@@ -4093,7 +4153,11 @@ impl App {
                 let n = self.tool_output_tabs.len();
                 self.push_system(format!(
                     "Bottom console {} — {n} run(s). Tab / ↑↓ switch while waiting.",
-                    if self.show_repl_panel { "shown" } else { "hidden" }
+                    if self.show_repl_panel {
+                        "shown"
+                    } else {
+                        "hidden"
+                    }
                 ));
             }
             _ => {
@@ -4189,9 +4253,8 @@ impl App {
             KeyCode::Down => {
                 self.palette_selection = self.palette_selection.saturating_add(1);
                 if !self.palette_items.is_empty() {
-                    self.palette_selection = self
-                        .palette_selection
-                        .min(self.palette_items.len() - 1);
+                    self.palette_selection =
+                        self.palette_selection.min(self.palette_items.len() - 1);
                 }
             }
             KeyCode::Backspace => {
@@ -4225,9 +4288,7 @@ impl App {
             _ => {}
         }
         if self.show_fleet_panel {
-            if !self.focus_zone.is_city()
-                && matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
-            {
+            if !self.focus_zone.is_city() && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
                 self.focus_zone = FocusZone::CityBoard;
                 return;
             }
@@ -4259,129 +4320,120 @@ impl App {
                 _ => {}
             }
             match self.focus_zone {
-                FocusZone::CityWish => {
-                    match key.code {
-                        KeyCode::Enter => {
-                            self.city_submit_wish();
-                            return;
-                        }
-                        KeyCode::Char(c) => {
-                            self.fleet_panel.wish_text.push(c);
-                            return;
-                        }
-                        KeyCode::Backspace => {
-                            self.fleet_panel.wish_text.pop();
-                            return;
-                        }
-                        _ => {}
+                FocusZone::CityWish => match key.code {
+                    KeyCode::Enter => {
+                        self.city_submit_wish();
+                        return;
                     }
-                }
-                FocusZone::CitySteer => {
-                    match key.code {
-                        KeyCode::Enter => {
-                            self.city_submit_steer();
-                            return;
-                        }
-                        KeyCode::Char(c) => {
-                            self.fleet_panel.steer_text.push(c);
-                            return;
-                        }
-                        KeyCode::Backspace => {
-                            self.fleet_panel.steer_text.pop();
-                            return;
-                        }
-                        _ => {}
+                    KeyCode::Char(c) => {
+                        self.fleet_panel.wish_text.push(c);
+                        return;
                     }
-                }
-                FocusZone::CitySpawn => {
-                    match key.code {
-                        KeyCode::Enter => {
-                            self.city_submit_spawn();
-                            return;
-                        }
-                        KeyCode::Char(c) if c.is_ascii_digit() => {
-                            if self.fleet_panel.spawn_focus_fleet {
-                                self.fleet_panel.spawn_fleet_n.push(c);
-                            } else {
-                                self.fleet_panel.spawn_crew_n.push(c);
-                            }
-                            return;
-                        }
-                        KeyCode::Backspace => {
-                            if self.fleet_panel.spawn_focus_fleet {
-                                self.fleet_panel.spawn_fleet_n.pop();
-                            } else {
-                                self.fleet_panel.spawn_crew_n.pop();
-                            }
-                            return;
-                        }
-                        KeyCode::Left | KeyCode::Right => {
-                            self.fleet_panel.spawn_focus_fleet =
-                                !self.fleet_panel.spawn_focus_fleet;
-                            return;
-                        }
-                        _ => {}
+                    KeyCode::Backspace => {
+                        self.fleet_panel.wish_text.pop();
+                        return;
                     }
-                }
-                FocusZone::CityInspector => {
-                    match key.code {
-                        KeyCode::PageUp => {
-                            self.fleet_panel.log_scroll_by(-8);
-                            return;
-                        }
-                        KeyCode::PageDown => {
-                            self.fleet_panel.log_scroll_by(8);
-                            return;
-                        }
-                        KeyCode::Char('f') => {
-                            if let Some(seat) = self.fleet_panel.selected_seat.clone() {
-                                self.fleet_start_follow(&seat);
-                            }
-                            return;
-                        }
-                        KeyCode::Char('a') => {
-                            if let Some(seat) = self.fleet_panel.selected_seat.clone() {
-                                self.fleet_start_attach(&seat);
-                            }
-                            return;
-                        }
-                        KeyCode::Char('o') => {
-                            if let Some(seat) = self.fleet_panel.selected_seat.clone() {
-                                self.fleet_open_inspect(&seat);
-                            }
-                            return;
-                        }
-                        KeyCode::Char('b') => {
-                            self.fleet_abort_remote();
-                            return;
-                        }
-                        KeyCode::Char('D') => {
-                            self.fleet_detach(false);
-                            return;
-                        }
-                        KeyCode::Char('d') => {
-                            if let Some(seat) = self.fleet_panel.selected_seat.clone() {
-                                self.city_open_down_confirm(Some(seat));
-                            }
-                            return;
-                        }
-                        KeyCode::Char('X') | KeyCode::Delete => {
-                            self.city_request_delete_selection();
-                            return;
-                        }
-                        KeyCode::Enter => {
-                            self.focus_zone = FocusZone::CitySteer;
-                            return;
-                        }
-                        KeyCode::Char('A') => {
-                            if let Some(id) = self.fleet_panel.selected_flow_id.clone() {
-                                self.city_open_assign_modal(&id);
-                            }
-                            return;
-                        }
-                        _ => {}
+                    _ => {}
+                },
+                FocusZone::CitySteer => match key.code {
+                    KeyCode::Enter => {
+                        self.city_submit_steer();
+                        return;
                     }
-                }
+                    KeyCode::Char(c) => {
+                        self.fleet_panel.steer_text.push(c);
+                        return;
+                    }
+                    KeyCode::Backspace => {
+                        self.fleet_panel.steer_text.pop();
+                        return;
+                    }
+                    _ => {}
+                },
+                FocusZone::CitySpawn => match key.code {
+                    KeyCode::Enter => {
+                        self.city_submit_spawn();
+                        return;
+                    }
+                    KeyCode::Char(c) if c.is_ascii_digit() => {
+                        if self.fleet_panel.spawn_focus_fleet {
+                            self.fleet_panel.spawn_fleet_n.push(c);
+                        } else {
+                            self.fleet_panel.spawn_crew_n.push(c);
+                        }
+                        return;
+                    }
+                    KeyCode::Backspace => {
+                        if self.fleet_panel.spawn_focus_fleet {
+                            self.fleet_panel.spawn_fleet_n.pop();
+                        } else {
+                            self.fleet_panel.spawn_crew_n.pop();
+                        }
+                        return;
+                    }
+                    KeyCode::Left | KeyCode::Right => {
+                        self.fleet_panel.spawn_focus_fleet = !self.fleet_panel.spawn_focus_fleet;
+                        return;
+                    }
+                    _ => {}
+                },
+                FocusZone::CityInspector => match key.code {
+                    KeyCode::PageUp => {
+                        self.fleet_panel.log_scroll_by(-8);
+                        return;
+                    }
+                    KeyCode::PageDown => {
+                        self.fleet_panel.log_scroll_by(8);
+                        return;
+                    }
+                    KeyCode::Char('f') => {
+                        if let Some(seat) = self.fleet_panel.selected_seat.clone() {
+                            self.fleet_start_follow(&seat);
+                        }
+                        return;
+                    }
+                    KeyCode::Char('a') => {
+                        if let Some(seat) = self.fleet_panel.selected_seat.clone() {
+                            self.fleet_start_attach(&seat);
+                        }
+                        return;
+                    }
+                    KeyCode::Char('o') => {
+                        if let Some(seat) = self.fleet_panel.selected_seat.clone() {
+                            self.fleet_open_inspect(&seat);
+                        }
+                        return;
+                    }
+                    KeyCode::Char('b') => {
+                        self.fleet_abort_remote();
+                        return;
+                    }
+                    KeyCode::Char('D') => {
+                        self.fleet_detach(false);
+                        return;
+                    }
+                    KeyCode::Char('d') => {
+                        if let Some(seat) = self.fleet_panel.selected_seat.clone() {
+                            self.city_open_down_confirm(Some(seat));
+                        }
+                        return;
+                    }
+                    KeyCode::Char('X') | KeyCode::Delete => {
+                        self.city_request_delete_selection();
+                        return;
+                    }
+                    KeyCode::Enter => {
+                        self.focus_zone = FocusZone::CitySteer;
+                        return;
+                    }
+                    KeyCode::Char('A') => {
+                        if let Some(id) = self.fleet_panel.selected_flow_id.clone() {
+                            self.city_open_assign_modal(&id);
+                        }
+                        return;
+                    }
+                    _ => {}
+                },
                 FocusZone::CityBoard => {
                     match key.code {
                         KeyCode::Up => {
@@ -4473,7 +4525,8 @@ impl App {
                 }
                 KeyCode::Char('a') => {
                     self.sessions_panel.show_all = !self.sessions_panel.show_all;
-                    self.sessions_panel.refresh(&self.session_id, self.bg_running_session.as_deref());
+                    self.sessions_panel
+                        .refresh(&self.session_id, self.bg_running_session.as_deref());
                     return;
                 }
                 _ => {}
@@ -4490,18 +4543,20 @@ impl App {
             return;
         }
         if self.key_matches("toggle_thinking", key) {
-            if let Some(msg) = self
-                .messages
-                .iter_mut()
-                .rev()
-                .find(|m| m.role == "assistant" && m.thinking.as_ref().is_some_and(|t| !t.is_empty()))
-            {
+            if let Some(msg) = self.messages.iter_mut().rev().find(|m| {
+                m.role == "assistant" && m.thinking.as_ref().is_some_and(|t| !t.is_empty())
+            }) {
                 msg.show_thinking = !msg.show_thinking;
             }
             return;
         }
         if self.key_matches("expand_tool", key) {
-            if let Some(msg) = self.messages.iter_mut().rev().find(|m| !m.tool_blocks.is_empty()) {
+            if let Some(msg) = self
+                .messages
+                .iter_mut()
+                .rev()
+                .find(|m| !m.tool_blocks.is_empty())
+            {
                 if let Some(block) = msg.tool_blocks.last_mut() {
                     block.expanded = !block.expanded;
                 }
@@ -4611,7 +4666,8 @@ impl App {
                     self.picker_selection = self.picker_selection.saturating_add(1).min(max);
                 }
                 KeyCode::Enter | KeyCode::Tab => {
-                    if let Some(selected) = self.picker_results.get(self.picker_selection).cloned() {
+                    if let Some(selected) = self.picker_results.get(self.picker_selection).cloned()
+                    {
                         match self.picker_mode {
                             PickerMode::File => {
                                 self.input = format!("{}{} ", self.picker_prefix, selected);
@@ -4622,15 +4678,13 @@ impl App {
                             PickerMode::Skill | PickerMode::Prompt => {
                                 self.input = format!("{}{} ", self.picker_prefix, selected);
                             }
-                            PickerMode::Model => {
-                                match self.apply_model_selection(&selected) {
-                                    Ok(msg) => {
-                                        self.input.clear();
-                                        self.push_system(msg);
-                                    }
-                                    Err(e) => self.push_system(e),
+                            PickerMode::Model => match self.apply_model_selection(&selected) {
+                                Ok(msg) => {
+                                    self.input.clear();
+                                    self.push_system(msg);
                                 }
-                            }
+                                Err(e) => self.push_system(e),
+                            },
                             PickerMode::Provider => {
                                 let pname =
                                     crate::ai::registry::provider_from_picker_row(&selected);
@@ -4840,14 +4894,7 @@ impl App {
         // mutating MCP tools (those keep requires_permission=true).
         matches!(
             tool_name,
-            "read"
-                | "grep"
-                | "ls"
-                | "find"
-                | "webfetch"
-                | "websearch"
-                | "write"
-                | "edit"
+            "read" | "grep" | "ls" | "find" | "webfetch" | "websearch" | "write" | "edit"
         )
     }
 
@@ -5194,7 +5241,11 @@ impl App {
                 _ => {
                     self.picker_prefix = prefix;
                     self.picker_query = query;
-                    self.picker_mode = if is_skill { PickerMode::Skill } else { PickerMode::Prompt };
+                    self.picker_mode = if is_skill {
+                        PickerMode::Skill
+                    } else {
+                        PickerMode::Prompt
+                    };
                     self.picker_results = filtered;
                     self.picker_selection = 0;
                     self.picker_active = true;
@@ -5369,15 +5420,21 @@ impl App {
                 if !self.picker_files_loaded {
                     self.load_picker_files();
                 }
-                self.picker_results =
-                    Self::rank_and_filter(&self.picker_files, &self.picker_query, Self::PICKER_RESULT_CAP);
+                self.picker_results = Self::rank_and_filter(
+                    &self.picker_files,
+                    &self.picker_query,
+                    Self::PICKER_RESULT_CAP,
+                );
             }
             PickerMode::Dir => {
                 if !self.picker_dirs_loaded {
                     self.load_picker_dirs();
                 }
-                self.picker_results =
-                    Self::rank_and_filter(&self.picker_dirs, &self.picker_query, Self::PICKER_RESULT_CAP);
+                self.picker_results = Self::rank_and_filter(
+                    &self.picker_dirs,
+                    &self.picker_query,
+                    Self::PICKER_RESULT_CAP,
+                );
             }
             PickerMode::Skill => {
                 let names: Vec<String> = discover_skills().into_iter().map(|s| s.name).collect();
@@ -5385,8 +5442,7 @@ impl App {
                     Self::rank_and_filter(&names, &self.picker_query, Self::PICKER_RESULT_CAP);
             }
             PickerMode::Prompt => {
-                let names: Vec<String> =
-                    discover_templates().into_iter().map(|t| t.name).collect();
+                let names: Vec<String> = discover_templates().into_iter().map(|t| t.name).collect();
                 self.picker_results =
                     Self::rank_and_filter(&names, &self.picker_query, Self::PICKER_RESULT_CAP);
             }
@@ -5498,7 +5554,8 @@ impl App {
                         if gap == 0 {
                             score -= 2;
                         }
-                    } else if hi == 0 || matches!(h[hi.saturating_sub(1)], '/' | '-' | '_' | '.' | ' ')
+                    } else if hi == 0
+                        || matches!(h[hi.saturating_sub(1)], '/' | '-' | '_' | '.' | ' ')
                     {
                         score -= 3; // start-of-token bonus
                     }
@@ -5521,7 +5578,13 @@ impl App {
     /// `cwd` (negations and complex patterns are not supported).
     fn build_ignore_globset(cwd: &std::path::Path) -> GlobSet {
         let mut builder = GlobSetBuilder::new();
-        for pat in ["**/target/**", "**/node_modules/**", "**/.git/**", "**/__pycache__/**", "**/*.o"] {
+        for pat in [
+            "**/target/**",
+            "**/node_modules/**",
+            "**/.git/**",
+            "**/__pycache__/**",
+            "**/*.o",
+        ] {
             if let Ok(g) = Glob::new(pat) {
                 builder.add(g);
             }
@@ -5545,7 +5608,9 @@ impl App {
                 }
             }
         }
-        builder.build().unwrap_or_else(|_| GlobSetBuilder::new().build().unwrap())
+        builder
+            .build()
+            .unwrap_or_else(|_| GlobSetBuilder::new().build().unwrap())
     }
 
     fn picker_filter_entry(entry: &walkdir::DirEntry) -> bool {
@@ -5646,7 +5711,11 @@ impl App {
                 } else {
                     28
                 },
-                repl_height: if self.tool_output_tabs.len() > 1 { 9 } else { 7 },
+                repl_height: if self.tool_output_tabs.len() > 1 {
+                    9
+                } else {
+                    7
+                },
             },
         );
 
@@ -5664,7 +5733,9 @@ impl App {
                 frame.render_widget(
                     Paragraph::new(Span::styled(
                         format!(" ! {banner}"),
-                        Style::default().fg(self.palette.warn).bg(self.palette.surface0),
+                        Style::default()
+                            .fg(self.palette.warn)
+                            .bg(self.palette.surface0),
                     )),
                     rect,
                 );
@@ -5726,20 +5797,19 @@ impl App {
                     FocusZone::CityBoard
                 };
                 // Optionally split side: City top + Tree drawer bottom when coexist.
-                let (city_area, tree_area) = if self.show_tree_with_city
-                    && self.tree_breadcrumb != "idle"
-                {
-                    let parts = ratatui::layout::Layout::default()
-                        .direction(ratatui::layout::Direction::Vertical)
-                        .constraints([
-                            ratatui::layout::Constraint::Percentage(72),
-                            ratatui::layout::Constraint::Percentage(28),
-                        ])
-                        .split(side);
-                    (parts[0], Some(parts[1]))
-                } else {
-                    (side, None)
-                };
+                let (city_area, tree_area) =
+                    if self.show_tree_with_city && self.tree_breadcrumb != "idle" {
+                        let parts = ratatui::layout::Layout::default()
+                            .direction(ratatui::layout::Direction::Vertical)
+                            .constraints([
+                                ratatui::layout::Constraint::Percentage(72),
+                                ratatui::layout::Constraint::Percentage(28),
+                            ])
+                            .split(side);
+                        (parts[0], Some(parts[1]))
+                    } else {
+                        (side, None)
+                    };
                 fleet_panel::render_city_panel(
                     frame,
                     city_area,
@@ -5760,7 +5830,8 @@ impl App {
                 if let Some(tree_area) = tree_area {
                     self.render_tree_panel(frame, tree_area);
                 }
-            } else if self.show_timeline_panel || self.side_mode == SidePanelMode::Timeline {            } else if self.show_timeline_panel || self.side_mode == SidePanelMode::Timeline {
+            } else if self.show_timeline_panel || self.side_mode == SidePanelMode::Timeline {
+            } else if self.show_timeline_panel || self.side_mode == SidePanelMode::Timeline {
                 self.render_timeline_panel(frame, side);
             } else {
                 self.render_tree_panel(frame, side);
@@ -5809,7 +5880,9 @@ impl App {
             settings::render_settings(frame, area, st, &self.palette);
         }
         if self.palette_open {
-            let height = (self.palette_items.len() as u16).clamp(3, 12).saturating_add(2);
+            let height = (self.palette_items.len() as u16)
+                .clamp(3, 12)
+                .saturating_add(2);
             let prect = widgets::centered_rect(area, 56, height);
             help::render_palette_list(
                 frame,
@@ -5970,20 +6043,18 @@ impl App {
             })
             .unwrap_or_default();
 
-        let line = status::render_footer_line(
-            &hints,
-            &self.status,
-            &spinner,
-            status_color,
-            &self.palette,
-        );
+        let line =
+            status::render_footer_line(&hints, &self.status, &spinner, status_color, &self.palette);
         frame.render_widget(Paragraph::new(line), area);
     }
 
     fn render_tree_panel(&mut self, frame: &mut Frame, area: Rect) {
         let max_w = (area.width as usize).saturating_sub(4).max(8);
         let mut lines: Vec<Line> = Vec::new();
-        lines.push(tree_view::turn_bar_line(&self.tree_breadcrumb, &self.palette));
+        lines.push(tree_view::turn_bar_line(
+            &self.tree_breadcrumb,
+            &self.palette,
+        ));
         lines.push(Line::from(Span::styled(
             format!(
                 " [{}|{}] ",
@@ -6005,11 +6076,8 @@ impl App {
             max_w,
             None,
         ));
-        let panel = Paragraph::new(lines).block(widgets::panel_block(
-            "Call Tree",
-            &self.palette,
-            true,
-        ));
+        let panel =
+            Paragraph::new(lines).block(widgets::panel_block("Call Tree", &self.palette, true));
         frame.render_widget(panel, area);
     }
 
@@ -6029,9 +6097,17 @@ impl App {
                 .iter()
                 .enumerate()
                 .map(|(i, (idx, summary))| {
-                    let marker = if i == self.timeline_selection { "›" } else { " " };
+                    let marker = if i == self.timeline_selection {
+                        "›"
+                    } else {
+                        " "
+                    };
                     let line = format!("{marker} @{idx} {summary}");
-                    let st = if i == self.timeline_selection { sel } else { style };
+                    let st = if i == self.timeline_selection {
+                        sel
+                    } else {
+                        style
+                    };
                     ListItem::new(Line::from(Span::styled(line, st)))
                 })
                 .collect()
@@ -6105,12 +6181,7 @@ impl App {
             .bg(self.palette.panel_bg);
         let lines: Vec<Line> = all_lines[start..]
             .iter()
-            .map(|l| {
-                Line::from(Span::styled(
-                    Self::clip_console_line(l, inner_w),
-                    style,
-                ))
-            })
+            .map(|l| Line::from(Span::styled(Self::clip_console_line(l, inner_w), style)))
             .collect();
 
         // Tab hit targets on the title row (approx).
@@ -6126,8 +6197,11 @@ impl App {
         let panel = Paragraph::new(lines)
             .style(Style::default().bg(self.palette.panel_bg))
             .block(
-                widgets::panel_block(&title, &self.palette, true)
-                    .style(Style::default().bg(self.palette.panel_bg).fg(self.palette.text)),
+                widgets::panel_block(&title, &self.palette, true).style(
+                    Style::default()
+                        .bg(self.palette.panel_bg)
+                        .fg(self.palette.text),
+                ),
             );
         frame.render_widget(panel, area);
     }
@@ -6149,7 +6223,9 @@ impl App {
             } else {
                 let mut i = 0;
                 while i < span_chars.len() {
-                    let take = max_width.saturating_sub(current_chars).min(span_chars.len() - i);
+                    let take = max_width
+                        .saturating_sub(current_chars)
+                        .min(span_chars.len() - i);
                     let segment: String = span_chars[i..i + take].iter().collect();
                     current_spans.push(Span::styled(segment, span.style.clone()));
                     current_chars += take;
@@ -6191,9 +6267,7 @@ impl App {
                     Span::styled(format!("{rail} "), rail_style),
                     Span::styled(
                         format!("{label} "),
-                        Style::default()
-                            .fg(color)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
                     ),
                 ]));
             }
@@ -6208,7 +6282,10 @@ impl App {
                         let line_idx = lines.len();
                         self.thinking_targets.push((line_idx, msg_idx));
                         let header = Line::from(vec![
-                            Span::styled("│ ".to_string(), Style::default().fg(self.palette.overlay0)),
+                            Span::styled(
+                                "│ ".to_string(),
+                                Style::default().fg(self.palette.overlay0),
+                            ),
                             Span::styled("thinking · click to hide".to_string(), think_style),
                         ]);
                         lines.extend(Self::wrap_line(&header, max_width));
@@ -6234,7 +6311,10 @@ impl App {
                         let preview_budget = max_width.saturating_sub(14).max(8);
                         let preview: String = thinking.chars().take(preview_budget).collect();
                         let header = Line::from(vec![
-                            Span::styled("│ ".to_string(), Style::default().fg(self.palette.overlay0)),
+                            Span::styled(
+                                "│ ".to_string(),
+                                Style::default().fg(self.palette.overlay0),
+                            ),
                             Span::styled(format!("💭 {preview}"), clickable),
                         ]);
                         lines.extend(Self::wrap_line(&header, max_width));
@@ -6255,19 +6335,16 @@ impl App {
                     let line_idx = lines.len();
                     self.tool_targets.push((line_idx, msg_idx, tool_idx));
                     let header = Line::from(vec![
-                        Span::styled(format!("{icon} "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
                         Span::styled(
-                            format!("{} · collapse", block.name),
-                            header_style,
+                            format!("{icon} "),
+                            Style::default().fg(color).add_modifier(Modifier::BOLD),
                         ),
+                        Span::styled(format!("{} · collapse", block.name), header_style),
                     ]);
                     lines.extend(Self::wrap_line(&header, max_width));
                     for raw_line in render_markdown(&block.full, syn, md) {
                         // Keep syntax highlight (don't wipe to muted).
-                        let mut styled = vec![Span::styled(
-                            "  ",
-                            Style::default(),
-                        )];
+                        let mut styled = vec![Span::styled("  ", Style::default())];
                         if block.is_error {
                             for span in raw_line.spans {
                                 styled.push(Span::styled(
@@ -6299,9 +6376,7 @@ impl App {
                         ),
                         Span::styled(
                             format!("{}  ", block.name),
-                            Style::default()
-                                .fg(color)
-                                .add_modifier(Modifier::BOLD),
+                            Style::default().fg(color).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
                             format!("{preview}{suffix}"),
@@ -6317,15 +6392,11 @@ impl App {
                 for (i, raw_line) in rendered.into_iter().enumerate() {
                     let mut line = raw_line;
                     if i == 0 && msg.role == "assistant" {
-                        line.spans.insert(
-                            0,
-                            Span::styled(format!("{rail} "), rail_style),
-                        );
+                        line.spans
+                            .insert(0, Span::styled(format!("{rail} "), rail_style));
                     } else if msg.role == "user" || msg.role == "system" {
-                        line.spans.insert(
-                            0,
-                            Span::styled(format!("{rail} "), rail_style),
-                        );
+                        line.spans
+                            .insert(0, Span::styled(format!("{rail} "), rail_style));
                     }
                     lines.extend(Self::wrap_line(&line, max_width));
                 }
@@ -6336,10 +6407,7 @@ impl App {
             {
                 lines.push(Line::from(vec![
                     Span::styled(format!("{rail} "), rail_style),
-                    Span::styled(
-                        "…".to_string(),
-                        Style::default().fg(self.palette.overlay0),
-                    ),
+                    Span::styled("…".to_string(), Style::default().fg(self.palette.overlay0)),
                 ]));
             }
 
@@ -6573,7 +6641,11 @@ impl App {
         if lines.len() > max_lines {
             let dropped = lines.len() - max_lines;
             lines.truncate(max_lines);
-            lines.push(format!("… ({} more line{})", dropped, if dropped == 1 { "" } else { "s" }));
+            lines.push(format!(
+                "… ({} more line{})",
+                dropped,
+                if dropped == 1 { "" } else { "s" }
+            ));
         }
         lines
     }
@@ -6600,7 +6672,9 @@ impl App {
             CityOverlay::ConfirmDelete { target } => {
                 let msg = match target {
                     CityDeleteTarget::Worker { seat } => {
-                        format!("DELETE seat `{seat}`?\nStops process, removes logs/status/profile.")
+                        format!(
+                            "DELETE seat `{seat}`?\nStops process, removes logs/status/profile."
+                        )
                     }
                     CityDeleteTarget::Bead { id, title } => {
                         format!("DELETE bead `{id}`?\n{title}")
@@ -6727,14 +6801,7 @@ impl App {
 
         let prompt_height = (text.len() as u16 + 2).min(area.height.saturating_sub(4).max(3));
         let prompt_area = widgets::centered_rect(area, 90, prompt_height);
-        widgets::render_modal_shell(
-            frame,
-            prompt_area,
-            title,
-            border_color,
-            &self.palette,
-            text,
-        );
+        widgets::render_modal_shell(frame, prompt_area, title, border_color, &self.palette, text);
     }
 
     fn handle_question_key(&mut self, key: crossterm::event::KeyEvent) {
@@ -6781,14 +6848,12 @@ impl App {
             None => return,
         };
 
-        let mut text = vec![
-            Line::from(Span::styled(
-                format!(" {}", pending.request.question),
-                Style::default()
-                    .fg(self.palette.text)
-                    .add_modifier(Modifier::BOLD),
-            )),
-        ];
+        let mut text = vec![Line::from(Span::styled(
+            format!(" {}", pending.request.question),
+            Style::default()
+                .fg(self.palette.text)
+                .add_modifier(Modifier::BOLD),
+        ))];
         if !pending.request.options.is_empty() {
             text.push(Line::from(""));
             for (i, opt) in pending.request.options.iter().enumerate() {
@@ -6800,10 +6865,7 @@ impl App {
                             .bg(self.palette.accent)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(
-                        format!(" {opt}"),
-                        Style::default().fg(self.palette.subtext),
-                    ),
+                    Span::styled(format!(" {opt}"), Style::default().fg(self.palette.subtext)),
                 ]));
             }
         }

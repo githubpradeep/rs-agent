@@ -49,7 +49,9 @@ dest="${INSTALL_DIR}/rs-agent"
 echo "Downloading ${artifact}..."
 if ! curl -fsSL "$url" -o "$dest"; then
   echo "error: failed to download ${url}" >&2
-  echo "       Check that a release exists and the artifact name matches your platform." >&2
+  echo "       No GitHub release for this tag/platform yet (need a v* tag)." >&2
+  echo "       Build from source:" >&2
+  echo "         git clone https://github.com/${REPO}.git && cd rs-agent && cargo install --path . --locked" >&2
   exit 1
 fi
 

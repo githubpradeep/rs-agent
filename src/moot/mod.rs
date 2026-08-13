@@ -31,9 +31,7 @@ fn moot_dir() -> PathBuf {
 }
 
 fn now_str() -> String {
-    chrono::Local::now()
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string()
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 fn ensure_dir() -> Result<(), String> {

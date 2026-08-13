@@ -215,6 +215,7 @@ pub fn handle_request(req: &ApiRequest) -> ApiResponse {
                     .map(|s| s.to_string()),
                 approve: true,
                 fail_fast: false,
+                shared_worktree: false,
             };
             match crate::fleet::fleet_up(opts) {
                 Ok(msg) => ApiResponse::ok(id, serde_json::json!({ "report": msg })),
@@ -222,11 +223,15 @@ pub fn handle_request(req: &ApiRequest) -> ApiResponse {
             }
         }
         "fleet.down" => {
-            let seats = req.params.get("seats").and_then(|v| v.as_array()).map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect::<Vec<_>>()
-            });
+            let seats = req
+                .params
+                .get("seats")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<_>>()
+                });
             let msg = crate::fleet::fleet_down(seats);
             ApiResponse::ok(id, serde_json::json!({ "report": msg }))
         }

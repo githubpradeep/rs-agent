@@ -19,9 +19,7 @@ pub struct Laurel {
 impl Laurel {
     pub fn new(text: String, seat: Option<String>) -> Self {
         Self {
-            written_at: chrono::Local::now()
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string(),
+            written_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             text,
             seat,
         }

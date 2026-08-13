@@ -130,9 +130,7 @@ impl GoalState {
             s.push_str("\nStatus: PAUSED — do not continue autonomously until the user resumes.");
         }
         if let Some(ref reason) = self.last_reason {
-            s.push_str(&format!(
-                "\nMost recent evaluator note: {reason}"
-            ));
+            s.push_str(&format!("\nMost recent evaluator note: {reason}"));
         }
         Some(s)
     }
@@ -363,10 +361,7 @@ pub fn format_transcript_for_evaluator(
     parts.reverse();
     let mut out = parts.join("\n");
     if out.chars().count() > max_chars {
-        let keep: String = out
-            .chars()
-            .skip(out.chars().count() - max_chars)
-            .collect();
+        let keep: String = out.chars().skip(out.chars().count() - max_chars).collect();
         out = format!("…[truncated]\n{keep}");
     }
     out

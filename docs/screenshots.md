@@ -1,6 +1,16 @@
 # TUI screenshot checklist
 
-Reference steal UI surfaces to capture after Waves 1–5:
+Product shots for README (`docs/img/` — capture locally; not required for CI):
+
+| File | How | Must show |
+|------|-----|-----------|
+| `docs/img/tree.png` | Deep Context mid-turn, `/tree` | `[D]` + call tree, not the whole log in chat |
+| `docs/img/idle.png` | fresh TUI | Opener: overnight factory + Deep Context |
+| `docs/img/cockpit.png` | `c` then follow a worker | wish composer + worker heartbeat (optional) |
+
+Record the 90s talk track in [`demo.md`](demo.md). Until PNGs exist, README uses the ASCII `/tree` sample.
+
+Other surfaces (after Waves 1–5):
 
 | Shot | How | What to show |
 |------|-----|----------------|
@@ -9,10 +19,8 @@ Reference steal UI surfaces to capture after Waves 1–5:
 | Help | `?` in normal mode | Filterable keymap overlay |
 | Settings | `/settings` | Theme / mouse / toast / notify tabs |
 | Palette | `Ctrl+K` | Fuzzy slash command list |
-| City cockpit | `c` | wish composer + workers/flow + inspector |
-| City follow | Enter worker · `f` | Log in inspector; chat stays clean |
-| City + tree | Deep Context mid-turn | Tree drawer under City |
+| Workers cockpit | `c` | wish composer + workers/flow + inspector |
+| Follow | Enter worker · `f` | Log in inspector; chat stays clean |
+| Cockpit + tree | Deep Context mid-turn | Tree drawer under cockpit |
 | Call tree | `/tree` mid-turn | TurnBar + Tree\|Timeline |
 | Theme auto | `theme = "auto"` | Host light/dark via `COLORFGBG` |
-
-Store PNGs under `docs/img/` when ready (not required for CI).

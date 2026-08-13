@@ -69,7 +69,10 @@ impl AgentTool for GrepTool {
         let output = match cmd.output().await {
             Ok(o) => o,
             Err(e) => {
-                return ToolExecuteResult::error(format!("Failed to run rg: {}. Is ripgrep installed?", e));
+                return ToolExecuteResult::error(format!(
+                    "Failed to run rg: {}. Is ripgrep installed?",
+                    e
+                ));
             }
         };
 
@@ -85,7 +88,11 @@ impl AgentTool for GrepTool {
 
         if stdout.len() > 10000 {
             let truncated = stdout.chars().take(10000).collect::<String>();
-            ToolExecuteResult::ok(format!("{}\n... (truncated, {} total chars)", truncated, stdout.len()))
+            ToolExecuteResult::ok(format!(
+                "{}\n... (truncated, {} total chars)",
+                truncated,
+                stdout.len()
+            ))
         } else {
             ToolExecuteResult::ok(stdout.to_string())
         }

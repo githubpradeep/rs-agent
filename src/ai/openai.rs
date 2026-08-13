@@ -60,7 +60,9 @@ fn convert_message_with_opts(msg: &Message, opts: ConvertOpts) -> serde_json::Va
             });
         }
         Role::Assistant => {
-            let text_parts: Vec<&str> = msg.content.iter()
+            let text_parts: Vec<&str> = msg
+                .content
+                .iter()
                 .filter(|c| c.content_type == ContentType::Text)
                 .filter_map(|c| c.text.as_deref())
                 .collect();
@@ -112,7 +114,9 @@ fn convert_message_with_opts(msg: &Message, opts: ConvertOpts) -> serde_json::Va
             return result;
         }
         _ => {
-            let text = msg.content.iter()
+            let text = msg
+                .content
+                .iter()
                 .filter(|c| c.content_type == ContentType::Text)
                 .filter_map(|c| c.text.as_deref())
                 .collect::<Vec<_>>()
@@ -248,11 +252,7 @@ impl Provider for OpenAIProvider {
         parse_openai_response(data)
     }
 
-    async fn chat_stream(
-        &self,
-        api_key: &str,
-        request: ChatRequest,
-    ) -> ProviderResult<BoxStream> {
+    async fn chat_stream(&self, api_key: &str, request: ChatRequest) -> ProviderResult<BoxStream> {
         let client = Client::builder()
             .timeout(Duration::from_secs(300))
             .build()
@@ -420,7 +420,8 @@ fn parse_openai_response(data: serde_json::Value) -> ProviderResult<AssistantMes
         for tc in tool_calls {
             let id = tc["id"].as_str().unwrap_or("").to_string();
             let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
-            let arguments = get_arguments(&tc["function"]["arguments"]).unwrap_or_else(|| "{}".to_string());
+            let arguments =
+                get_arguments(&tc["function"]["arguments"]).unwrap_or_else(|| "{}".to_string());
             let input: serde_json::Value =
                 serde_json::from_str(&arguments).unwrap_or(serde_json::Value::Null);
 
@@ -460,7 +461,11 @@ fn parse_openai_response(data: serde_json::Value) -> ProviderResult<AssistantMes
 fn get_arguments(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(s) => {
-            if s.is_empty() { None } else { Some(s.clone()) }
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.clone())
+            }
         }
         serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
             Some(serde_json::to_string(value).unwrap_or_default())
@@ -484,7 +489,10 @@ fn parse_openai_stream_line(line: &str) -> Option<StreamDelta> {
     let choices = value["choices"].as_array()?;
     let choice = choices.first()?;
 
-    if choice["finish_reason"].as_str().is_some_and(|r| !r.is_empty()) {
+    if choice["finish_reason"]
+        .as_str()
+        .is_some_and(|r| !r.is_empty())
+    {
         let reason = match choice["finish_reason"].as_str() {
             Some("stop") => Some(StopReason::EndTurn),
             Some("tool_calls") => Some(StopReason::ToolUse),
@@ -519,9 +527,7 @@ fn parse_openai_stream_line(line: &str) -> Option<StreamDelta> {
                 if !args.is_empty() {
                     return Some(StreamDelta {
                         content_index: index,
-                        r#type: DeltaType::ToolCallDelta {
-                            input: args,
-                        },
+                        r#type: DeltaType::ToolCallDelta { input: args },
                     });
                 }
             }

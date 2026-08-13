@@ -13,11 +13,7 @@ pub trait AgentTool: Send + Sync {
     fn requires_permission(&self) -> bool {
         false
     }
-    async fn execute(
-        &self,
-        tool_call_id: &str,
-        args: Value,
-    ) -> ToolExecuteResult;
+    async fn execute(&self, tool_call_id: &str, args: Value) -> ToolExecuteResult;
 }
 
 #[derive(Debug, Clone, PartialEq)]

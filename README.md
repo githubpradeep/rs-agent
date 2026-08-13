@@ -1,37 +1,40 @@
 # rs-agent
 
-**Your everyday coding agent — with Deep Context.**  
-A Rust TUI for the work you already do (edit, bash, search, sessions, skills), plus a
-persistent-REPL core so big context doesn’t blow the window when the task gets hard.
+**A local overnight coding factory.**  
+Leave a backlog; cheaper workers implement; you review in the morning. Deep
+Context keeps huge logs and repos *out* of the model window.
 
-## Why rs-agent
+**One line:** You close the laptop. Work continues. Big context never blows the window.
 
-- **Built for daily coding.** Same loop you expect from a modern terminal agent: read / edit /
-  write / bash / grep / find / web tools, vim-flavored TUI, streaming, permissions, sessions,
-  `/model` + `/provider`, skills and prompt templates.
-- **Better when context gets big (the USP).** Deep Context keeps large docs, repos, and diffs in a
-  persistent Python REPL *outside* the model window. The agent peeks and slices in code, then
-  calls `llm_query` / `agent_query` as a **tree** — parents only see summaries, not full
-  subtree dumps. Inspired by [Recursive Language Models](https://arxiv.org/abs/2512.24601).
-  Everyday tasks stay flat and fast; hard context tasks escalate into the tree without you
-  changing tools. Huge `read`s auto-escalate (`[rlm_escalate]` → `repl`). Status bar shows `[D]`
-  and `/tree` opens automatically while Deep Context runs.
-- **Skills.** Drop a markdown file with frontmatter into `skills/` or `~/.rs-agent/skills/` and
-  the agent picks up a new reusable workflow — optional `tools:` allow-list (Skills 2.0). See
-  [`docs/skills.md`](docs/skills.md). Hooks: [`docs/hooks.md`](docs/hooks.md).
+Daily edit/bash/search is the on-ramp (vim-flavored TUI, sessions, skills,
+`/model`). The product is unattended implement-and-review on your machine — not
+another chat sidebar.
 
-**One line:** Everyday coding agent with Deep Context — load 100KB of source once, query it 100
-times, never hit a limit.
+## Why this, not another coding agent
+
+- **Overnight, not just a session.** `wish` → ready queue (beads) → `fleet up`
+  workers with leases → review in the morning. Crash recovery so a dropped
+  provider stream does not wedge the graph. See [`docs/overnight.md`](docs/overnight.md).
+- **Deep Context when the file is too big.** Large docs stay in a persistent
+  Python REPL. The agent peeks and slices, then `llm_query` / `agent_query` as a
+  **tree** — parents see summaries, not subtree dumps. Huge `read`s auto-escalate
+  (`[rlm_escalate]` → `repl`). Status `[D]`; `/tree` opens while it runs.
+  Inspired by [Recursive Language Models](https://arxiv.org/abs/2512.24601).
+- **Same daily loop you already know.** read / edit / write / bash / grep / find /
+  web, permissions, skills. Drop markdown in `skills/` or `~/.rs-agent/skills/`
+  ([`docs/skills.md`](docs/skills.md)).
+
+**Trust:** workers run YOLO; `repl` is unsandboxed `python3`. Read
+[`docs/trust.md`](docs/trust.md) before `-a` or `fleet up`.
+
+Operator cockpit (wish → spawn → follow): [`docs/overnight.md`](docs/overnight.md).
+Standing roles and the full office map: [`docs/city-ops.md`](docs/city-ops.md).
 
 ## Quickstart (Anthropic)
 
-Install a prebuilt binary:
+Requirements: a stable Rust toolchain and `python3` on `PATH` (Deep Context `repl`).
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/githubpradeep/rs-agent/main/scripts/install.sh | bash
-```
-
-Or build from source:
+**Build from source** (works today):
 
 ```sh
 git clone https://github.com/githubpradeep/rs-agent.git
@@ -40,32 +43,83 @@ export ANTHROPIC_API_KEY=sk-ant-...
 cargo run --release -- --provider anthropic
 ```
 
+Prebuilt install (macOS Apple Silicon / Linux x86_64) **after a `v*` GitHub
+release exists**:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/githubpradeep/rs-agent/main/scripts/install.sh | bash
+```
+
+Until [releases](https://github.com/githubpradeep/rs-agent/releases) list a tag,
+that curl line will 404 — use source.
+
+### Day-1 path
+
+```text
+rs-agent          # TUI
+c                 # cockpit: wish composer + workers
+type a wish ↵     # becomes a design/task bead
+u                 # spawn workers (or: rs-agent -a fleet up --seats Fleet-1,Fleet-2)
+select a worker   # follow logs; steer if needed
+```
+
+Morning: `/beads ready` and review closed notes. Soft goals like “keep
+implementing…” will **not** finish while ready/open beads remain. Prefer
+`/goal no open beads`.
+
+### Demos
+
+```sh
+# Deep Context — realistic outage log (~180KB). See docs/demo.md
+./scripts/demo-deep-context.sh --provider anthropic
+# Interactive (best for recording): ./scripts/demo-deep-context.sh --tui
+
+# Overnight (same project cwd; YOLO)
+cargo run --release -- -a --provider anthropic -- wish "summarize the outage demo" --auto
+cargo run --release -- -a fleet up --seats Fleet-1 --budget-minutes 30
+```
+
 One-shot / scripting:
 
 ```sh
-# One-shot prompt, plain text output
 cargo run --release -- --provider anthropic -p "summarize example/rlm_long_doc.md via repl"
-
-# One-shot prompt, JSON event stream (for scripting/tooling)
 cargo run --release -- --provider anthropic --mode json -p "list files with ls"
-
-# Deep Context demo — realistic outage log (~180KB). See docs/demo.md
-./scripts/demo-deep-context.sh --provider anthropic
-# Interactive (best for recording): ./scripts/demo-deep-context.sh --tui
 ```
 
-Requirements: a stable Rust toolchain and `python3` on `PATH` (used by the Deep Context `repl` tool).
+Talk track and recording checklist: [`docs/demo.md`](docs/demo.md).
+
+## Overnight (short)
+
+```bash
+# Intake
+rs-agent wish "add tests for the parser" --auto
+
+# Night — YOLO, named seats, wall-clock budget
+rs-agent -a fleet up --seats Fleet-1,Fleet-2 --budget-minutes 480
+
+# Morning
+rs-agent          # TUI: c  then inspect workers / /beads ready
+rs-agent fleet down
+```
+
+Pipeline: `design` → close spawns `implement` → close spawns `review`
+(`bead fail` reopens implement; `bead land` after a passed review).
+
+Two fleet seats no longer share one dirty checkout: `fleet up` uses a git
+worktree per seat (`.rs-agent/worktrees/`). Pass `--shared-worktree` to opt
+out. Details: [`docs/overnight.md`](docs/overnight.md),
+[`docs/trust.md`](docs/trust.md).
 
 ## Configuration
 
-Today, rs-agent reads layered config from `~/.rs-agent/config.toml` (user) plus
-`.rs-agent/settings.toml` / `.rs-agent.toml` (project overrides). CLI flags always win.
+Layered config: `~/.rs-agent/config.toml` (user) plus `.rs-agent/settings.toml` /
+`.rs-agent.toml` (project). CLI flags always win.
 
 ```toml
 # ~/.rs-agent/config.toml
 provider = "anthropic"
 model = "claude-sonnet-4-20250514"
-approve = true
+approve = true          # YOLO — see docs/trust.md
 auto_mode = false
 rlm_depth = 2
 rlm_escalate_chars = 10000   # auto Deep Context escalate on huge reads
@@ -93,63 +147,37 @@ smart = "claude-opus-4-20250514"
 # perm_deny = "d"
 ```
 
-State that's already live under `~/.rs-agent/`:
+State under `~/.rs-agent/`:
 
 | Path | Purpose |
 |------|---------|
 | `~/.rs-agent/sessions/` | Saved session transcripts (`--resume <id>` / `--list-sessions`) |
 | `~/.rs-agent/trust.json` | Per-project "always allow" tool-permission store |
 | `~/.rs-agent/AGENTS.md` | Global instructions merged into every system prompt |
-| `~/.rs-agent/skills/` | User-global skills (see below) |
+| `~/.rs-agent/skills/` | User-global skills |
 | `~/.rs-agent/seats/` | Named seats (persistent agent identity + diary) |
+| `~/.rs-agent/secrets.toml` | Pasted API keys from `/login` |
 
-Project-local `AGENTS.md` / `CLAUDE.md` (walked up from cwd) and `.rs-agent/commands/*.md` are
-also discovered automatically and merged into the system prompt unless `--no-context-files` is
-passed. Project work graph: `.rs-agent/beads.json`. Laurels: `.rs-agent/laurels.jsonl`.
-Project brain: `brain/*.md` + `brain/facts.jsonl`. Worker status: `.rs-agent/worker-status.json`.
-
-## Long-run & continuity
-
-| Command / tool | Purpose |
-|----------------|---------|
-| `/goal <condition>` | Auto-continue until the condition holds (tool-using verify when `goal_verify = true`) |
-| `/handoff` + `handoff` tool | Consenting handoff — agent writes notes for the next wake |
-| `/seat <name>` | Bind a persistent named seat (role, pronouns, diary) |
-| `/beads` / `/beads ready` / `bead` tool | Work graph with deps, leases, ready queue |
-| `/worker` | Read last headless worker status (`.rs-agent/worker-status.json`) |
-| `/marshal` / `/fleet` | Reclaim stale leases + backlog / lease holders |
-| `/brain` / `/brain remember` | Project doctrine (`brain/*.md`) + short facts |
-| `/laurel <text>` | Recognition only — injected on wake, no work attached |
-| `escalate` tool | Pause `/goal` and ask for a human |
-| `task` `profile=` | `plan` \| `implement` \| `verify` sub-agent defaults |
-| `rs-agent worker --loop` | Overnight factory: claim → implement → close |
-| `rs-agent marshal --once` | Reclaim stale leases + print fleet backlog |
-
-Pipeline bead kinds: `design` → `implement` → `review` (close advances; `bead fail` reopens implement; `bead land` checks review). Soft goals like “keep implementing…” will **not** achieve while ready/open beads remain. Prefer `/goal no open beads` for a hard stop.
-
-See [`docs/overnight.md`](docs/overnight.md) for the overnight worker, fleet seats, marshal, brain wake pack, and crash recovery.
-See [`docs/hooks.md`](docs/hooks.md) for `before_goal_continue`, `before_bead_close`, `on_goal_achieved`, and `before_handoff`.
+Project-local `AGENTS.md` / `CLAUDE.md` (walked up from cwd) and
+`.rs-agent/commands/*.md` are merged into the system prompt unless
+`--no-context-files`. Work graph: `.rs-agent/beads.json`. Fleet:
+`.rs-agent/fleet/`. More paths: [`docs/overnight.md`](docs/overnight.md).
 
 ## Skills
 
-A skill is a markdown file (optionally with YAML frontmatter: `name`, `description`, `triggers`)
-that teaches the agent a specific workflow — debugging, PR review, writing a commit message, the
-Deep Context long-doc pattern, etc. Drop one in:
+A skill is a markdown file (optionally with YAML frontmatter: `name`,
+`description`, `triggers`) that teaches a workflow. Drop one in:
 
-- `~/.rs-agent/skills/*.md` — available in every project
-- `.rs-agent/skills/*.md` — project-local, shared via your repo
-- `skills/*.md` at a repo root — shipped alongside a project (this repo ships a handful of
-  starter skills this way)
-
-Then, in the TUI:
+- `~/.rs-agent/skills/*.md` — every project
+- `.rs-agent/skills/*.md` — project-local
+- `skills/*.md` at a repo root — this repo ships a few starters
 
 ```
-/skills            # list discovered skills
-/skill pr-review   # inject a skill's instructions into the conversation
+/skills            # list
+/skill pr-review   # inject into the conversation
 ```
 
-**Status:** discovery, frontmatter parsing, and TUI `/skills` / `/skill <name>` are live. See
-[`docs/skills.md`](docs/skills.md) for the full authoring guide.
+Authoring: [`docs/skills.md`](docs/skills.md). Hooks: [`docs/hooks.md`](docs/hooks.md).
 
 ## TUI
 
@@ -160,45 +188,38 @@ cargo run --release -- --provider anthropic
 | Key | Mode | Action |
 |-----|------|--------|
 | `i` | Normal | Enter insert mode |
+| `c` | Normal | Cockpit (wish / workers / follow) |
 | `Esc` | Insert (idle) | Back to normal mode |
 | `Esc` | Waiting (agent running) | **Abort** the current turn |
-| `Enter` | Waiting (agent running) | **Steer** — queue a follow-up message for the next turn |
+| `Enter` | Waiting (agent running) | **Steer** — queue a follow-up for the next turn |
 | `Enter` | Insert | Submit message / run a `/command` |
-| `@` | Insert | Open fuzzy file picker; `↑`/`↓` navigate, `Enter`/`Tab` select, `Esc` cancel |
-| `↑` `↓` | Insert | Cycle input history (older/newer submitted messages) |
+| `@` | Insert | Fuzzy file picker |
+| `↑` `↓` | Insert | Cycle input history |
 | `↑` `↓` `PgUp` `PgDn` | Normal | Scroll chat history |
-| `t` | Normal | Toggle the most recent assistant message's thinking trace |
-| `e` | Normal | Toggle the most recent tool result block open/closed |
-| `G` | Normal | Jump to the bottom of chat (resume auto-follow) |
-| click 💭 | Any | Toggle a message's thinking trace open/closed |
-| click ⚙/⚠ | Any | Toggle a tool result block open/closed |
-| `a` / `Enter` | Permission prompt | Allow this tool call once |
-| `t` | Permission prompt | Trust this project (auto-allow here going forward) |
+| `t` | Normal | Toggle thinking trace |
+| `e` | Normal | Toggle last tool result |
+| `G` | Normal | Jump to bottom |
+| `a` / `Enter` | Permission prompt | Allow once |
+| `t` | Permission prompt | Trust this project |
 | `d` / `Esc` | Permission prompt | Deny |
-| `^P` | Any | Cycle provider/model (ready providers with credentials) |
+| `^P` | Any | Cycle provider/model |
 | `^C` | Any | Quit |
 
-Slash commands (type in insert mode, `Enter` to run):
+Day-1 slash commands:
 
 | Command | Description |
 |---------|--------------|
-| `/help` | List available commands and key hints |
-| `/compact` | Summarize/compact the conversation to free context |
-| `/new` | Start a new session |
-| `/model [provider/model\|alias]` | Interactive cross-provider picker, or switch mid-session (pi-style) |
-| `/provider [name]` / `/login` | Provider menu: switch ready providers, or open signup URL + paste API key (`~/.rs-agent/secrets.toml`) |
-| `/tree` | Toggle the Deep Context call-tree side panel |
-| `/timeline` | Toggle API-message timeline; Enter forks at `@N` ([`docs/timeline.md`](docs/timeline.md)) |
-| `/fork [@N] [label]` | Fork session (optionally truncated at API index N) |
-| `/image <path>` | Queue Kitty-protocol image display |
-| `/lsp start\|stop\|status` | Minimal diagnostics via rust-analyzer ([`docs/lsp.md`](docs/lsp.md)) |
-| `/skill-pack export\|import` | Zip share/import for skills |
-| `/skills`, `/skill <name>` | List / inject a skill |
-| `/prompt` `/p <name> [args]` | Fill a prompt template into the input |
-| `/mode plan\|ask\|agent` | Switch tool permissions (read-only / no tools / full) |
-| `/keys` `/clear` `/context` `/sessions` `/export [md\|json\|html]` `/trust` | UX helpers (see `/help`) |
+| `/help` | Commands and key hints |
+| `/wish <text>` | Intake a wish as a bead |
+| `/city` / `/fleet` | Cockpit (workers, follow, spawn) |
+| `/beads` / `/beads ready` | Work graph |
+| `/tree` | Deep Context call tree |
+| `/model` `/provider` `/login` | Switch model or paste a key |
+| `/compact` `/new` `/fork` | Session hygiene |
+| `/mode plan\|ask\|agent` | Tool permissions |
 
-Full reference: [`docs/keymap.md`](docs/keymap.md).
+Full keymap: [`docs/keymap.md`](docs/keymap.md). Screenshot checklist:
+[`docs/screenshots.md`](docs/screenshots.md) (`docs/img/` after you capture).
 
 ### CLI options
 
@@ -206,25 +227,27 @@ Full reference: [`docs/keymap.md`](docs/keymap.md).
 |------|-------------|
 | `--provider` | `anthropic` (recommended), `openai`, `opencode`, `opencode-cli` (experimental), `bedrock` |
 | `--model` | Model override |
-| `--rlm-depth` | Max Deep Context recursion depth, root → child → leaf (default 2) |
-| `--rlm-escalate-chars` | Char threshold for auto Deep Context escalate on huge reads (default 10000) |
+| `--rlm-depth` | Max Deep Context recursion depth (default 2) |
+| `--rlm-escalate-chars` | Auto Deep Context escalate threshold (default 10000) |
 | `--thinking-budget` | Extended-thinking token budget (Anthropic); `0` disables |
-| `--mode` | Output mode for `-p`: `text` (default) or `json` |
+| `--mode` | `-p` output: `text` (default) or `json` |
 | `-p, --prompt` | One-shot prompt (non-interactive) |
-| `-a, --approve` | **YOLO mode.** Skip permission prompts entirely — every tool call auto-executes. Use with care. |
-| `--auto-mode` | Lighter YOLO: auto-approve only read-only tools (`read`/`grep`/`ls`/`find`/`webfetch`/`websearch`); everything else still prompts |
+| `-a, --approve` | **YOLO.** Skip permission prompts. See [`docs/trust.md`](docs/trust.md). |
+| `--auto-mode` | Auto-approve read-only tools only |
 | `-r, --resume <id>` | Resume a saved session |
 | `--list-sessions` | List saved sessions and exit |
-| `--list-models` | List models available for the chosen provider and exit |
+| `--list-models` | List models for the provider and exit |
 | `--no-context-files` | Skip `AGENTS.md`/`CLAUDE.md`/project-command discovery |
-| `--system-prompt` | Override the default system prompt entirely |
-| `--append-system-prompt` | Append text (or `@path/to/file`) to the system prompt; repeatable |
+| `--system-prompt` | Override the default system prompt |
+| `--append-system-prompt` | Append text (or `@path/to/file`); repeatable |
 | `--max-iterations` | Cap on agent loop iterations per turn (default 99999) |
-| `--api-key` / `--api-key-env` | Supply or redirect the provider API key |
-| `--base-url` | Override the provider's API base URL |
+| `--api-key` / `--api-key-env` | Supply or redirect the API key |
+| `--base-url` | Override the provider API base URL |
 | `--timeout` | Request timeout in seconds (default 300) |
 
-Run `cargo run --release -- --help` for the exact, current flag set.
+`cargo run --release -- --help` for the current flag set. Subcommands:
+`worker`, `fleet`, `wish`, `marshal`, `role`, `status`, `api`, `runtime`,
+`schedule` — overnight operators use [`docs/overnight.md`](docs/overnight.md).
 
 ## Providers
 
@@ -232,36 +255,26 @@ Run `cargo run --release -- --help` for the exact, current flag set.
 |----------|-----------|----------|-------|
 | Anthropic | `anthropic` | `ANTHROPIC_API_KEY` | Recommended. |
 | OpenAI | `openai` | `OPENAI_API_KEY` | |
-| OpenRouter | `openrouter` | `OPENROUTER_API_KEY` | Aggregator — hundreds of catalog models once keyed. |
-| Groq / DeepSeek / Together / Fireworks / xAI / … | same id | see `/provider` | OpenAI-compatible; listed from the built-in catalog. |
-| AWS Bedrock | `bedrock` / `amazon-bedrock` | `~/.aws/credentials` or env | Newer models need inference-profile IDs (`us.anthropic…`); bare IDs are auto-prefixed from your AWS region. |
+| OpenRouter | `openrouter` | `OPENROUTER_API_KEY` | Aggregator — catalog models once keyed. |
+| Groq / DeepSeek / Together / Fireworks / xAI / … | same id | see `/provider` | OpenAI-compatible catalog. |
+| AWS Bedrock | `bedrock` / `amazon-bedrock` | `~/.aws/credentials` or env | Newer models need inference-profile IDs (`us.anthropic…`). |
 | OpenCode (REST) | `opencode` | `OPENCODE_API_KEY` | |
-| OpenCode CLI | `opencode-cli` | (local CLI) | Experimental. `/model` lists whatever `opencode models` returns (full OpenCode catalog). |
+| OpenCode CLI | `opencode-cli` | (local CLI) | Experimental. |
 
-rs-agent ships a **pi-style static model catalog** (~1000 models / ~35 providers in
-[`data/models.catalog.json`](data/models.catalog.json), synced from `reference/pi`).
-`/model` only shows models for providers that have credentials configured (same rule as pi).
-Export e.g. `OPENROUTER_API_KEY` to unlock the large OpenRouter slice. Refresh the catalog with
-`python3 scripts/sync-model-catalog.py` when `reference/pi` is present.
-
-Mid-session: `/model`, `Ctrl-P`, `/provider` (or `/login`) switch across providers — no restart.
-The last provider/model is written to `~/.rs-agent/config.toml` and restored next launch
-(override with `--provider` / `--model`).
-For providers without a key yet, `/provider` opens the console/signup URL and lets you paste
-an API key into `~/.rs-agent/secrets.toml` (also exported to the matching env var for the process).
+Static catalog (~1000 models) in [`data/models.catalog.json`](data/models.catalog.json).
+`/model` shows models for providers that have credentials. Mid-session:
+`/model`, `Ctrl-P`, `/provider` / `/login`. Last selection is saved to
+`~/.rs-agent/config.toml`.
 
 ## Deep Context workflow
 
 1. Put a large payload into the REPL's `context` (or `load_file` / `load_dir`).
-2. Run Python that peeks/chunks the context and calls `llm_query(prompt)` (leaf LM call) or
-   `agent_query(task)` (recursive sub-agent with its own tools).
+2. Peek/chunk in Python; `llm_query(prompt)` (leaf) or `agent_query(task)` (nested agent).
 3. Finish with `FINAL(value)`.
-4. Inspect the call tree with `/tree` in the TUI (auto-opens while `repl` runs; status bar shows
-   `[D]`), or `tree`/`tree_final` events in `--mode json`.
+4. Inspect `/tree` (auto-opens while `repl` runs; `[D]` in the status bar).
 
-See [`example/rlm_long_doc.md`](example/rlm_long_doc.md) for a worked example.
-
-Example `/tree` panel while Deep Context is running (status bar shows `[D]`):
+Worked example: [`example/rlm_long_doc.md`](example/rlm_long_doc.md). Demo log:
+[`docs/demo.md`](docs/demo.md).
 
 ```
  Call tree
@@ -286,12 +299,12 @@ User → Root AgentLoop → tools (incl. repl)
 
 ## `reference/`
 
-`reference/` holds local research notes (other agent/CLI projects) used while building rs-agent.
-It's git-ignored and isn't part of the crate — you don't need it to build, run, or contribute.
+Local research notes (other agent/CLI projects). Git-ignored — not part of the crate.
 
 ## Contributing
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for build/test/lint commands and PR expectations.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md). Product sequence:
+[`docs/productize.md`](docs/productize.md).
 
 ## License
 

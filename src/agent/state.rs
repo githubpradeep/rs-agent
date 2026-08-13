@@ -1,9 +1,8 @@
-use crate::ai::token_count;
-use crate::ai::types::*;
 use crate::agent::goal::GoalState;
 use crate::agent::handoff::HandoffNotes;
 use crate::agent::mode::AgentMode;
-
+use crate::ai::token_count;
+use crate::ai::types::*;
 
 #[derive(Debug, Clone)]
 pub struct AgentState {
@@ -86,14 +85,22 @@ impl AgentState {
             return true;
         }
         let lower = name.to_lowercase();
-        self.skill_tools.iter().any(|t| t == &lower || lower.starts_with(&format!("{t}__")))
+        self.skill_tools
+            .iter()
+            .any(|t| t == &lower || lower.starts_with(&format!("{t}__")))
     }
 
     pub fn add_message(&mut self, msg: Message) {
         self.messages.push(msg);
     }
 
-    pub fn add_tool_result(&mut self, tool_use_id: String, tool_name: String, content: String, is_error: bool) {
+    pub fn add_tool_result(
+        &mut self,
+        tool_use_id: String,
+        tool_name: String,
+        content: String,
+        is_error: bool,
+    ) {
         let msg = Message {
             role: Role::Tool,
             content: vec![Content {

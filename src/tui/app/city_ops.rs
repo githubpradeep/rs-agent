@@ -34,6 +34,7 @@ pub fn fleet_up_opts(
         model,
         approve: true,
         fail_fast: false,
+        shared_worktree: false,
     }
 }
 
@@ -56,8 +57,5 @@ pub fn should_divert_logs(
     selected: Option<&str>,
     attach_seat: Option<&str>,
 ) -> bool {
-    show_city
-        && selected.is_some()
-        && attach_seat.is_some()
-        && selected == attach_seat
+    show_city && selected.is_some() && attach_seat.is_some() && selected == attach_seat
 }

@@ -117,7 +117,10 @@ impl McpClient {
                 }),
             )
             .await?;
-        let is_error = result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
+        let is_error = result
+            .get("isError")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         Ok((format_tool_result(&result), is_error))
     }
 

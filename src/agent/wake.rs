@@ -30,10 +30,7 @@ impl WakeInputs {
             .map(|s| s.laurels.iter().rev().take(5).cloned().collect())
             .unwrap_or_default();
         // Prefer seat diary handoff if session handoff missing.
-        let handoff = handoff.or_else(|| {
-            seat.as_ref()
-                .and_then(|s| s.last_handoff().cloned())
-        });
+        let handoff = handoff.or_else(|| seat.as_ref().and_then(|s| s.last_handoff().cloned()));
         Self {
             seat,
             handoff,
@@ -78,7 +75,10 @@ pub fn build(inputs: &WakeInputs) -> Option<String> {
 
     let mut laurels = laurel::recent(inputs.laurels_limit);
     for l in &inputs.extra_laurels {
-        if !laurels.iter().any(|x| x.text == l.text && x.written_at == l.written_at) {
+        if !laurels
+            .iter()
+            .any(|x| x.text == l.text && x.written_at == l.written_at)
+        {
             laurels.push(l.clone());
         }
     }

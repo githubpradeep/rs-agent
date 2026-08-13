@@ -42,7 +42,9 @@ impl AgentTool for LsTool {
         let dir_path = parsed.path.unwrap_or_else(|| ".".to_string());
         let mut entries = match fs::read_dir(&dir_path).await {
             Ok(e) => e,
-            Err(e) => return ToolExecuteResult::error(format!("Failed to read dir {}: {}", dir_path, e)),
+            Err(e) => {
+                return ToolExecuteResult::error(format!("Failed to read dir {}: {}", dir_path, e))
+            }
         };
 
         let mut result = Vec::new();

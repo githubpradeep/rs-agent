@@ -24,8 +24,14 @@ fn select_provider(session_seed: &str) -> &'static str {
             return Box::leak(val.into_boxed_str());
         }
     }
-    let seed: u64 = session_seed.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-    if seed % 2 == 0 { "exa" } else { "parallel" }
+    let seed: u64 = session_seed
+        .bytes()
+        .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+    if seed % 2 == 0 {
+        "exa"
+    } else {
+        "parallel"
+    }
 }
 
 #[async_trait]
@@ -119,10 +125,17 @@ async fn search_parallel(query: &str, num_results: u32) -> Result<String, String
         .map_err(|e| format!("Request failed: {}", e))?;
 
     let status = resp.status();
-    let text = resp.text().await.map_err(|e| format!("Read failed: {}", e))?;
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("Read failed: {}", e))?;
 
     if !status.is_success() {
-        return Err(format!("Parallel API returned {}: {}", status.as_u16(), text));
+        return Err(format!(
+            "Parallel API returned {}: {}",
+            status.as_u16(),
+            text
+        ));
     }
 
     parse_mcp_response(&text, num_results)
@@ -166,7 +179,10 @@ async fn search_exa(query: &str, num_results: u32, args: &WebSearchArgs) -> Resu
         .map_err(|e| format!("Request failed: {}", e))?;
 
     let status = resp.status();
-    let text = resp.text().await.map_err(|e| format!("Read failed: {}", e))?;
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("Read failed: {}", e))?;
 
     if !status.is_success() {
         return Err(format!("Exa API returned {}: {}", status.as_u16(), text));

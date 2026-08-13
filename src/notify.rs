@@ -2,8 +2,8 @@
 
 use std::io::{self, Write};
 use std::process::Command;
-use std::time::{Duration, Instant};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::lifecycle::{self, Lifecycle};
 

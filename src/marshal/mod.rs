@@ -30,9 +30,7 @@ pub fn report_path() -> PathBuf {
 }
 
 fn now_str() -> String {
-    chrono::Local::now()
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string()
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 fn write_report(report: &MarshalReport) {
@@ -88,9 +86,7 @@ fn idle_fleet_seats() -> Vec<SeatStatus> {
         .into_iter()
         .filter(|s| {
             let caste = crate::agent::seat::resolve_caste(&s.seat);
-            caste == SeatCaste::Fleet
-                && s.running
-                && (s.state == "idle" || s.state == "sleeping")
+            caste == SeatCaste::Fleet && s.running && (s.state == "idle" || s.state == "sleeping")
         })
         .collect()
 }
@@ -255,7 +251,9 @@ pub fn run_with_opts(opts: MarshalOpts) -> String {
         out.push_str("Marshal: no stale leases.\n");
     }
     if dead > 0 {
-        out.push_str(&format!("Marshal: released {dead} claim(s) from dead pid seats.\n"));
+        out.push_str(&format!(
+            "Marshal: released {dead} claim(s) from dead pid seats.\n"
+        ));
     }
     if !auto_assigned.is_empty() {
         out.push_str("Auto-assign:\n");
@@ -285,7 +283,8 @@ pub fn run_with_opts(opts: MarshalOpts) -> String {
 
 /// Loop until Ctrl-C / budget — cron-friendly when used with --once externally.
 pub async fn run_loop(opts: MarshalOpts, interval_secs: u64, budget_minutes: u64) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(budget_minutes.saturating_mul(60));
+    let deadline =
+        std::time::Instant::now() + Duration::from_secs(budget_minutes.saturating_mul(60));
     loop {
         if std::time::Instant::now() >= deadline {
             eprintln!("[marshal] budget exhausted");

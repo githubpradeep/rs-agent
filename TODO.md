@@ -92,11 +92,13 @@ _(Wave 3 delivered named themes + single-char keybindings; richer variants defer
 
 ## F. Ship / share
 
+Canonical sequence: [`docs/productize.md`](docs/productize.md).
+
 - [x] Release binaries (macOS/Linux) via `.github/workflows/release.yml` on `v*` tags
 - [x] Install one-liner (curl script pointing at release artifacts)
 - [x] Keep `reference/` out of published artifact (git-ignored, untracked; documented in README/CONTRIBUTING)
-- [ ] Tag `v0.1.0` + release notes — *manual; ask before tagging*
-- [ ] Dogfood with 3 outsiders → `v0.2`
+- [ ] Tag `v0.1.0` + release notes — *manual; ask before tagging* (sprint 0.5)
+- [ ] Dogfood with 3 outsiders → `v0.2` (sprint 3)
 
 ---
 
