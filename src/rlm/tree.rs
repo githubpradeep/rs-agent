@@ -357,10 +357,13 @@ mod tests {
         let mut repl = crate::rlm::repl::ReplSession::spawn()
             .await
             .expect("start repl");
+        let abort = crate::agent::control::AbortFlag::new();
         let out = repl
-            .exec_with_host("print(1+1)", |_m, _a, _k| async {
-                Ok(serde_json::Value::Null)
-            })
+            .exec_with_host(
+                "print(1+1)",
+                |_m, _a, _k| async { Ok(serde_json::Value::Null) },
+                &abort,
+            )
             .await
             .expect("exec");
         assert!(out.ok, "stdout={} stderr={}", out.stdout, out.stderr);

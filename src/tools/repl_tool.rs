@@ -172,6 +172,7 @@ impl AgentTool for ReplTool {
                         }
                     }
                 },
+                &self.abort,
             )
             .await;
 

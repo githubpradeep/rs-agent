@@ -305,6 +305,12 @@ pub struct App {
     tree_panel_text: String,
     show_repl_panel: bool,
     repl_panel: String,
+    /// Console scrollback: lines up from the tail (0 = follow live output).
+    console_scroll: usize,
+    /// Last rendered chat viewport height (for page-scroll sizing).
+    chat_rows: usize,
+    /// Where the console panel was last drawn (mouse-wheel routing).
+    console_area: Option<Rect>,
     /// Switchable live tool outputs (Tab cycles while waiting).
     tool_output_tabs: Vec<ToolOutputTab>,
     tool_output_tab: usize,
@@ -757,6 +763,9 @@ impl App {
             tree_panel_text: "(no call tree yet)".to_string(),
             show_repl_panel: false,
             repl_panel: String::new(),
+            console_scroll: 0,
+            chat_rows: 0,
+            console_area: None,
             tool_output_tabs: Vec::new(),
             tool_output_tab: 0,
             tool_in_progress: None,
@@ -1036,7 +1045,9 @@ impl App {
                 if let Some(last) = self.messages.last_mut() {
                     last.text.push_str(&text);
                 }
-                self.follow_bottom = true;
+                // Respect the user's scroll position: if they scrolled up mid-turn,
+                // do not yank them back to the tail on every streamed chunk.
+                // follow_bottom stays true when they are already at the tail.
             }
             AgentEvent::ThinkingDelta { thinking } => {
                 if self.messages.is_empty()
@@ -1060,12 +1071,10 @@ impl App {
                     }
                 }
                 self.status = "thinking...".to_string();
-                self.follow_bottom = true;
                 self.publish_lifecycle(Lifecycle::Working, "thinking");
             }
             AgentEvent::ToolUseStart { id, name } => {
                 self.status = format!("using {}...", name);
-                self.follow_bottom = true;
                 self.publish_lifecycle(Lifecycle::Working, &format!("tool:{name}"));
                 if name == "repl" || name == "bash" || name == "task" {
                     let n = self.tool_output_tabs.len() + 1;
@@ -1077,6 +1086,7 @@ impl App {
                         done: false,
                     });
                     self.tool_output_tab = self.tool_output_tabs.len().saturating_sub(1);
+                    self.console_scroll = 0;
                     // Bottom console only — never steal chat width mid-turn.
                     self.show_repl_panel = true;
                 }
@@ -1166,7 +1176,6 @@ impl App {
                         is_error: result.is_error || expand_diag,
                     });
                 }
-                self.follow_bottom = true;
                 if result.is_error && full.contains("STUCK:") {
                     self.status = "STUCK".to_string();
                 }
@@ -1413,13 +1422,27 @@ impl App {
     fn handle_event(&mut self, event: Event) -> io::Result<()> {
         match event {
             Event::Mouse(mouse) => {
-                self.follow_bottom = false;
                 match mouse.kind {
-                    MouseEventKind::ScrollDown => {
-                        self.scroll_offset = self.scroll_offset.saturating_add(3);
-                    }
-                    MouseEventKind::ScrollUp => {
-                        self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                    MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                        // Wheel over the console scrolls the console, not the chat.
+                        let over_console = self
+                            .console_area
+                            .map(|a| mouse.row >= a.y && mouse.row < a.y.saturating_add(a.height))
+                            .unwrap_or(false);
+                        if over_console {
+                            if mouse.kind == MouseEventKind::ScrollUp {
+                                self.console_scroll = self.console_scroll.saturating_add(3);
+                            } else {
+                                self.console_scroll = self.console_scroll.saturating_sub(3);
+                            }
+                        } else {
+                            self.follow_bottom = false;
+                            if mouse.kind == MouseEventKind::ScrollDown {
+                                self.scroll_offset = self.scroll_offset.saturating_add(3);
+                            } else {
+                                self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                            }
+                        }
                     }
                     MouseEventKind::Down(button)
                         if button == crossterm::event::MouseButton::Left =>
@@ -1594,6 +1617,13 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') if self.show_repl_panel => {
                 self.cycle_tool_output_tab(1);
             }
+            KeyCode::PageUp if self.show_repl_panel => {
+                // Scroll the console buffer up (toward older output).
+                self.console_scroll = self.console_scroll.saturating_add(10);
+            }
+            KeyCode::PageDown if self.show_repl_panel => {
+                self.console_scroll = self.console_scroll.saturating_sub(10);
+            }
             KeyCode::Enter => {
                 if !self.input.trim().is_empty() {
                     let text = std::mem::take(&mut self.input);
@@ -1630,6 +1660,7 @@ impl App {
         let n = self.tool_output_tabs.len() as i32;
         let cur = self.tool_output_tab as i32;
         self.tool_output_tab = ((cur + delta).rem_euclid(n)) as usize;
+        self.console_scroll = 0;
         self.status = format!(
             "console {}/{} · {}",
             self.tool_output_tab + 1,
@@ -1646,13 +1677,13 @@ impl App {
             .or_else(|| self.tool_output_tabs.iter().rposition(|t| t.name == name))
         {
             self.tool_output_tabs[idx].buffer.push_str(chunk);
-            Self::trim_panel_utf8(&mut self.tool_output_tabs[idx].buffer, 16_000);
+            Self::trim_panel_utf8(&mut self.tool_output_tabs[idx].buffer, 64_000);
             self.tool_output_tab = idx;
             self.show_repl_panel = true;
         } else {
             // Fallback single buffer if a tab was not opened.
             self.repl_panel.push_str(chunk);
-            Self::trim_panel_utf8(&mut self.repl_panel, 16_000);
+            Self::trim_panel_utf8(&mut self.repl_panel, 64_000);
             self.show_repl_panel = true;
         }
     }
@@ -4710,13 +4741,26 @@ impl App {
             }
             KeyCode::PageUp => {
                 self.follow_bottom = false;
-                self.scroll_offset = self.scroll_offset.saturating_sub(10);
+                self.scroll_offset = self.scroll_offset.saturating_sub(self.page_rows());
             }
             KeyCode::PageDown => {
-                self.scroll_offset = self.scroll_offset.saturating_add(10);
+                self.scroll_offset = self.scroll_offset.saturating_add(self.page_rows());
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Vim-style half page up.
+                self.follow_bottom = false;
+                self.scroll_offset = self.scroll_offset.saturating_sub(self.page_rows() / 2);
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll_offset = self.scroll_offset.saturating_add(self.page_rows() / 2);
             }
             _ => {}
         }
+    }
+
+    /// Page size for chat scrolling (viewport minus header/footer rows).
+    fn page_rows(&self) -> usize {
+        self.chat_rows.saturating_sub(2).max(10)
     }
 
     fn handle_insert_key(&mut self, key: crossterm::event::KeyEvent) {
@@ -5754,6 +5798,7 @@ impl App {
     fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
         self.hit_map.clear();
+        self.console_area = None;
         lifecycle::set_focused(true);
 
         let show_side = self.show_fleet_panel
@@ -6048,7 +6093,7 @@ impl App {
             self.keys.binding("insert")
         );
         if self.input_mode == InputMode::Waiting {
-            hints = " Esc abort · Tab console · Enter steer".to_string();
+            hints = " Esc abort · Tab console · PgUp/PgDn console scroll · Enter steer".to_string();
             if self.queued_steers > 0 {
                 hints.push_str(&format!(" · queued:{}", self.queued_steers));
             }
@@ -6204,6 +6249,7 @@ impl App {
     fn render_repl_panel(&mut self, frame: &mut Frame, area: Rect) {
         use ratatui::widgets::Clear;
 
+        self.console_area = Some(area);
         // Erase previous frame so long lines / side-panel thrash cannot bleed.
         frame.render_widget(Clear, area);
 
@@ -6226,7 +6272,11 @@ impl App {
             if self.tool_output_tabs.len() > 6 {
                 parts.push("…".into());
             }
-            format!("Console · Tab {}", parts.join(""))
+            let mut title = format!("Console · Tab {}", parts.join(""));
+            if self.console_scroll > 0 {
+                title.push_str(&format!(" · ↑{} (PgDn to follow)", self.console_scroll));
+            }
+            title
         };
         // Cap title so the border never overflows the terminal width.
         let title = Self::clip_console_line(&title, inner_w.saturating_sub(2));
@@ -6239,11 +6289,14 @@ impl App {
             .unwrap_or(self.repl_panel.as_str());
 
         let all_lines: Vec<&str> = body.lines().collect();
-        let start = all_lines.len().saturating_sub(visible_rows);
+        let max_off = all_lines.len().saturating_sub(visible_rows);
+        let off = self.console_scroll.min(max_off);
+        let start = max_off.saturating_sub(off);
+        let end = (start + visible_rows).min(all_lines.len());
         let style = Style::default()
             .fg(self.palette.overlay1)
             .bg(self.palette.panel_bg);
-        let lines: Vec<Line> = all_lines[start..]
+        let lines: Vec<Line> = all_lines[start..end]
             .iter()
             .map(|l| Line::from(Span::styled(Self::clip_console_line(l, inner_w), style)))
             .collect();
@@ -6309,6 +6362,7 @@ impl App {
 
     fn render_messages(&mut self, frame: &mut Frame, area: Rect) {
         self.chat_area_y = area.y;
+        self.chat_rows = area.height as usize;
         let max_width = (area.width as usize).saturating_sub(3).max(20);
         let md = MarkdownStyle::from_palette(&self.palette);
         let syn = self.theme_name.syntect_theme();
@@ -6475,7 +6529,15 @@ impl App {
                 ]));
             }
 
-            lines.push(Line::from(""));
+            // One blank line between messages. Markdown already ends some blocks
+            // with an empty line — never stack two (made the chat feel oversized).
+            let last_blank = lines
+                .last()
+                .map(|l| l.spans.iter().all(|s| s.content.trim().is_empty()))
+                .unwrap_or(false);
+            if !last_blank {
+                lines.push(Line::from(""));
+            }
         }
 
         let inner_height = (area.height as usize).saturating_sub(1);

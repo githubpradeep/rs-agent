@@ -165,7 +165,20 @@ pub fn spawn_session_runtime(cfg: SessionRuntimeConfig) -> SessionRuntime {
     let resume_todos = cfg.todos;
 
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        // Tool-output sink is thread-local; bash/repl readers run on tokio
+        // worker threads, so install the sink there too — otherwise live
+        // tool output is silently dropped before it reaches the TUI.
+        let (sink_tx, sink_rx) = crossbeam_channel::unbounded::<crate::agent::AgentEvent>();
+        let rt = {
+            let worker_sink = sink_tx.clone();
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .on_thread_start(move || {
+                    crate::tools::output_sink::set_tool_output_sink(worker_sink.clone());
+                })
+                .build()
+                .expect("tokio runtime for session")
+        };
         rt.block_on(async move {
             let sp = system_prompt_for_thread
                 .unwrap_or_else(crate::agent::default_system_prompt);
@@ -207,7 +220,8 @@ pub fn spawn_session_runtime(cfg: SessionRuntimeConfig) -> SessionRuntime {
                 agent_loop.set_permission_channel(permission_tx);
             }
             // Bridge tool-emitted events onto this runtime's event channel.
-            let (sink_tx, sink_rx) = channel::unbounded::<AgentEvent>();
+            // (sink_tx/sink_rx are created before the runtime; workers install
+            // their thread-local copy via on_thread_start.)
             crate::tools::output_sink::set_tool_output_sink(sink_tx.clone());
             let event_tx_bridge = event_tx.clone();
             std::thread::spawn(move || {

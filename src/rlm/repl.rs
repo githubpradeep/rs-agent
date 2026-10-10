@@ -1,5 +1,6 @@
 //! Persistent Python REPL with host-mediated llm_query / agent_query.
 
+use crate::agent::control::AbortFlag;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::process::Stdio;
@@ -277,22 +278,29 @@ impl ReplSession {
         &mut self,
         code: &str,
         host_handler: F,
+        abort: &AbortFlag,
     ) -> Result<ReplExecResult, String>
     where
         F: FnMut(String, Vec<Value>, Value) -> Fut,
         Fut: std::future::Future<Output = Result<Value, String>>,
     {
-        self.exec_with_host_and_output(code, host_handler, |_, _| {})
+        self.exec_with_host_and_output(code, host_handler, |_, _| {}, abort)
             .await
     }
 
     /// Like [`exec_with_host`], but also forwards live `stdout`/`stderr` JSON
     /// lines to `on_output(stream, text)` as they arrive.
+    ///
+    /// The read loop watches `abort`: Esc kills the Python process, marks the
+    /// session dead (next call respawns fresh), and returns immediately —
+    /// otherwise a runaway `exec` could only be stopped by the 10-minute
+    /// silence timeout (which never fires while Python keeps printing).
     pub async fn exec_with_host_and_output<F, Fut, O>(
         &mut self,
         code: &str,
         mut host_handler: F,
         mut on_output: O,
+        abort: &AbortFlag,
     ) -> Result<ReplExecResult, String>
     where
         F: FnMut(String, Vec<Value>, Value) -> Fut,
@@ -310,12 +318,18 @@ impl ReplSession {
 
         loop {
             let mut buf = String::new();
-            let n = match tokio::time::timeout(
-                std::time::Duration::from_secs(600),
-                self.stdout.read_line(&mut buf),
-            )
-            .await
-            {
+            let n = match tokio::select! {
+                biased;
+                _ = abort.wait() => {
+                    self.dead = true;
+                    let _ = self.child.kill().await;
+                    return Err("aborted".to_string());
+                }
+                read = tokio::time::timeout(
+                    std::time::Duration::from_secs(600),
+                    self.stdout.read_line(&mut buf),
+                ) => read,
+            } {
                 Ok(Ok(n)) => n,
                 Ok(Err(e)) => return Err(e.to_string()),
                 Err(_) => {
@@ -458,10 +472,12 @@ mod tests {
             return;
         }
         let mut session = ReplSession::spawn().await.expect("python3");
+        let abort = crate::agent::control::AbortFlag::new();
         let result = session
             .exec_with_host(
                 "answer = 'hello from var'\nFINAL_VAR('answer')\n",
                 |_m, _a, _k| async { Err::<Value, String>("no host".into()) },
+                &abort,
             )
             .await
             .expect("exec");
@@ -472,5 +488,43 @@ mod tests {
             Some(Value::String("hello from var".into()))
         );
         session.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod abort_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn abort_kills_runaway_exec() {
+        if !python3_available() {
+            return;
+        }
+        let mut session = ReplSession::spawn().await.expect("python3");
+        let abort = AbortFlag::new();
+        let task_abort = abort.clone();
+        let handle = tokio::spawn(async move {
+            session
+                .exec_with_host(
+                    "import time\ntime.sleep(120)\nprint('never')\n",
+                    |_m, _a, _k| async { Err::<Value, String>("no host".into()) },
+                    &task_abort,
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = std::time::Instant::now();
+        abort.abort();
+        let result = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("abort did not resolve the exec in time")
+            .expect("task panicked");
+        assert_eq!(result.unwrap_err(), "aborted");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "abort was slow: {:?}",
+            started.elapsed()
+        );
     }
 }
