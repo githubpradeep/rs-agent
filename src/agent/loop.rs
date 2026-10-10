@@ -78,6 +78,8 @@ pub enum AgentEvent {
         limit: usize,
         input_tokens: usize,
         output_tokens: usize,
+        /// Cumulative prompt-cache hits (10% billing on Anthropic).
+        cache_read_tokens: usize,
     },
     Compacting,
     Compacted {
@@ -1340,6 +1342,7 @@ impl AgentLoop {
                 limit,
                 input_tokens: self.state.total_input_tokens,
                 output_tokens: self.state.total_output_tokens,
+                cache_read_tokens: self.state.total_cache_read_tokens,
             });
 
             let tool_calls: Vec<Content> = assistant_msg

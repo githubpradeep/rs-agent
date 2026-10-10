@@ -30,14 +30,19 @@ impl ToolRegistry {
     }
 
     pub fn tool_defs(&self) -> Vec<ToolDef> {
-        self.tools
+        // Sorted by name: prompt-cache prefixes must be byte-stable across
+        // requests, and HashMap iteration order is not.
+        let mut defs: Vec<ToolDef> = self
+            .tools
             .values()
             .map(|t| ToolDef {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
                 input_schema: t.input_schema(),
             })
-            .collect()
+            .collect();
+        defs.sort_by(|a, b| a.name.cmp(&b.name));
+        defs
     }
 
     pub fn len(&self) -> usize {

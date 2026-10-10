@@ -281,6 +281,8 @@ pub struct App {
     token_limit: usize,
     session_input_tokens: usize,
     session_output_tokens: usize,
+    /// Cumulative prompt-cache hits (shown as a hit-rate chip).
+    session_cache_read_tokens: usize,
     near_limit: bool,
     session_id: String,
     session_title: Option<String>,
@@ -729,6 +731,7 @@ impl App {
             token_limit: crate::ai::token_count::get_context_limit(&model),
             session_input_tokens: resume.as_ref().map(|s| s.total_input_tokens).unwrap_or(0),
             session_output_tokens: resume.as_ref().map(|s| s.total_output_tokens).unwrap_or(0),
+            session_cache_read_tokens: 0,
             near_limit: false,
             session_id,
             session_title: title,
@@ -1304,11 +1307,13 @@ impl App {
                 limit,
                 input_tokens,
                 output_tokens,
+                cache_read_tokens,
             } => {
                 self.token_used = used;
                 self.token_limit = limit;
                 self.session_input_tokens = input_tokens;
                 self.session_output_tokens = output_tokens;
+                self.session_cache_read_tokens = cache_read_tokens;
             }
             AgentEvent::Compacting => {
                 self.status = "compacting...".to_string();
@@ -6045,7 +6050,7 @@ impl App {
                     .map(|s| format!("VIEW {s}"))
             })
             .unwrap_or_default();
-        let token_str = if self.token_limit > 0 {
+        let mut token_str = if self.token_limit > 0 {
             let pct = self.token_used as f64 / self.token_limit as f64 * 100.0;
             if self.near_limit {
                 format!(" ⚠{:.0}%", pct)
@@ -6059,6 +6064,12 @@ impl App {
         } else {
             String::new()
         };
+        // Prompt-cache hit chip: cache reads bill at ~10% of input on Anthropic.
+        let denom = self.session_input_tokens + self.session_cache_read_tokens;
+        if self.session_cache_read_tokens > 0 && denom > 0 {
+            let pct = (self.session_cache_read_tokens as f64 / denom as f64 * 100.0) as u64;
+            token_str.push_str(&format!(" · cache {pct}%"));
+        }
         let cost_str = crate::ai::token_count::format_cost_usd(
             &self.model_name,
             self.session_input_tokens,

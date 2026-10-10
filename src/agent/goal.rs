@@ -113,6 +113,11 @@ impl GoalState {
     }
 
     /// System-prompt sticky block while the goal is active or paused.
+    ///
+    /// Byte-stable within a task (no `last_reason`): the system prompt heads the
+    /// prompt-cache prefix, and the evaluator reason already reaches the model via
+    /// the injected `[goal]` user message. Volatile text here would invalidate the
+    /// entire cached prefix on every evaluation.
     pub fn system_note(&self) -> Option<String> {
         if !matches!(self.status, GoalStatus::Active | GoalStatus::Paused) {
             return None;
@@ -128,9 +133,6 @@ impl GoalState {
         );
         if self.status == GoalStatus::Paused {
             s.push_str("\nStatus: PAUSED — do not continue autonomously until the user resumes.");
-        }
-        if let Some(ref reason) = self.last_reason {
-            s.push_str(&format!("\nMost recent evaluator note: {reason}"));
         }
         Some(s)
     }

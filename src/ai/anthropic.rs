@@ -154,6 +154,39 @@ fn convert_tools_to_anthropic(tools: &[ToolDef]) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Anthropic prompt caching is opt-in via `cache_control` markers, and the
+/// cache is prefix-matched: tools → system → messages. We stamp a breakpoint
+/// on each so the whole stable prefix (tool defs + system + prior turns) is
+/// billed as cache reads (10% of input price) on every follow-up request.
+fn apply_cache_breakpoints(body: &mut serde_json::Value) {
+    let ephemeral = serde_json::json!({"type": "ephemeral"});
+    if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        if let Some(last) = tools.last_mut() {
+            last["cache_control"] = ephemeral.clone();
+        }
+    }
+    if let Some(system) = body.get_mut("system").and_then(|s| s.as_array_mut()) {
+        if let Some(last) = system.last_mut() {
+            last["cache_control"] = ephemeral.clone();
+        }
+    }
+    if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        if let Some(last_msg) = messages.last_mut() {
+            if let Some(blocks) = last_msg.get_mut("content").and_then(|c| c.as_array_mut()) {
+                if let Some(last_block) = blocks.last_mut() {
+                    last_block["cache_control"] = ephemeral.clone();
+                }
+            }
+        }
+    }
+}
+
+/// System goes out as a one-block array (a bare string cannot carry
+/// `cache_control`).
+fn system_to_blocks(system_text: &str) -> serde_json::Value {
+    serde_json::json!([{"type": "text", "text": system_text}])
+}
+
 #[async_trait]
 impl Provider for AnthropicProvider {
     fn name(&self) -> &str {
@@ -184,7 +217,7 @@ impl Provider for AnthropicProvider {
         });
 
         if let Some(s) = system_text {
-            body["system"] = serde_json::json!(s);
+            body["system"] = system_to_blocks(&s);
         }
         if !request.tools.is_empty() {
             body["tools"] = serde_json::json!(convert_tools_to_anthropic(&request.tools));
@@ -201,6 +234,7 @@ impl Provider for AnthropicProvider {
                 "budget_tokens": thinking.budget_tokens
             });
         }
+        apply_cache_breakpoints(&mut body);
 
         let resp = client
             .post(format!("{}/messages", self.base_url))
@@ -261,7 +295,7 @@ impl Provider for AnthropicProvider {
         });
 
         if let Some(s) = system_text {
-            body["system"] = serde_json::json!(s);
+            body["system"] = system_to_blocks(&s);
         }
         if !request.tools.is_empty() {
             body["tools"] = serde_json::json!(convert_tools_to_anthropic(&request.tools));
@@ -278,6 +312,7 @@ impl Provider for AnthropicProvider {
                 "budget_tokens": thinking.budget_tokens
             });
         }
+        apply_cache_breakpoints(&mut body);
 
         let response = client
             .post(format!("{}/messages", self.base_url))
@@ -531,4 +566,61 @@ fn parse_anthropic_stream_event(line: &str) -> Option<StreamDelta> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn cache_breakpoints_stamp_tools_system_and_last_message() {
+        let mut body = serde_json::json!({
+            "model": "claude-test",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "turn 1"}]},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "reply"},
+                    {"type": "tool_use", "id": "t1", "name": "bash", "input": {}}
+                ]}
+            ],
+            "system": [{"type": "text", "text": "system prompt"}],
+            "tools": [{"name": "bash"}, {"name": "read"}]
+        });
+        apply_cache_breakpoints(&mut body);
+        let cc = |v: &serde_json::Value| v.get("cache_control").map(|c| c["type"] == "ephemeral");
+        let tools = body["tools"].as_array().unwrap();
+        assert!(
+            cc(&tools[0]).is_none(),
+            "only the LAST tool gets the marker"
+        );
+        assert_eq!(cc(&tools[1]), Some(true));
+        assert_eq!(cc(&body["system"][0]), Some(true));
+        let blocks = body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(cc(&blocks[0]), None);
+        assert_eq!(cc(&blocks[1]), Some(true));
+    }
+
+    #[test]
+    fn system_is_cacheable_block_array() {
+        let blocks = system_to_blocks("hello");
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "hello");
+        assert!(
+            blocks[0].get("cache_control").is_none(),
+            "stamped later by apply_cache_breakpoints"
+        );
+    }
+
+    #[test]
+    fn breakpoints_skip_missing_sections() {
+        let mut body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        });
+        apply_cache_breakpoints(&mut body);
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
 }

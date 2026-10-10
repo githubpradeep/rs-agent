@@ -13,6 +13,8 @@ pub struct AgentState {
     pub thinking_budget: Option<u32>,
     pub total_input_tokens: usize,
     pub total_output_tokens: usize,
+    /// Cumulative provider cache-read tokens (prompt-cache hits).
+    pub total_cache_read_tokens: usize,
     pub mode: AgentMode,
     /// Active skill tool allow-list (Skills 2.0). Empty = unrestricted.
     pub skill_tools: Vec<String>,
@@ -36,6 +38,7 @@ impl AgentState {
             thinking_budget: None,
             total_input_tokens: 0,
             total_output_tokens: 0,
+            total_cache_read_tokens: 0,
             mode: AgentMode::Agent,
             skill_tools: Vec::new(),
             goal: None,
@@ -297,6 +300,7 @@ impl AgentState {
         if let Some(ref usage) = msg.usage {
             self.total_input_tokens += usage.input_tokens as usize;
             self.total_output_tokens += usage.output_tokens as usize;
+            self.total_cache_read_tokens += usage.cache_read_input_tokens.unwrap_or(0) as usize;
         }
         self.messages.push(Message {
             role: Role::Assistant,
