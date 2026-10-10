@@ -1,3 +1,4 @@
+pub mod ancestor;
 pub mod compact_pins;
 pub mod control;
 pub mod goal;
@@ -5,12 +6,14 @@ pub mod handoff;
 pub mod laurel;
 pub mod r#loop;
 pub mod mode;
+pub mod refine;
 pub mod registry;
 pub mod repair;
 pub mod rlm_escalate;
 pub mod seat;
 pub mod state;
 pub mod tool;
+pub mod trajectory;
 pub mod wake;
 
 pub use control::*;

@@ -126,6 +126,8 @@ rlm_escalate_chars = 10000   # auto Deep Context escalate on huge reads
 thinking_budget = 10000
 max_iterations = 99999
 timeout = 300
+auto_goal = true             # task-like requests keep working until verified done (/goal clear to disable)
+verify_cmd = "cargo test"    # harness runs this before letting the agent stop; failure re-injects
 base_url = "https://api.anthropic.com/v1"
 disable_mouse = false   # true = native text selection; Shift+drag also works with mouse on
 theme = "dark"          # dark | light | forest

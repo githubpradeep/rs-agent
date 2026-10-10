@@ -193,13 +193,16 @@ pub fn spawn_session_runtime(cfg: SessionRuntimeConfig) -> SessionRuntime {
                 crate::tools::todowrite::clear();
             }
 
-            let goal_verify = crate::config::Config::load().goal_verify.unwrap_or(true);
+            let cfg_full = crate::config::Config::load();
+            let goal_verify = cfg_full.goal_verify.unwrap_or(true);
             let mut agent_loop = AgentLoop::new(provider2, state)
                 .with_max_iterations(max_iterations)
                 .with_abort(abort_for_thread.clone())
                 .with_steer(steer_for_thread.clone())
                 .with_rlm_depth(0, max_rlm_depth)
-                .with_goal_verify(goal_verify);
+                .with_goal_verify(goal_verify)
+                .with_exit_gates(cfg_full.auto_goal.unwrap_or(true))
+                .with_verify_cmd(cfg_full.verify_cmd.clone());
             if !approve {
                 agent_loop.set_permission_channel(permission_tx);
             }

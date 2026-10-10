@@ -495,6 +495,7 @@ impl App {
             .map(|s| s.id.clone())
             .unwrap_or_else(SessionStore::generate_id);
         crate::tools::turn_snapshot::set_session(&session_id);
+        crate::agent::trajectory::set_session(&session_id);
         let created_at = resume
             .as_ref()
             .map(|s| s.created_at.clone())
@@ -1370,6 +1371,7 @@ impl App {
                 self.session_id = id;
                 self.session_title = title.filter(|t| !t.is_empty());
                 crate::tools::turn_snapshot::set_session(&self.session_id);
+                crate::agent::trajectory::set_session(&self.session_id);
                 lifecycle::set_session(Some(self.session_id.clone()), None);
                 if self.show_sessions_panel {
                     self.sessions_panel
@@ -2361,6 +2363,7 @@ impl App {
         self.queued_steers = 0;
         self.provider_auto_continues = 0;
         crate::tools::turn_snapshot::set_session(&self.session_id);
+        crate::agent::trajectory::set_session(&self.session_id);
         lifecycle::set_session(Some(self.session_id.clone()), None);
         if self.show_sessions_panel {
             self.sessions_panel
@@ -2450,6 +2453,7 @@ impl App {
         self.agent_session_id = id.to_string();
         self.refresh_bg_running();
         crate::tools::turn_snapshot::set_session(&self.session_id);
+        crate::agent::trajectory::set_session(&self.session_id);
         lifecycle::set_session(Some(self.session_id.clone()), None);
     }
 
@@ -2922,6 +2926,7 @@ impl App {
                      /handoff  /route <seat>  /seat […]  /beads [ready]  /laurel <text>\n\
                      /worker [seat]  /marshal  /city  /fleet [panel|status|up|down]\n\
                      /detach  /mail [send|ack]  /wish …  /moot …  /brain remember|falsify <…>\n\
+                     /refine [list|apply|reject|rollback]  /recall <id>\n\
                      /compact  /new  /fork [@N] [label]  /timeline  /sessions\n\
                      /export [md|json|html]  /image [path]  /lsp [start|stop|status]  /skill-pack export|import\n\
                      /revert  /trust list|reset  /rename <title>  /history [query|n]\n\n\
@@ -3937,6 +3942,65 @@ impl App {
             "/compact" => {
                 let _ = self.command_tx.send(AppCommand::Compact);
                 self.status = "compacting...".to_string();
+            }
+            "/recall" => {
+                let id = arg.trim();
+                if id.is_empty() {
+                    self.push_system(
+                        "Usage: /recall <step id>  (ids are in the compaction index, e.g. s12)",
+                    );
+                } else {
+                    match crate::agent::trajectory::recall(id) {
+                        Ok(text) => self.push_system(text),
+                        Err(e) => self.push_system(e),
+                    }
+                }
+            }
+            "/refine" => {
+                let rest = arg.trim();
+                if rest.is_empty() {
+                    let pending =
+                        crate::agent::refine::format_list(&crate::agent::refine::list_pending());
+                    self.push_system(pending);
+                    self.submit_user_text(
+                        "Review this session for one durable operational lesson. \
+                         If you have one, call refine with action=propose, kind=fact or skill, \
+                         text, and evidence quoted from what happened. \
+                         Do not edit the system prompt. Do not apply the proposal."
+                            .into(),
+                    );
+                } else if rest == "list" {
+                    self.push_system(crate::agent::refine::format_list(
+                        &crate::agent::refine::list_all(),
+                    ));
+                } else if let Some(id) = rest.strip_prefix("apply").map(str::trim) {
+                    if id.is_empty() {
+                        self.push_system("Usage: /refine apply <id>");
+                    } else {
+                        match crate::agent::refine::apply(id) {
+                            Ok(msg) => self.push_system(msg),
+                            Err(e) => self.push_system(e),
+                        }
+                    }
+                } else if let Some(id) = rest.strip_prefix("reject").map(str::trim) {
+                    if id.is_empty() {
+                        self.push_system("Usage: /refine reject <id>");
+                    } else {
+                        match crate::agent::refine::reject(id) {
+                            Ok(msg) => self.push_system(msg),
+                            Err(e) => self.push_system(e),
+                        }
+                    }
+                } else if rest == "rollback" {
+                    match crate::agent::refine::rollback() {
+                        Ok(msg) => self.push_system(msg),
+                        Err(e) => self.push_system(e),
+                    }
+                } else {
+                    self.push_system(
+                        "Usage: /refine | /refine list | /refine apply <id> | /refine reject <id> | /refine rollback",
+                    );
+                }
             }
             "/revert" => match crate::tools::turn_snapshot::restore_last_turn() {
                 Ok(n) => {

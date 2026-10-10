@@ -9,6 +9,7 @@ use crate::rlm::tree::CallTree;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 #[derive(Deserialize)]
@@ -195,6 +196,7 @@ impl AgentTool for TaskTool {
                 let abort = self.abort.clone();
                 Arc::new(move || crate::tools::default_tools_list_with_abort(abort.clone()))
             },
+            subcall_chars: Arc::new(AtomicUsize::new(0)),
         };
 
         match host.agent_query(&task, tools).await {

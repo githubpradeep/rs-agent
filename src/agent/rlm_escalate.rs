@@ -36,8 +36,8 @@ pub fn escalate_enabled() -> bool {
 pub fn system_note() -> &'static str {
     "DEEP CONTEXT ESCALATE (harness): A tool result marked [rlm_escalate] is too large for chat. \
      Do NOT re-read or paste the full file. Use the repl tool (Deep Context): \
-     `context = load_file('…')` (or load_dir), peek/search in Python, then \
-     llm_query on slices, and FINAL(value). Prefer sub-calls over stuffing the window."
+     `context = load_file('…')` (or load_dir), peek with read_file/grep in the REPL, then \
+     llm_query on slices, and FINAL(value) or FINAL_VAR(name). Prefer sub-calls over stuffing the window."
 }
 
 pub fn format_escalate_footer(file_path: &str, total_chars: usize) -> String {

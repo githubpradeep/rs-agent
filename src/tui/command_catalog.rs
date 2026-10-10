@@ -22,6 +22,8 @@ pub const PALETTE_COMMANDS: &[&str] = &[
     "/beads",
     "/city",
     "/compact",
+    "/recall",
+    "/refine",
     "/new",
     "/fork",
     "/sessions",

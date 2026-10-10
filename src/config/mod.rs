@@ -83,6 +83,13 @@ pub struct Config {
     pub max_iterations: Option<usize>,
     /// When true (default), `/goal` runs a tool-using verify subagent after the transcript check.
     pub goal_verify: Option<bool>,
+    /// Optional command the harness runs before allowing the agent to stop
+    /// (e.g. "cargo test"). A non-zero exit re-injects the failure and continues.
+    pub verify_cmd: Option<String>,
+    /// When true (default), task-like requests arm a completion goal so the
+    /// agent keeps working until the request is verified done. `/goal clear`
+    /// disables it for the session.
+    pub auto_goal: Option<bool>,
     pub timeout: Option<u64>,
     pub base_url: Option<String>,
     pub model_aliases: HashMap<String, String>,

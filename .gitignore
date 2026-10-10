@@ -8,3 +8,4 @@ __pycache__/
 example/rlm_demo_corpus.md
 example/demo/outage.log
 .rs-agent/
+.ori/

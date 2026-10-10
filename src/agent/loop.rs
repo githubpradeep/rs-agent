@@ -173,6 +173,108 @@ pub(crate) fn snap_compact_split(messages: &[Message], budget_split: usize) -> u
 
 const MAX_TOOL_OUTPUT_CHARS: usize = 100_000;
 
+/// Max consecutive deterministic-gate continuations before the stop is honored.
+const MAX_EXIT_STRIKES: u8 = 4;
+/// Wall-clock budget for the `verify_cmd` gate.
+const VERIFY_TIMEOUT_SECS: u64 = 300;
+
+/// Verbs that mark an imperative implementation request. Kept conservative:
+/// a miss keeps today's stop-on-summary behavior; a false positive costs one
+/// cheap evaluator round (which confirms answered questions immediately).
+const TASK_VERBS: &[&str] = &[
+    "build",
+    "create",
+    "make",
+    "implement",
+    "add",
+    "write",
+    "develop",
+    "generate",
+    "fix",
+    "repair",
+    "refactor",
+    "migrate",
+    "port",
+    "convert",
+    "integrate",
+    "update",
+    "remove",
+    "delete",
+    "improve",
+    "extend",
+    "complete",
+    "finish",
+    "design",
+    "automate",
+    "scaffold",
+    "debug",
+    "test",
+    "install",
+    "configure",
+];
+
+/// Heuristic: does this message look like an implementation task (worth a
+/// harness-enforced completion goal) rather than a question or chat?
+pub fn looks_like_task(msg: &str) -> bool {
+    let t = msg.trim();
+    if t.chars().count() < 8 || t.starts_with('/') {
+        return false;
+    }
+    let lower = t.to_lowercase();
+    lower.split_whitespace().any(|w| {
+        let w = w.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+        TASK_VERBS.contains(&w)
+    })
+}
+
+/// Default completion condition for auto-armed goals.
+pub fn default_goal_condition(request: &str) -> String {
+    let brief: String = request.split_whitespace().collect::<Vec<_>>().join(" ");
+    let brief: String = brief.chars().take(300).collect();
+    format!("The user's request is fully implemented and verified: {brief}")
+}
+
+/// Deterministic blocker: pending/in-progress todos mean planned work remains.
+fn todo_exit_blocker(todos: &[crate::tools::todowrite::TodoItem]) -> Option<String> {
+    let open: Vec<String> = todos
+        .iter()
+        .filter(|t| matches!(t.status.as_str(), "pending" | "in_progress"))
+        .map(|t| t.content.trim().to_string())
+        .collect();
+    if open.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} todo item(s) not completed ({}): finish them or mark them cancelled",
+        open.len(),
+        open.join("; ")
+    ))
+}
+
+/// Run the configured verify command; `(ok, failure-output-tail)`.
+async fn run_verify_command(cmd: &str) -> Result<(bool, String), String> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(VERIFY_TIMEOUT_SECS),
+        tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .output(),
+    )
+    .await
+    .map_err(|_| format!("timed out after {VERIFY_TIMEOUT_SECS}s"))?
+    .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        return Ok((true, String::new()));
+    }
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let tail = truncate_tool_output(combined.trim(), 1_500);
+    Ok((false, tail))
+}
+
 pub struct AgentLoop {
     provider: Arc<dyn Provider>,
     tools: ToolRegistry,
@@ -204,6 +306,18 @@ pub struct AgentLoop {
     hooks: HookRegistry,
     /// When true, `/goal` may spawn a tool-using verify subagent.
     goal_verify: bool,
+    /// Harness exit gates: deterministic blockers + auto goal arming. Off for
+    /// nested agents (their callers own their termination).
+    exit_gates: bool,
+    /// Optional command run before the agent may stop (`verify_cmd`).
+    verify_cmd: Option<String>,
+    /// Consecutive deterministic-gate continuations (reset on tool activity).
+    exit_strikes: u8,
+    /// A terminal tool ran this turn (escalate / handoff / bead block) — the
+    /// turn is allowed to end even if the goal looks unmet.
+    terminal_tool_seen: bool,
+    /// User explicitly cleared the goal — do not re-arm the auto goal.
+    auto_goal_disabled: bool,
 }
 
 impl AgentLoop {
@@ -232,11 +346,28 @@ impl AgentLoop {
             rlm_escalate_hint_sent: std::sync::atomic::AtomicBool::new(false),
             hooks: HookRegistry::load(),
             goal_verify: true,
+            exit_gates: true,
+            verify_cmd: None,
+            exit_strikes: 0,
+            terminal_tool_seen: false,
+            auto_goal_disabled: false,
         }
     }
 
     pub fn with_goal_verify(mut self, enabled: bool) -> Self {
         self.goal_verify = enabled;
+        self
+    }
+
+    /// Master switch for harness exit gates (default on; nested agents off).
+    pub fn with_exit_gates(mut self, enabled: bool) -> Self {
+        self.exit_gates = enabled;
+        self
+    }
+
+    /// Enforce a verification command before the agent may stop.
+    pub fn with_verify_cmd(mut self, cmd: Option<String>) -> Self {
+        self.verify_cmd = cmd;
         self
     }
 
@@ -330,6 +461,81 @@ impl AgentLoop {
         &mut self.state
     }
 
+    /// Arm the default completion goal for task-like requests so an interactive
+    /// session cannot stop on an unverified summary (opencode/Codex parity).
+    /// Existing live goals win; achieved/cleared goals re-arm per request.
+    fn maybe_arm_default_goal(
+        &mut self,
+        user_message: &str,
+        callback: &mut (dyn FnMut(AgentEvent) + Send),
+    ) {
+        if !self.exit_gates || self.auto_goal_disabled || self.rlm_depth != 0 {
+            return;
+        }
+        if self.state.mode != AgentMode::Agent {
+            return;
+        }
+        let rearm = match &self.state.goal {
+            None => true,
+            Some(g) => matches!(g.status, GoalStatus::Achieved | GoalStatus::Cleared),
+        };
+        if !rearm || !looks_like_task(user_message) {
+            return;
+        }
+        let condition = default_goal_condition(user_message);
+        self.state.goal = Some(goal::GoalState::new(
+            condition,
+            self.state.total_input_tokens,
+            self.state.total_output_tokens,
+        ));
+        crate::agent::ancestor::publish_goal(
+            self.state.goal.as_ref().map(|g| g.condition.as_str()),
+        );
+        callback(AgentEvent::GoalUpdate {
+            summary: "armed (auto)".into(),
+        });
+        callback(AgentEvent::Status {
+            message: "◎ auto-goal armed — agent keeps working until the request is \
+                      verified done (/goal clear to disable)"
+                .into(),
+        });
+    }
+
+    /// Cheap deterministic checks before the agent may stop. Returns the
+    /// reasons to block the stop, or `None` when evidence says it may stop.
+    async fn deterministic_exit_blockers(&mut self) -> Option<String> {
+        let mut reasons: Vec<String> = Vec::new();
+        let todos = crate::tools::todowrite::snapshot();
+        if let Some(reason) = todo_exit_blocker(&todos) {
+            reasons.push(reason);
+        }
+        if let Some(cmd) = self.verify_cmd.clone() {
+            let cmd = cmd.trim().to_string();
+            if !cmd.is_empty() {
+                match run_verify_command(&cmd).await {
+                    Ok((true, _)) => {}
+                    Ok((false, tail)) => reasons.push(format!(
+                        "verify command `{cmd}` failed: {tail}\n\
+                         Fix the failures above before stopping."
+                    )),
+                    Err(e) => {
+                        tracing::warn!(error = %e, cmd = %cmd, "verify_cmd could not run; skipping gate")
+                    }
+                }
+            }
+        }
+        if reasons.is_empty() {
+            None
+        } else {
+            Some(reasons.join("; "))
+        }
+    }
+
+    /// True when exit gates should run at the would-be stop point.
+    fn exit_gates_apply(&self) -> bool {
+        self.exit_gates && self.rlm_depth == 0 && self.state.mode == AgentMode::Agent
+    }
+
     /// Set or replace the session goal (does not start a turn by itself).
     pub fn set_goal(&mut self, condition: String) {
         self.state.goal = Some(goal::GoalState::new(
@@ -337,11 +543,17 @@ impl AgentLoop {
             self.state.total_input_tokens,
             self.state.total_output_tokens,
         ));
+        crate::agent::ancestor::publish_goal(
+            self.state.goal.as_ref().map(|g| g.condition.as_str()),
+        );
     }
 
     pub fn clear_goal(&mut self) -> Option<goal::GoalState> {
         let mut g = self.state.goal.take()?;
         g.status = GoalStatus::Cleared;
+        crate::agent::ancestor::publish_goal(None);
+        // Explicit clear also opts this session out of the auto goal.
+        self.auto_goal_disabled = true;
         Some(g)
     }
 
@@ -867,6 +1079,15 @@ impl AgentLoop {
         callback: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<(), String> {
         self.abort.clear();
+        // A fresh user turn is never terminal, even if the previous one ended
+        // via escalate/handoff.
+        self.terminal_tool_seen = false;
+        if self.rlm_depth == 0 {
+            crate::agent::ancestor::publish_goal(
+                self.state.goal.as_ref().map(|g| g.condition.as_str()),
+            );
+        }
+        self.maybe_arm_default_goal(user_message, callback);
         crate::tools::turn_snapshot::begin_turn();
         self.hooks.on_message(user_message);
         let user_msg = Message {
@@ -1208,6 +1429,36 @@ impl AgentLoop {
                     });
                 }
                 self.state.add_assistant(&to_store);
+
+                // Harness exit gates: refuse a narrative-only stop when cheap
+                // deterministic evidence says work remains. Bounded by strikes
+                // so a stuck model still stops after a few nudges.
+                if self.exit_gates_apply() && !self.terminal_tool_seen {
+                    if let Some(reason) = self.deterministic_exit_blockers().await {
+                        if self.exit_strikes < MAX_EXIT_STRIKES {
+                            self.exit_strikes = self.exit_strikes.saturating_add(1);
+                            callback(AgentEvent::Status {
+                                message: format!("◎ exit blocked: {reason}"),
+                            });
+                            self.state.add_message(Message {
+                                role: Role::User,
+                                content: vec![Content {
+                                    content_type: ContentType::Text,
+                                    text: Some(format!(
+                                        "[harness] Stop blocked: {reason}\n\
+                                         Continue working now. When everything above is \
+                                         addressed, give the final summary."
+                                    )),
+                                    ..Default::default()
+                                }],
+                            });
+                            continue;
+                        }
+                    } else {
+                        self.exit_strikes = 0;
+                    }
+                }
+
                 // Claude Code–style `/goal`: evaluate completion; if unmet, continue.
                 if self.maybe_continue_for_goal(callback).await? {
                     continue;
@@ -1224,6 +1475,7 @@ impl AgentLoop {
                     g.consecutive_blocks = 0;
                 }
             }
+            self.exit_strikes = 0;
 
             let has_sequential = self
                 .tools
@@ -1534,6 +1786,7 @@ impl AgentLoop {
             });
             self.store_tool_result(id, name, &result.content, result.is_error);
             self.after_tool_side_effects(name, &result, callback);
+            self.note_terminal_tool(name, &input, &result);
 
             if result.terminate {
                 break;
@@ -1576,6 +1829,7 @@ impl AgentLoop {
             });
             self.store_tool_result(&job.id, &job.name, &result.content, result.is_error);
             self.after_tool_side_effects(&job.name, result, callback);
+            self.note_terminal_tool(&job.name, &job.input, result);
         }
 
         for result in &results {
@@ -1585,6 +1839,27 @@ impl AgentLoop {
         }
 
         Ok(())
+    }
+
+    /// Record that this turn ended through a legitimate terminal tool
+    /// (escalate / handoff terminate; a successfully blocked bead is a
+    /// deliberate stopping point). Exit gates skip such turns.
+    fn note_terminal_tool(
+        &mut self,
+        name: &str,
+        input: &serde_json::Value,
+        result: &ToolExecuteResult,
+    ) {
+        if result.terminate {
+            self.terminal_tool_seen = true;
+            return;
+        }
+        if !result.is_error && name.eq_ignore_ascii_case("bead") {
+            let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            if action.eq_ignore_ascii_case("block") {
+                self.terminal_tool_seen = true;
+            }
+        }
     }
 
     /// Sync handoff notes / escalate → pause goal after tool execution.
@@ -1687,7 +1962,11 @@ impl AgentLoop {
             if m.role == Role::System {
                 m.content.iter().find_map(|c| {
                     c.text.as_deref().and_then(|t| {
-                        t.strip_prefix("[Compacted summary of earlier conversation]\n")
+                        if t.starts_with("[Compacted summary of earlier conversation]") {
+                            Some(crate::agent::trajectory::summary_body(t).to_string())
+                        } else {
+                            None
+                        }
                     })
                 })
             } else {
@@ -1739,7 +2018,7 @@ impl AgentLoop {
         let api_key = std::env::var(self.provider.api_key_env_var())
             .map_err(|_| format!("{} not set", self.provider.api_key_env_var()))?;
 
-        let user_msg = if let Some(prev) = previous_summary {
+        let user_msg = if let Some(prev) = previous_summary.as_deref() {
             let handoff_snap = crate::agent::handoff::snapshot();
             let handoff_seed = self
                 .state
@@ -1834,21 +2113,35 @@ impl AgentLoop {
 
         // Pin recent file paths + failed edits so they survive later compaction.
         let mut pins = CompactPins::default();
-        if let Some(prev) = previous_summary {
+        if let Some(prev) = previous_summary.as_deref() {
             pins.merge(CompactPins::from_summary_text(prev));
         }
         pins.merge(collect_pins_from_messages(&to_summarize));
         pins.merge(collect_pins_from_messages(&keep_msgs));
         let summary = append_pins_to_summary(&summary, &pins);
 
+        let archived = match crate::agent::trajectory::archive(&to_summarize) {
+            Ok(steps) => steps,
+            Err(e) => {
+                callback(AgentEvent::Status {
+                    message: format!("trajectory archive failed: {e}"),
+                });
+                Vec::new()
+            }
+        };
+        let index = crate::agent::trajectory::format_index(&archived);
+        let older = previous_summary
+            .as_deref()
+            .map(crate::agent::trajectory::older_tier)
+            .unwrap_or_default();
+        let projection =
+            format!("[Compacted summary of earlier conversation]\n{summary}\n\n{index}{older}");
+
         let summary_msg = Message {
             role: Role::System,
             content: vec![Content {
                 content_type: ContentType::Text,
-                text: Some(format!(
-                    "[Compacted summary of earlier conversation]\n{}",
-                    summary
-                )),
+                text: Some(projection),
                 ..Default::default()
             }],
         };
@@ -2134,5 +2427,92 @@ mod tool_output_truncation_tests {
         assert!(out.chars().count() < s.chars().count());
         // Would panic on invalid UTF-8 boundaries if this were byte-based.
         let _ = out.len();
+    }
+}
+
+#[cfg(test)]
+mod exit_gate_tests {
+    use super::{default_goal_condition, looks_like_task, todo_exit_blocker};
+    use crate::agent::tool::AgentTool;
+    use crate::tools::todowrite::{self, TodoItem};
+
+    fn todo(id: &str, content: &str, status: &str) -> TodoItem {
+        TodoItem {
+            id: id.into(),
+            content: content.into(),
+            status: status.into(),
+        }
+    }
+
+    #[test]
+    fn task_heuristic_matches_imperatives() {
+        assert!(looks_like_task("develop a snake game in python"));
+        assert!(looks_like_task("please fix the parser bug"));
+        assert!(looks_like_task("can you add tests for the parser?"));
+        assert!(looks_like_task("Fix: broken import in main.rs"));
+        assert!(looks_like_task("BUILD the release binary"));
+    }
+
+    #[test]
+    fn task_heuristic_skips_chat_and_questions() {
+        assert!(!looks_like_task("hi"));
+        assert!(!looks_like_task("what does this function do?"));
+        assert!(!looks_like_task("/model"));
+        assert!(!looks_like_task("what changed in git today"));
+        assert!(!looks_like_task(""));
+    }
+
+    #[test]
+    fn goal_condition_is_compact() {
+        let long = "word ".repeat(200);
+        let cond = default_goal_condition(&long);
+        assert!(cond.chars().count() < 400);
+        assert!(cond.starts_with("The user's request is fully implemented"));
+        assert!(!cond.contains('\n'));
+    }
+
+    #[test]
+    fn todo_blocker_fires_only_for_open_items() {
+        assert!(todo_exit_blocker(&[]).is_none());
+        assert!(todo_exit_blocker(&[todo("1", "done thing", "completed")]).is_none());
+        assert!(todo_exit_blocker(&[todo("2", "abandoned", "cancelled")]).is_none());
+
+        let blocker = todo_exit_blocker(&[
+            todo("1", "wrote engine", "completed"),
+            todo("2", "playtest the game", "in_progress"),
+            todo("3", "add sound", "pending"),
+        ])
+        .expect("open todos must block the exit");
+        assert!(blocker.contains("2 todo item(s)"));
+        assert!(blocker.contains("playtest the game"));
+    }
+
+    #[tokio::test]
+    async fn todo_gate_sees_tool_written_todos() {
+        todowrite::clear();
+        let tool = todowrite::TodoWriteTool;
+        let r = tool
+            .execute(
+                "1",
+                serde_json::json!({
+                    "todos": [{"id": "g", "content": "write game loop", "status": "pending"}]
+                }),
+            )
+            .await;
+        assert!(!r.is_error);
+        let blocker = todo_exit_blocker(&todowrite::snapshot());
+        assert!(blocker.is_some());
+
+        let r = tool
+            .execute(
+                "2",
+                serde_json::json!({
+                    "todos": [{"id": "g", "content": "write game loop", "status": "completed"}]
+                }),
+            )
+            .await;
+        assert!(!r.is_error);
+        assert!(todo_exit_blocker(&todowrite::snapshot()).is_none());
+        todowrite::clear();
     }
 }

@@ -40,6 +40,11 @@ impl AgentMode {
         }
     }
 
+    /// Agent and plan turns are an RLM. Ask stays a normal chat with no tools.
+    pub fn uses_rlm(self) -> bool {
+        !matches!(self, Self::Ask)
+    }
+
     pub fn system_note(self) -> Option<&'static str> {
         match self {
             Self::Agent => None,

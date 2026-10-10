@@ -55,9 +55,11 @@ impl AgentTool for ApplyPatchTool {
         let args = normalize_patch_args(args);
         let parsed: ApplyPatchArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolExecuteResult::error(format!(
+            Err(e) => {
+                return ToolExecuteResult::error(format!(
                 "Invalid apply_patch args: {e}. Expected {{patch: \"...\", file_path?: \"...\"}}."
-            )),
+            ))
+            }
         };
         if parsed.patch.trim().is_empty() {
             return ToolExecuteResult::error("patch must not be empty");

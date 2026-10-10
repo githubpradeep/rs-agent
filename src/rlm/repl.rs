@@ -62,7 +62,28 @@ def load_dir(path, max_files=50, max_bytes=200000):
 
 def FINAL(value):
     _NS["_FINAL"] = value
+    _NS.pop("_FINAL_NAME", None)
     return value
+
+def FINAL_VAR(name):
+    key = str(name)
+    if key not in _NS:
+        raise KeyError("FINAL_VAR: %s is not defined" % key)
+    _NS["_FINAL"] = _NS[key]
+    _NS["_FINAL_NAME"] = key
+    return key
+
+def read_file(path, offset=1, limit=200):
+    return _host("read_file", str(path), offset=int(offset), limit=int(limit))
+
+def grep(pattern, path=".", include=None):
+    kwargs = {"path": str(path)}
+    if include:
+        kwargs["include"] = str(include)
+    return _host("grep", str(pattern), **kwargs)
+
+def bash(command):
+    return _host("bash", str(command))
 
 _NS.update({
     "llm_query": llm_query,
@@ -71,6 +92,10 @@ _NS.update({
     "load_file": load_file,
     "load_dir": load_dir,
     "FINAL": FINAL,
+    "FINAL_VAR": FINAL_VAR,
+    "read_file": read_file,
+    "grep": grep,
+    "bash": bash,
 })
 
 def handle_exec(code):
@@ -128,6 +153,7 @@ def handle_exec(code):
         "stdout": stdout_cap.getvalue()[-8000:],
         "stderr": (err or stderr_cap.getvalue())[-8000:],
         "final": _NS.get("_FINAL"),
+        "final_name": _NS.get("_FINAL_NAME"),
     }
 
 for line in sys.stdin:
@@ -143,6 +169,7 @@ for line in sys.stdin:
     typ = msg.get("type")
     if typ == "exec":
         _NS.pop("_FINAL", None)
+        _NS.pop("_FINAL_NAME", None)
         out = handle_exec(msg.get("code", ""))
         _REAL_OUT.write(json.dumps(out, default=str) + "\n")
         _REAL_OUT.flush()
@@ -166,6 +193,7 @@ pub struct ReplExecResult {
     pub stdout: String,
     pub stderr: String,
     pub final_value: Option<Value>,
+    pub final_name: Option<String>,
 }
 
 pub struct ReplSession {
@@ -173,6 +201,7 @@ pub struct ReplSession {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     write_lock: Mutex<()>,
+    dead: bool,
 }
 
 /// Error message shown whenever `python3` can't be found on `PATH`.
@@ -220,6 +249,7 @@ impl ReplSession {
             stdin,
             stdout: BufReader::new(stdout),
             write_lock: Mutex::new(()),
+            dead: false,
         };
 
         let _ = session
@@ -280,11 +310,24 @@ impl ReplSession {
 
         loop {
             let mut buf = String::new();
-            let n = self
-                .stdout
-                .read_line(&mut buf)
-                .await
-                .map_err(|e| e.to_string())?;
+            let n = match tokio::time::timeout(
+                std::time::Duration::from_secs(600),
+                self.stdout.read_line(&mut buf),
+            )
+            .await
+            {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => return Err(e.to_string()),
+                Err(_) => {
+                    self.dead = true;
+                    let _ = self.child.kill().await;
+                    return Err(
+                        "REPL was silent for 10 minutes and has been reset. \
+                         Sub-calls are not killed for thinking; Python itself stopped producing output."
+                            .into(),
+                    );
+                }
+            };
             if n == 0 {
                 return Err("REPL exited unexpectedly".to_string());
             }
@@ -333,6 +376,10 @@ impl ReplSession {
                             .unwrap_or("")
                             .to_string(),
                         final_value: v.get("final").cloned().filter(|x| !x.is_null()),
+                        final_name: v
+                            .get("final_name")
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string()),
                     });
                 }
                 _ => {}
@@ -354,6 +401,10 @@ impl ReplSession {
             .await
             .map_err(|e| e.to_string())?;
         serde_json::from_str(buf.trim()).map_err(|e| format!("bad reply: {} ({})", e, buf.trim()))
+    }
+
+    pub fn is_dead(&self) -> bool {
+        self.dead
     }
 
     pub async fn shutdown(mut self) {
@@ -399,5 +450,27 @@ mod tests {
             Err(e) => assert_eq!(e, PYTHON3_NOT_FOUND),
             Ok(_) => panic!("expected spawn to fail with empty PATH"),
         }
+    }
+
+    #[tokio::test]
+    async fn final_var_reads_namespace() {
+        if !python3_available() {
+            return;
+        }
+        let mut session = ReplSession::spawn().await.expect("python3");
+        let result = session
+            .exec_with_host(
+                "answer = 'hello from var'\nFINAL_VAR('answer')\n",
+                |_m, _a, _k| async { Err::<Value, String>("no host".into()) },
+            )
+            .await
+            .expect("exec");
+        assert!(result.ok, "{}", result.stderr);
+        assert_eq!(result.final_name.as_deref(), Some("answer"));
+        assert_eq!(
+            result.final_value,
+            Some(Value::String("hello from var".into()))
+        );
+        session.shutdown().await;
     }
 }

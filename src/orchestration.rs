@@ -91,6 +91,12 @@ impl DualTimeout {
     }
 }
 
+pub fn idle_backoff_secs(misses: u32, base_secs: u64) -> u64 {
+    let base = base_secs.max(1);
+    let shifted = base.saturating_mul(1u64 << misses.min(8));
+    shifted.min(120).max(base.min(120))
+}
+
 /// Exponential backoff with jitter (Conductor RetryLogic).
 pub fn backoff_delay(attempt: u32, base_ms: u64, max_ms: u64, jitter_ms: u64) -> Duration {
     let exp = base_ms.saturating_mul(1u64 << attempt.min(16));
@@ -242,6 +248,14 @@ impl RoutingHandoff {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_backoff_doubles_then_caps() {
+        assert_eq!(idle_backoff_secs(0, 5), 5);
+        assert_eq!(idle_backoff_secs(1, 5), 10);
+        assert_eq!(idle_backoff_secs(2, 5), 20);
+        assert_eq!(idle_backoff_secs(8, 5), 120);
+    }
 
     #[test]
     fn backoff_grows_and_caps() {

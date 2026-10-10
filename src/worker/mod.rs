@@ -441,6 +441,7 @@ async fn run_one_bead(
     }
 
     // Advertise session_id only after a loadable file exists on disk.
+    crate::agent::trajectory::set_session(&session_id);
     seed_session_file(
         &store,
         &session_id,
@@ -779,6 +780,7 @@ pub async fn run_worker(
         fleet::append_log(&claimant, &format!("reclaimed {n} stale lease(s)"));
     }
 
+    let mut idle_misses = 0u32;
     loop {
         if Instant::now() >= deadline {
             eprintln!("[worker:{claimant}] budget exhausted — writing handoff");
@@ -814,6 +816,7 @@ pub async fn run_worker(
         // If we still hold a claimed bead (paused mid-work / TUI detach), continue it.
         let resume_session = status.lock().ok().and_then(|st| st.session_id.clone());
         if let Some(existing) = find_claimed_by(&claimant) {
+            idle_misses = 0;
             eprintln!(
                 "[worker:{claimant}] continuing claimed {} — {}",
                 existing.id, existing.title
@@ -903,9 +906,10 @@ pub async fn run_worker(
                         caste.as_str()
                     );
                     eprintln!("[worker:{claimant}] {caste_idle}");
+                    let wait = crate::orchestration::idle_backoff_secs(idle_misses, cfg.sleep_secs);
+                    idle_misses = idle_misses.saturating_add(1);
                     eprintln!(
-                        "[worker:{claimant}] sleeping {}s (not working — queue not ready)",
-                        cfg.sleep_secs
+                        "[worker:{claimant}] sleeping {wait}s (idle backoff — queue not ready)"
                     );
                     fleet::append_log(&claimant, &caste_idle);
                     if let Ok(mut st) = status.lock() {
@@ -916,7 +920,7 @@ pub async fn run_worker(
                     }
                     // Sleep in slices so pause can interrupt.
                     let mut slept = 0u64;
-                    while slept < cfg.sleep_secs {
+                    while slept < wait {
                         if Instant::now() >= deadline {
                             break;
                         }
@@ -958,6 +962,7 @@ pub async fn run_worker(
             bead.kind.as_str(),
             bead.title
         );
+        idle_misses = 0;
         fleet::append_log(&claimant, &format!("claimed {} — {}", bead.id, bead.title));
 
         match run_one_bead(

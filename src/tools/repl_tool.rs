@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use crossbeam_channel as channel;
 use serde::Deserialize;
 use serde_json::Value;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 #[derive(Deserialize)]
@@ -72,8 +73,10 @@ impl AgentTool for ReplTool {
 
     fn description(&self) -> &str {
         "Execute Python in a persistent Deep Context REPL. Large context lives in the `context` variable \
-         (set via optional context arg or load_file/load_dir). Use llm_query(prompt) for leaf LM \
-         calls and agent_query(task) for recursive coding sub-agents. Call FINAL(value) when done. \
+         (set via optional context arg or load_file/load_dir). read_file, grep, and bash run through \
+         the harness and keep their output in Python variables. Use llm_query(prompt) for leaf LM \
+         calls and agent_query(task) for recursive coding sub-agents. Call FINAL(value) or \
+         FINAL_VAR(name) when done. A long FINAL_VAR stays in the REPL; chat only sees a preview. \
          Stdout is truncated; prefer variables and sub-calls over dumping huge strings."
     }
 
@@ -127,6 +130,7 @@ impl AgentTool for ReplTool {
                 let abort = self.abort.clone();
                 Arc::new(move || crate::tools::default_tools_list_with_abort(abort.clone()))
             },
+            subcall_chars: Arc::new(AtomicUsize::new(0)),
         };
 
         let mut guard = self.repl.lock().await;
@@ -171,7 +175,7 @@ impl AgentTool for ReplTool {
             )
             .await;
 
-        match result {
+        let executed = match result {
             Ok(r) => {
                 self.tree.finish(
                     &node_id,
@@ -180,7 +184,10 @@ impl AgentTool for ReplTool {
                     } else {
                         crate::rlm::CallStatus::Error
                     },
-                    r.final_value.as_ref().map(|v| v.to_string()),
+                    r.final_value.as_ref().map(|v| {
+                        let s = v.to_string();
+                        s.chars().take(200).collect::<String>()
+                    }),
                 );
                 let mut out = String::new();
                 if !r.stdout.is_empty() {
@@ -193,11 +200,11 @@ impl AgentTool for ReplTool {
                     out.push_str("STDERR:\n");
                     out.push_str(&r.stderr);
                 }
-                if let Some(final_v) = r.final_value {
+                if let Some(final_v) = &r.final_value {
                     if !out.is_empty() {
                         out.push('\n');
                     }
-                    out.push_str(&format!("FINAL: {}", final_v));
+                    out.push_str(&format_final(final_v, r.final_name.as_deref()));
                 }
                 if out.is_empty() {
                     out = if r.ok {
@@ -217,7 +224,33 @@ impl AgentTool for ReplTool {
                     .finish(&node_id, crate::rlm::CallStatus::Error, Some(e.clone()));
                 ToolExecuteResult::error(e)
             }
+        };
+        if session.is_dead() {
+            *guard = None;
         }
+        executed
+    }
+}
+
+/// Keep a long REPL answer out of the root window. Short answers pass through.
+fn format_final(value: &Value, name: Option<&str>) -> String {
+    let rendered = match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    const CAP: usize = 8_000;
+    let n = rendered.chars().count();
+    if n <= CAP {
+        match name {
+            Some(n) => format!("FINAL_VAR {n}: {rendered}"),
+            None => format!("FINAL: {rendered}"),
+        }
+    } else {
+        let preview: String = rendered.chars().take(1_500).collect();
+        let label = name.unwrap_or("value");
+        format!(
+            "FINAL_VAR {label}: {n} chars kept in the REPL (not loaded into chat).\npreview:\n{preview}"
+        )
     }
 }
 

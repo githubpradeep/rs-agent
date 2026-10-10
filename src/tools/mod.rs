@@ -15,6 +15,8 @@ pub mod output_sink;
 pub mod post_mutation;
 pub mod question;
 pub mod read;
+pub mod recall;
+pub mod refine;
 pub mod remember;
 pub mod repl_tool;
 pub mod task;
@@ -38,6 +40,8 @@ pub use mail::MailTool;
 pub use moot::MootTool;
 pub use question::QuestionTool;
 pub use read::ReadTool;
+pub use recall::RecallTool;
+pub use refine::RefineTool;
 pub use remember::RememberTool;
 pub use repl_tool::ReplTool;
 pub use task::TaskTool;
@@ -121,6 +125,8 @@ pub fn default_tools_list_with_abort(abort: crate::agent::AbortFlag) -> Vec<Shar
         Arc::new(EscalateTool) as SharedTool,
         Arc::new(MailTool) as SharedTool,
         Arc::new(RememberTool) as SharedTool,
+        Arc::new(RecallTool) as SharedTool,
+        Arc::new(RefineTool) as SharedTool,
         Arc::new(MootTool) as SharedTool,
     ]
 }

@@ -729,7 +729,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_max_iterations(cli.max_iterations)
         .with_rlm_depth(0, cli.rlm_depth)
-        .with_goal_verify(cfg.goal_verify.unwrap_or(true));
+        .with_goal_verify(cfg.goal_verify.unwrap_or(true))
+        .with_exit_gates(cfg.auto_goal.unwrap_or(true))
+        .with_verify_cmd(cfg.verify_cmd.clone());
         rs_agent::tools::register_default_tools_with_rlm(&mut agent, cli.rlm_depth);
         {
             let mcp_cfg = rs_agent::config::Config::load().mcp;

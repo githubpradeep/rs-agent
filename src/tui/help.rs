@@ -170,6 +170,16 @@ pub fn build_entries(keys: &KeyMap) -> Vec<HelpEntry> {
             desc: "set / pause / clear auto-continue goal".into(),
             group: "slash",
         },
+        HelpEntry {
+            keys: "/recall".into(),
+            desc: "read one archived trajectory step by id".into(),
+            group: "slash",
+        },
+        HelpEntry {
+            keys: "/refine".into(),
+            desc: "propose or apply a fact/skill note; does not edit the system prompt".into(),
+            group: "slash",
+        },
     ];
     e.sort_by(|a, b| a.group.cmp(b.group).then(a.keys.cmp(&b.keys)));
     e

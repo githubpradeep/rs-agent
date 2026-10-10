@@ -1,5 +1,6 @@
 pub mod host;
 pub mod repl;
+pub mod root;
 pub mod tree;
 
 pub use host::RlmHost;
