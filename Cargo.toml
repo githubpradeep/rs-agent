@@ -66,3 +66,8 @@ similar = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 base64 = "0.22"
 
+# Linux eval builds (Terminal-Bench / Daytona) vendor OpenSSL so the binary
+# does not depend on the sandbox's libssl. macOS keeps the system TLS stack.
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
+

@@ -9,3 +9,5 @@ example/rlm_demo_corpus.md
 example/demo/outage.log
 .rs-agent/
 .ori/
+jobs/
+.harbor.env
