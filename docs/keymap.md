@@ -261,7 +261,6 @@ Typed in insert mode, run on `Enter`.
 | `/sessions` | Toggle Sessions side panel (project chats · Enter switch · `n` new) |
 | `/sessions list` | Text dump of saved sessions |
 | `/export [md\|json\|html]` | Export the current session transcript (markdown default; json/html for sharing) |
-| `/image <path>` | Queue a Kitty graphics render (Kitty/WezTerm/Ghostty) |
 | `/lsp [start\|stop\|status]` | rust-analyzer diagnostics integration |
 | `/revert` | Restore files changed in the last turn (turn snapshot) |
 | `/trust list\|reset` | Manage the per-project trust store |

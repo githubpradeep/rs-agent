@@ -29,7 +29,6 @@ pub const PALETTE_COMMANDS: &[&str] = &[
     "/rename",
     "/history",
     "/lsp",
-    "/image",
 ];
 
 pub fn filter_commands(query: &str) -> Vec<String> {

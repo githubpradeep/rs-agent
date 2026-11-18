@@ -3,7 +3,6 @@ pub mod command_catalog;
 pub mod help;
 pub mod hit;
 pub mod keys;
-pub mod kitty;
 pub mod layout;
 pub mod renderer;
 pub mod sessions_panel;

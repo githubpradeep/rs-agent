@@ -1705,7 +1705,6 @@ name = "rs-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64",
  "chrono",
  "clap",
  "crossbeam-channel",
