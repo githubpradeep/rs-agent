@@ -81,8 +81,6 @@ pub fn api_key_env_for(provider: &str) -> &'static str {
     match canonicalize_provider(provider).as_str() {
         "openai" => "OPENAI_API_KEY",
         "anthropic" => "ANTHROPIC_API_KEY",
-        "opencode" => "OPENCODE_API_KEY",
-        "opencode-go" => "OPENCODE_GO_API_KEY",
         "openrouter" => "OPENROUTER_API_KEY",
         "groq" => "GROQ_API_KEY",
         "deepseek" => "DEEPSEEK_API_KEY",
@@ -106,78 +104,11 @@ pub fn supports_runtime(provider: &str) -> bool {
 
 pub fn has_configured_auth(provider: &str) -> bool {
     let p = canonicalize_provider(provider);
-    if p == "opencode" || p == "opencode-go" {
-        let env = api_key_env_for(&p);
-        if std::env::var(env).is_ok() {
-            return true;
-        }
-        if crate::config::Secrets::load().get_key(&p).is_some() {
-            return true;
-        }
-        // Zen keys live in OpenCode's auth store (not always exported).
-        opencode_auth_key(&p).is_some()
-    } else {
-        let env = api_key_env_for(&p);
-        if std::env::var(env).is_ok() {
-            return true;
-        }
-        crate::config::Secrets::load().get_key(&p).is_some()
+    let env = api_key_env_for(&p);
+    if std::env::var(env).is_ok() {
+        return true;
     }
-}
-
-/// Paths OpenCode uses for `auth.json` (XDG data dir, then legacy default).
-fn opencode_auth_json_paths() -> Vec<std::path::PathBuf> {
-    let mut paths = Vec::new();
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        if !xdg.is_empty() {
-            paths.push(std::path::PathBuf::from(xdg).join("opencode/auth.json"));
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        paths.push(std::path::PathBuf::from(home).join(".local/share/opencode/auth.json"));
-    }
-    paths
-}
-
-/// Read `provider.key` from OpenCode's `auth.json` (`opencode` / `opencode-go`).
-fn opencode_auth_key(provider: &str) -> Option<String> {
-    let p = canonicalize_provider(provider);
-    if p != "opencode" && p != "opencode-go" {
-        return None;
-    }
-    for path in opencode_auth_json_paths() {
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-            continue;
-        };
-        if let Some(key) = v
-            .get(&p)
-            .and_then(|e| e.get("key"))
-            .and_then(|k| k.as_str())
-            .map(str::trim)
-            .filter(|k| !k.is_empty())
-        {
-            return Some(key.to_string());
-        }
-    }
-    None
-}
-
-/// Load OpenCode Zen API keys from `~/.local/share/opencode/auth.json` into the
-/// process environment when the corresponding env vars are unset.
-pub fn export_opencode_auth_from_file() {
-    if std::env::var("OPENCODE_API_KEY").is_err() {
-        if let Some(key) = opencode_auth_key("opencode") {
-            std::env::set_var("OPENCODE_API_KEY", key);
-        }
-    }
-    if std::env::var("OPENCODE_GO_API_KEY").is_err() {
-        if let Some(key) = opencode_auth_key("opencode-go") {
-            std::env::set_var("OPENCODE_GO_API_KEY", key);
-        }
-    }
+    crate::config::Secrets::load().get_key(&p).is_some()
 }
 
 /// Console / signup URL where the user can create an API key for `provider`.
@@ -189,7 +120,6 @@ pub fn provider_connect_url(provider: &str) -> Option<&'static str> {
         "groq" => Some("https://console.groq.com/keys"),
         "deepseek" => Some("https://platform.deepseek.com/api_keys"),
         "mistral" => Some("https://console.mistral.ai/api-keys/"),
-        "opencode" | "opencode-go" => Some("https://opencode.ai/zen"),
         _ => None,
     }
 }
@@ -251,7 +181,7 @@ pub fn provider_picker_rows() -> Vec<String> {
         }
     }
     // Ensure core ones always appear even if catalog empty
-    for p in ["anthropic", "openai", "opencode", "openrouter"] {
+    for p in ["anthropic", "openai", "openrouter"] {
         if !rows.iter().any(|r| r.starts_with(&format!("{p} "))) && supports_runtime(p) {
             let ready = has_configured_auth(p);
             let mark = if ready { "ready" } else { "needs key" };
@@ -346,8 +276,7 @@ pub fn provider_client_needs_recreate(
 
 /// Construct a provider client by name.
 ///
-/// When `opts.default_model` is set, uses that model's catalog `api` + `base_url`
-/// (critical for OpenCode Zen: OpenAI `/zen/v1` vs Anthropic `/zen`).
+/// When `opts.default_model` is set, uses that model's catalog `api` + `base_url`.
 pub fn create_provider(name: &str, opts: CreateProviderOpts) -> Result<Arc<dyn Provider>, String> {
     let p = canonicalize_provider(name);
     let timeout = if opts.timeout_secs == 0 {
@@ -356,11 +285,17 @@ pub fn create_provider(name: &str, opts: CreateProviderOpts) -> Result<Arc<dyn P
         opts.timeout_secs
     };
 
-    if p == "opencode" || p == "opencode-go" {
-        export_opencode_auth_from_file();
-    }
-
     let sample = catalog_entry_for(&p, opts.default_model.as_deref());
+    // Unknown provider without an explicit base URL would silently hit the
+    // OpenAI endpoint with the wrong key — fail loudly instead. A custom
+    // OpenAI-compatible endpoint stays available via `--base-url`.
+    if sample.is_none() && opts.base_url.is_none() && p != "openai" {
+        return Err(format!(
+            "Unknown provider `{p}` — use a catalog provider \
+             (anthropic / openai / openrouter) or pass --base-url \
+             for a custom OpenAI-compatible endpoint."
+        ));
+    }
     let api = sample
         .map(|m| m.api.as_str())
         .unwrap_or("openai-completions");
@@ -404,7 +339,7 @@ pub fn create_provider(name: &str, opts: CreateProviderOpts) -> Result<Arc<dyn P
         }
         other => Err(format!(
             "Provider `{}` uses API `{}` which rs-agent cannot drive yet. \
-             Use openai / anthropic / opencode or set a compatible base URL.",
+             Use anthropic / openai / openrouter or set a compatible base URL.",
             p, other
         )),
     }
@@ -497,9 +432,6 @@ pub async fn fetch_all_model_displays(timeout_secs: u64) -> Vec<String> {
         ) else {
             continue;
         };
-        if p == "opencode" || p == "opencode-go" {
-            export_opencode_auth_from_file();
-        }
         let key = std::env::var(provider.api_key_env_var()).unwrap_or_default();
         if key.is_empty() {
             continue;
@@ -565,7 +497,7 @@ mod tests {
 
     #[test]
     fn create_core_providers() {
-        for p in ["anthropic", "openai", "openrouter", "groq", "opencode"] {
+        for p in ["anthropic", "openai", "openrouter"] {
             assert!(
                 create_provider(p, CreateProviderOpts::new()).is_ok(),
                 "failed for {p}"
@@ -574,102 +506,22 @@ mod tests {
     }
 
     #[test]
-    fn opencode_deepseek_uses_zen_v1() {
-        let p = create_provider(
-            "opencode",
-            CreateProviderOpts {
-                default_model: Some("deepseek-v4-flash-free".into()),
-                ..Default::default()
-            },
-        )
-        .expect("opencode client");
-        assert_eq!(p.base_url(), "https://opencode.ai/zen/v1");
-        assert_eq!(p.name(), "opencode");
-    }
-
-    #[test]
-    fn opencode_claude_uses_anthropic_zen() {
-        let p = create_provider(
-            "opencode",
-            CreateProviderOpts {
-                default_model: Some("claude-haiku-4-5".into()),
-                ..Default::default()
-            },
-        )
-        .expect("opencode anthropic client");
-        assert_eq!(p.base_url(), "https://opencode.ai/zen/v1");
-        assert_eq!(p.name(), "opencode");
-        assert!(provider_client_needs_recreate(
-            "opencode",
-            "deepseek-v4-flash-free",
-            "opencode",
-            "claude-haiku-4-5"
-        ));
-        assert!(!provider_client_needs_recreate(
-            "opencode",
-            "deepseek-v4-flash-free",
-            "opencode",
-            "deepseek-v4-pro"
-        ));
-    }
-
-    #[test]
-    fn connect_url_points_at_zen() {
-        assert_eq!(
-            provider_connect_url("opencode"),
-            Some("https://opencode.ai/zen")
-        );
-    }
-
-    #[test]
-    fn opencode_auth_from_json_file() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let before_key = std::env::var_os("OPENCODE_API_KEY");
-        let before_go = std::env::var_os("OPENCODE_GO_API_KEY");
-        let before_home = std::env::var_os("HOME");
-        let before_xdg = std::env::var_os("XDG_DATA_HOME");
-
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let auth_dir = tmp.path().join("opencode");
-        std::fs::create_dir_all(&auth_dir).unwrap();
-        std::fs::write(
-            auth_dir.join("auth.json"),
-            r#"{"opencode":{"type":"api","key":"zen-test-key"},"opencode-go":{"type":"api","key":"go-test-key"}}"#,
-        )
-        .unwrap();
-        // Isolate from the real ~/.local/share/opencode/auth.json.
-        std::env::set_var("HOME", tmp.path().join("no-home"));
-        std::env::set_var("XDG_DATA_HOME", tmp.path());
-        std::env::remove_var("OPENCODE_API_KEY");
-        std::env::remove_var("OPENCODE_GO_API_KEY");
-
-        assert!(has_configured_auth("opencode"));
-        assert!(has_configured_auth("opencode-go"));
-        export_opencode_auth_from_file();
-        assert_eq!(std::env::var("OPENCODE_API_KEY").unwrap(), "zen-test-key");
-        assert_eq!(std::env::var("OPENCODE_GO_API_KEY").unwrap(), "go-test-key");
-
-        match before_key {
-            Some(v) => std::env::set_var("OPENCODE_API_KEY", v),
-            None => std::env::remove_var("OPENCODE_API_KEY"),
-        }
-        match before_go {
-            Some(v) => std::env::set_var("OPENCODE_GO_API_KEY", v),
-            None => std::env::remove_var("OPENCODE_GO_API_KEY"),
-        }
-        match before_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-        match before_xdg {
-            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-            None => std::env::remove_var("XDG_DATA_HOME"),
-        }
+    fn unknown_provider_without_base_url_errors() {
+        // Removed provider ids must fail loudly, not silently hit OpenAI.
+        assert!(create_provider("opencode", CreateProviderOpts::new()).is_err());
+        assert!(create_provider("opencode-go", CreateProviderOpts::new()).is_err());
+        assert!(create_provider("groq", CreateProviderOpts::new()).is_err());
+        // A custom endpoint via --base-url still works for any name.
+        let custom = CreateProviderOpts {
+            base_url: Some("http://localhost:8080/v1".into()),
+            ..Default::default()
+        };
+        assert!(create_provider("my-proxy", custom).is_ok());
     }
 
     #[test]
     fn core_providers_are_known_and_runnable() {
-        for p in ["anthropic", "openai", "opencode", "openrouter"] {
+        for p in ["anthropic", "openai", "openrouter"] {
             assert!(is_known_provider(p), "{p} should be known");
             assert!(supports_runtime(p), "{p} should be runnable");
         }

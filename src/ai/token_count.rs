@@ -61,7 +61,6 @@ static MODEL_LIMITS: LazyLock<HashMap<&str, usize>> = LazyLock::new(|| {
     m.insert("deepseek-chat", 200_000);
     m.insert("deepseek-reasoner", 200_000);
     m.insert("deepseek-v4-flash-free", 200_000);
-    m.insert("opencode/deepseek-v4-flash-free", 200_000);
     m.insert("command-r", 128_000);
     m.insert("command-r-plus", 128_000);
     m

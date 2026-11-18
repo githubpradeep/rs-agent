@@ -160,7 +160,7 @@ impl AgentState {
         }
     }
 
-    /// Make history valid for OpenAI-compat providers (DeepSeek / OpenCode Zen):
+    /// Make history valid for OpenAI-compat providers (DeepSeek / OpenRouter):
     /// - every `tool` message answers an open `tool_calls` id from the preceding assistant
     /// - tool results stay contiguous after that assistant (pull forward if a user/system
     ///   landed between them — e.g. harness nudges or compaction)

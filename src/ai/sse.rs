@@ -2,7 +2,7 @@
 //!
 //! Reqwest delivers TCP chunks that often split mid-`data: …` line. Parsing
 //! each chunk with `.lines()` alone drops incomplete events and can yield empty
-//! assistant turns (especially on OpenCode Zen / DeepSeek).
+//! assistant turns (especially on DeepSeek and other OpenAI-compat providers).
 
 use crate::ai::types::{ProviderError, StreamDelta};
 use futures::StreamExt;

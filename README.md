@@ -175,7 +175,7 @@ Full keymap: [`docs/keymap.md`](docs/keymap.md).
 
 | Flag | Description |
 |------|-------------|
-| `--provider` | `anthropic` (recommended), `openai`, `opencode` |
+| `--provider` | `anthropic` (recommended), `openai`, `openrouter` |
 | `--model` | Model override |
 | `--rlm-depth` | Max Deep Context recursion depth (default 2) |
 | `--rlm-escalate-chars` | Auto Deep Context escalate threshold (default 10000) |
@@ -204,7 +204,6 @@ Full keymap: [`docs/keymap.md`](docs/keymap.md).
 | Anthropic | `anthropic` | `ANTHROPIC_API_KEY` | Recommended. |
 | OpenAI | `openai` | `OPENAI_API_KEY` | Any OpenAI-compatible endpoint via `--base-url`. |
 | OpenRouter | `openrouter` | `OPENROUTER_API_KEY` | Aggregator — a curated slice of frontier models (`openrouter/<id>`, incl. `openrouter/auto`). |
-| OpenCode Zen | `opencode` | `OPENCODE_API_KEY` | Reuses `~/.local/share/opencode/auth.json` when present. |
 
 Curated catalog in [`data/models.catalog.json`](data/models.catalog.json).
 `/model` shows models for providers that have credentials. Mid-session:

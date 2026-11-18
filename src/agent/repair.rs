@@ -384,7 +384,7 @@ mod tests {
 
     #[test]
     fn weak_model_detects_flash_free() {
-        assert!(is_weak_model("opencode/deepseek-v4-flash-free"));
+        assert!(is_weak_model("openrouter/deepseek-v4-flash-free"));
         assert!(is_weak_model("claude-haiku-4"));
         assert!(!is_weak_model("claude-opus-4-6"));
         assert!(!is_weak_model("us.anthropic.claude-sonnet-4-5"));

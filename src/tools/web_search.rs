@@ -19,7 +19,7 @@ const EXA_URL: &str = "https://mcp.exa.ai/mcp";
 const MAX_NUM_RESULTS: u32 = 20;
 
 fn select_provider(session_seed: &str) -> &'static str {
-    if let Ok(val) = std::env::var("OPENCODE_WEBSEARCH_PROVIDER") {
+    if let Ok(val) = std::env::var("RS_AGENT_WEBSEARCH_PROVIDER") {
         if val == "exa" || val == "parallel" {
             return Box::leak(val.into_boxed_str());
         }

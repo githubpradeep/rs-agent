@@ -162,9 +162,9 @@ mod fuzzy_tests {
     #[test]
     fn fuzzy_matches_subsequence() {
         let items = vec![
-            "opencode-cli/opencode/claude-sonnet-4-6".into(),
-            "opencode-cli/opencode/deepseek-v4-flash-free".into(),
-            "anthropic/claude-haiku-4-5".into(),
+            "openrouter/anthropic/claude-sonnet-4.5".into(),
+            "openrouter/deepseek/deepseek-v4-flash-free".into(),
+            "anthropic/claude-haiku-4.5".into(),
         ];
         let hit = App::rank_and_filter(&items, "sonnet", 10);
         assert!(hit.iter().any(|s| s.contains("sonnet")));

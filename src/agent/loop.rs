@@ -460,7 +460,7 @@ impl AgentLoop {
     }
 
     /// Arm the default completion goal for task-like requests so an interactive
-    /// session cannot stop on an unverified summary (opencode/Codex parity).
+    /// session cannot stop on an unverified summary (agent-harness parity).
     /// Existing live goals win; achieved/cleared goals re-arm per request.
     fn maybe_arm_default_goal(
         &mut self,
@@ -1052,7 +1052,7 @@ impl AgentLoop {
         match self.run_loop(callback).await {
             Ok(()) => Ok(()),
             Err(e) if e == "aborted" => {
-                // OpenCode: unsettled tools become interrupted error results so the
+                // Unsettled tools become interrupted error results so the
                 // next turn never sends unpaired tool_use to the provider.
                 let (syn, drop) = self.state.repair_tool_pairing();
                 if syn > 0 || drop > 0 {
@@ -1207,7 +1207,7 @@ impl AgentLoop {
             self.check_aborted()?;
             // Guarantee tool_use/tool_result pairing before every LLM call.
             // Compaction / harness nudges can otherwise leave orphan `role:tool`
-            // messages that OpenCode Zen rejects with HTTP 400.
+            // messages that strict OpenAI-compatible providers reject with HTTP 400.
             let (synthesized, dropped) = self.state.repair_tool_pairing();
             if synthesized > 0 || dropped > 0 {
                 callback(AgentEvent::Status {
@@ -1522,7 +1522,7 @@ impl AgentLoop {
             match self.provider.chat_stream(&api_key, request.clone()).await {
                 Ok(mut stream) => {
                     // Accumulate text/thinking by type, not by content_index.
-                    // OpenAI-compat streams (OpenCode/DeepSeek) use index 0 for both
+                    // OpenAI-compat streams (DeepSeek and others) use index 0 for both
                     // thinking and text; sharing one slot dropped text from history
                     // while still painting it in the TUI ("Empty model response").
                     let mut text_buf = String::new();

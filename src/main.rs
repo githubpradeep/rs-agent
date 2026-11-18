@@ -109,8 +109,7 @@ fn maybe_run_first_launch_wizard(
     eprintln!("(Press Enter to accept defaults; Ctrl-C to cancel)\n");
 
     let provider = {
-        let raw =
-            read_line_prompt("Provider [anthropic/openai/opencode/openrouter] (anthropic): ")?;
+        let raw = read_line_prompt("Provider [anthropic/openai/openrouter] (anthropic): ")?;
         if raw.is_empty() {
             "anthropic".to_string()
         } else {
@@ -147,17 +146,10 @@ fn maybe_run_first_launch_wizard(
     }
 
     let env_name = rs_agent::ai::registry::api_key_env_for(&provider).to_string();
-    // OpenCode Zen: reuse local `auth.json` when present.
-    if matches!(provider.to_lowercase().as_str(), "opencode" | "opencode-go") {
-        rs_agent::ai::registry::export_opencode_auth_from_file();
-    }
     if std::env::var(&env_name).is_err() && !rs_agent::ai::registry::has_configured_auth(&provider)
     {
         eprintln!("\nNo {} in the environment yet.", env_name);
         eprintln!("  export {}=...", env_name);
-        if matches!(provider.to_lowercase().as_str(), "opencode" | "opencode-go") {
-            eprintln!("  (or sign in with OpenCode — keys are read from ~/.local/share/opencode/auth.json)");
-        }
         let smoke = read_line_prompt("Run a tiny smoke prompt after you set the key? [y/N]: ")?;
         if smoke.eq_ignore_ascii_case("y") || smoke.eq_ignore_ascii_case("yes") {
             eprintln!(
@@ -181,7 +173,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = Config::ensure_user_dir();
     let _ = Config::write_default_user_config_if_missing();
     rs_agent::config::export_secrets_to_env();
-    rs_agent::ai::registry::export_opencode_auth_from_file();
 
     // Merge config file values into any CLI fields left at their clap
     // defaults / `None`. Explicit CLI flags always win.
@@ -216,14 +207,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.timeout,
     )?;
 
-    // Re-export after provider construction path may have run (auth.json).
-    if matches!(
-        provider_name.to_lowercase().as_str(),
-        "opencode" | "opencode-go"
-    ) {
-        rs_agent::ai::registry::export_opencode_auth_from_file();
-    }
-
     let env_name = provider.api_key_env_var().to_string();
     if let Some(ref key) = cli.api_key {
         std::env::set_var(&env_name, key);
@@ -240,9 +223,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var(&env_name).is_err() {
         eprintln!("Missing API key for {}.", provider_lower);
         eprintln!("  export {}=sk-...", env_name);
-        if matches!(provider_lower.as_str(), "opencode" | "opencode-go") {
-            eprintln!("  Or sign in with OpenCode (reads ~/.local/share/opencode/auth.json).");
-        }
         eprintln!("Or paste a key via /provider|/login (saved to ~/.rs-agent/secrets.toml).");
         std::process::exit(1);
     }

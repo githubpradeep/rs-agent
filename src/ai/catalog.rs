@@ -1,5 +1,5 @@
 //! Built-in model catalog: curated entries for the providers rs-agent can
-//! drive (anthropic, openai, opencode zen). Hand-maintained JSON at
+//! drive (anthropic, openai, openrouter). Hand-maintained JSON at
 //! `data/models.catalog.json`.
 
 use serde::Deserialize;

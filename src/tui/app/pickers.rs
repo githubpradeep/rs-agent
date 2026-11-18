@@ -29,15 +29,9 @@ impl App {
         if !crate::ai::registry::is_known_provider(&mref.provider) {
             return Err(format!("Unknown provider `{}`", mref.provider));
         }
-        // Prefer OpenCode Zen keys from the local OpenCode install when unset.
-        if mref.provider.eq_ignore_ascii_case("opencode")
-            || mref.provider.eq_ignore_ascii_case("opencode-go")
-        {
-            crate::ai::registry::export_opencode_auth_from_file();
-        }
         if !crate::ai::registry::has_configured_auth(&mref.provider) {
             return Err(format!(
-                "Provider `{}` has no credentials (export {} or sign in via OpenCode).",
+                "Provider `{}` has no credentials (export {}).",
                 mref.provider,
                 crate::ai::registry::api_key_env_for(&mref.provider)
             ));
