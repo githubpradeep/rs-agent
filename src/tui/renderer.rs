@@ -1,17 +1,8 @@
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use std::sync::OnceLock;
-use syntect::easy::HighlightLines;
-use syntect::highlighting::FontStyle;
-use syntect::parsing::SyntaxSet;
 
 use super::theme::Palette;
-
-fn syntax_set() -> &'static SyntaxSet {
-    static SS: OnceLock<SyntaxSet> = OnceLock::new();
-    SS.get_or_init(|| SyntaxSet::load_defaults_newlines())
-}
 
 /// Palette-derived markdown colors (light themes no longer get dark ANSI).
 #[derive(Clone, Copy)]
@@ -41,43 +32,30 @@ impl MarkdownStyle {
     }
 }
 
-fn highlight_code(code: &str, lang: &str, syntect_theme: &str) -> Vec<Line<'static>> {
-    let ss = syntax_set();
-    let ts = syntect::highlighting::ThemeSet::load_defaults();
-    let syntax = ss
-        .find_syntax_by_token(lang)
-        .unwrap_or_else(|| ss.find_syntax_plain_text());
-    let theme = ts
-        .themes
-        .get(syntect_theme)
-        .unwrap_or(&ts.themes["base16-ocean.dark"]);
-    let mut highlighter = HighlightLines::new(syntax, theme);
-
+fn render_code_lines(code: &str, md: MarkdownStyle) -> Vec<Line<'static>> {
     code.lines()
         .map(|line| {
-            let ranges = highlighter.highlight_line(line, ss).unwrap_or_default();
-            let spans: Vec<Span<'static>> = ranges
-                .into_iter()
-                .map(|(style, text)| {
-                    let fg = style.foreground;
-                    let mut s = Style::default().fg(Color::Rgb(fg.r, fg.g, fg.b));
-                    if style.font_style.contains(FontStyle::BOLD) {
-                        s = s.add_modifier(Modifier::BOLD);
-                    }
-                    if style.font_style.contains(FontStyle::ITALIC) {
-                        s = s.add_modifier(Modifier::ITALIC);
-                    }
-                    Span::styled(text.to_string(), s)
-                })
-                .collect();
-            Line::from(spans)
+            let mut s = Vec::with_capacity(2);
+            s.push(Span::styled(
+                " │ ".to_string(),
+                Style::default().fg(md.code_gutter),
+            ));
+            s.push(Span::styled(
+                if line.is_empty() {
+                    " ".to_string()
+                } else {
+                    line.to_string()
+                },
+                Style::default().fg(md.inline_code),
+            ));
+            Line::from(s)
         })
         .collect()
 }
 
-/// Renders markdown to styled ratatui lines, syntax-highlighting fenced code
-/// blocks using `syntect_theme`.
-pub fn render_markdown(text: &str, syntect_theme: &str, md: MarkdownStyle) -> Vec<Line<'static>> {
+/// Renders markdown to styled ratatui lines; fenced code blocks get a
+/// gutter-marked plain style.
+pub fn render_markdown(text: &str, md: MarkdownStyle) -> Vec<Line<'static>> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TABLES);
@@ -88,7 +66,6 @@ pub fn render_markdown(text: &str, syntect_theme: &str, md: MarkdownStyle) -> Ve
     let mut para_sep = false;
 
     let mut in_code_block = false;
-    let mut code_lang = String::new();
     let mut code_text = String::new();
     let mut in_heading = false;
     let mut heading_lvl = 0u32;
@@ -128,7 +105,8 @@ pub fn render_markdown(text: &str, syntect_theme: &str, md: MarkdownStyle) -> Ve
                 }
                 Tag::CodeBlock(kind) => {
                     in_code_block = true;
-                    code_lang = match kind {
+                    // Language token is parsed but unused (plain code styling).
+                    let _lang = match kind {
                         CodeBlockKind::Fenced(lang) => lang.to_string(),
                         CodeBlockKind::Indented => String::new(),
                     };
@@ -162,12 +140,8 @@ pub fn render_markdown(text: &str, syntect_theme: &str, md: MarkdownStyle) -> Ve
                 TagEnd::CodeBlock => {
                     in_code_block = false;
                     if !code_text.is_empty() {
-                        let highlighted = highlight_code(&code_text, &code_lang, syntect_theme);
-                        for hl_line in highlighted {
-                            let mut s = Vec::with_capacity(hl_line.spans.len() + 1);
-                            s.push(Span::styled(" │ ", Style::default().fg(md.code_gutter)));
-                            s.extend(hl_line.spans);
-                            lines.push(Line::from(s));
+                        for hl_line in render_code_lines(&code_text, md) {
+                            lines.push(hl_line);
                         }
                     }
                     code_text.clear();

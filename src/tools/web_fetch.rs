@@ -47,7 +47,7 @@ fn extract_text(node: scraper::ElementRef, out: &mut String) {
                 }
             }
             scraper::node::Node::Element(_) => {
-                if let Some(el) = scraper::ElementRef::wrap(child.clone()) {
+                if let Some(el) = scraper::ElementRef::wrap(child) {
                     let tag = el.value().name();
                     if matches!(
                         tag,
@@ -72,15 +72,17 @@ fn extract_text(node: scraper::ElementRef, out: &mut String) {
                             | "table"
                             | "ul"
                             | "ol"
-                    ) {
-                        if !out.is_empty() && !out.ends_with('\n') {
-                            out.push('\n');
-                        }
+                    ) && !out.is_empty()
+                        && !out.ends_with('\n')
+                    {
+                        out.push('\n');
                     }
-                    if matches!(tag, "td" | "th") {
-                        if !out.is_empty() && !out.ends_with('\n') && !out.ends_with(' ') {
-                            out.push_str("  ");
-                        }
+                    if matches!(tag, "td" | "th")
+                        && !out.is_empty()
+                        && !out.ends_with('\n')
+                        && !out.ends_with(' ')
+                    {
+                        out.push_str("  ");
                     }
                     if tag == "a" {
                         let href = el.value().attr("href").unwrap_or("");
@@ -107,14 +109,14 @@ fn html_to_markdown(html: &str) -> String {
     let mut md = String::new();
     let body_sel = Selector::parse("body").unwrap();
     if let Some(body) = doc.select(&body_sel).next() {
-        node_to_markdown(body, &mut md, 0);
+        node_to_markdown(body, &mut md);
     } else {
-        node_to_markdown(doc.root_element(), &mut md, 0);
+        node_to_markdown(doc.root_element(), &mut md);
     }
     md.trim().to_string()
 }
 
-fn node_to_markdown(node: scraper::ElementRef, out: &mut String, depth: usize) {
+fn node_to_markdown(node: scraper::ElementRef, out: &mut String) {
     for child in node.children() {
         match child.value() {
             scraper::node::Node::Text(t) => {
@@ -124,7 +126,7 @@ fn node_to_markdown(node: scraper::ElementRef, out: &mut String, depth: usize) {
                 }
             }
             scraper::node::Node::Element(_) => {
-                if let Some(el) = scraper::ElementRef::wrap(child.clone()) {
+                if let Some(el) = scraper::ElementRef::wrap(child) {
                     let tag = el.value().name();
                     match tag {
                         "script" | "style" | "noscript" | "iframe" | "object" | "embed" => continue,
@@ -132,7 +134,7 @@ fn node_to_markdown(node: scraper::ElementRef, out: &mut String, depth: usize) {
                             let level = tag[1..].parse::<usize>().unwrap_or(1);
                             let prefix = "#".repeat(level);
                             let mut content = String::new();
-                            node_to_markdown(el, &mut content, depth + 1);
+                            node_to_markdown(el, &mut content);
                             let trimmed = content.trim();
                             if !trimmed.is_empty() {
                                 out.push_str(&format!("\n{} {}\n\n", prefix, trimmed));
@@ -140,14 +142,14 @@ fn node_to_markdown(node: scraper::ElementRef, out: &mut String, depth: usize) {
                         }
                         "p" => {
                             let mut content = String::new();
-                            node_to_markdown(el, &mut content, depth + 1);
+                            node_to_markdown(el, &mut content);
                             let trimmed = content.trim();
                             if !trimmed.is_empty() {
                                 out.push_str(&format!("\n{}\n\n", trimmed));
                             }
                         }
                         "br" => {
-                            out.push_str("\n");
+                            out.push('\n');
                         }
                         "hr" => {
                             out.push_str("\n---\n\n");
@@ -157,10 +159,10 @@ fn node_to_markdown(node: scraper::ElementRef, out: &mut String, depth: usize) {
                             let is_ol = tag == "ol";
                             let mut idx = 1;
                             for li_child in el.children() {
-                                if let Some(li_el) = scraper::ElementRef::wrap(li_child.clone()) {
+                                if let Some(li_el) = scraper::ElementRef::wrap(li_child) {
                                     if li_el.value().name() == "li" {
                                         let mut content = String::new();
-                                        node_to_markdown(li_el, &mut content, depth + 1);
+                                        node_to_markdown(li_el, &mut content);
                                         let trimmed = content.trim();
                                         if !trimmed.is_empty() {
                                             let bullet = if is_ol {
@@ -179,11 +181,11 @@ fn node_to_markdown(node: scraper::ElementRef, out: &mut String, depth: usize) {
                         }
                         "li" => {
                             // Handled by ul/ol
-                            node_to_markdown(el, out, depth);
+                            node_to_markdown(el, out);
                         }
                         "blockquote" => {
                             let mut content = String::new();
-                            node_to_markdown(el, &mut content, depth + 1);
+                            node_to_markdown(el, &mut content);
                             for line in content.trim().lines() {
                                 out.push_str(&format!("> {}\n", line));
                             }
@@ -192,10 +194,9 @@ fn node_to_markdown(node: scraper::ElementRef, out: &mut String, depth: usize) {
                         "pre" => {
                             let mut code = String::new();
                             for code_child in el.children() {
-                                if let Some(code_el) = scraper::ElementRef::wrap(code_child.clone())
-                                {
+                                if let Some(code_el) = scraper::ElementRef::wrap(code_child) {
                                     if code_el.value().name() == "code" {
-                                        node_to_markdown(code_el, &mut code, depth + 1);
+                                        node_to_markdown(code_el, &mut code);
                                     }
                                 } else if let scraper::node::Node::Text(t) = code_child.value() {
                                     code.push_str(&t.text);
@@ -217,7 +218,7 @@ fn node_to_markdown(node: scraper::ElementRef, out: &mut String, depth: usize) {
                                 .unwrap_or(false);
                             if !is_in_pre {
                                 let mut content = String::new();
-                                node_to_markdown(el, &mut content, depth + 1);
+                                node_to_markdown(el, &mut content);
                                 let trimmed = content.trim();
                                 if !trimmed.is_empty() {
                                     out.push_str(&format!("`{}`", trimmed));
@@ -226,7 +227,7 @@ fn node_to_markdown(node: scraper::ElementRef, out: &mut String, depth: usize) {
                         }
                         "strong" | "b" => {
                             let mut content = String::new();
-                            node_to_markdown(el, &mut content, depth + 1);
+                            node_to_markdown(el, &mut content);
                             let trimmed = content.trim();
                             if !trimmed.is_empty() {
                                 out.push_str(&format!("**{}**", trimmed));
@@ -234,7 +235,7 @@ fn node_to_markdown(node: scraper::ElementRef, out: &mut String, depth: usize) {
                         }
                         "em" | "i" => {
                             let mut content = String::new();
-                            node_to_markdown(el, &mut content, depth + 1);
+                            node_to_markdown(el, &mut content);
                             let trimmed = content.trim();
                             if !trimmed.is_empty() {
                                 out.push_str(&format!("*{}*", trimmed));
@@ -243,7 +244,7 @@ fn node_to_markdown(node: scraper::ElementRef, out: &mut String, depth: usize) {
                         "a" => {
                             let href = el.value().attr("href").unwrap_or("");
                             let mut content = String::new();
-                            node_to_markdown(el, &mut content, depth + 1);
+                            node_to_markdown(el, &mut content);
                             let trimmed = content.trim();
                             if !trimmed.is_empty() && !href.is_empty() {
                                 out.push_str(&format!("[{}]({})", trimmed, href));
@@ -260,7 +261,7 @@ fn node_to_markdown(node: scraper::ElementRef, out: &mut String, depth: usize) {
                         }
                         "table" => {
                             let mut content = String::new();
-                            node_to_markdown(el, &mut content, depth + 1);
+                            node_to_markdown(el, &mut content);
                             let trimmed = content.trim();
                             if !trimmed.is_empty() {
                                 out.push_str(&format!("\n{}\n\n", trimmed));
@@ -269,12 +270,11 @@ fn node_to_markdown(node: scraper::ElementRef, out: &mut String, depth: usize) {
                         "tr" => {
                             let mut cells = Vec::new();
                             for cell_child in el.children() {
-                                if let Some(cell_el) = scraper::ElementRef::wrap(cell_child.clone())
-                                {
+                                if let Some(cell_el) = scraper::ElementRef::wrap(cell_child) {
                                     let tag_name = cell_el.value().name();
                                     if tag_name == "td" || tag_name == "th" {
                                         let mut content = String::new();
-                                        node_to_markdown(cell_el, &mut content, depth + 1);
+                                        node_to_markdown(cell_el, &mut content);
                                         cells.push(content.trim().to_string());
                                     }
                                 }
@@ -285,10 +285,10 @@ fn node_to_markdown(node: scraper::ElementRef, out: &mut String, depth: usize) {
                         }
                         "div" | "span" | "section" | "article" | "main" | "header" | "footer"
                         | "nav" => {
-                            node_to_markdown(el, out, depth);
+                            node_to_markdown(el, out);
                         }
                         _ => {
-                            node_to_markdown(el, out, depth);
+                            node_to_markdown(el, out);
                         }
                     }
                 }

@@ -1,19 +1,14 @@
-//! Provider/model registry — pi-style mid-session switching + static catalog.
+//! Provider/model registry — mid-session switching + static catalog.
 //!
-//! Active choice is a `(provider, model)` pair. The built-in catalog (from
-//! reference/pi) lists ~1000 models; the picker shows catalog entries for
-//! every provider that has configured auth and a runnable API client.
+//! Active choice is a `(provider, model)` pair. The built-in catalog lists
+//! curated models per provider; the picker shows catalog entries for every
+//! provider that has configured auth and a runnable API client.
 
 use crate::ai::anthropic::AnthropicProvider;
-use crate::ai::bedrock::BedrockProvider;
 use crate::ai::catalog::{self, CatalogModel};
 use crate::ai::openai::OpenAIProvider;
-use crate::ai::opencode_cli::OpenCodeCliProvider;
 use crate::ai::provider::Provider;
 use std::sync::Arc;
-
-/// Hand-maintained extras not (yet) in the extracted pi catalog.
-const EXTRA_PROVIDERS: &[&str] = &["opencode-cli", "bedrock"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRef {
@@ -52,121 +47,46 @@ impl ModelRef {
     }
 }
 
-/// All provider ids we know about (catalog ∪ extras), sorted.
+/// All provider ids we know about (from the catalog), sorted.
 pub fn known_providers() -> Vec<String> {
     let mut v: Vec<String> = catalog::catalog_providers()
         .into_iter()
         .map(|s| s.to_string())
         .collect();
-    for p in EXTRA_PROVIDERS {
-        if !v.iter().any(|x| x == p) {
-            // bedrock alias for amazon-bedrock
-            v.push((*p).to_string());
-        }
-    }
-    // Normalize: prefer `bedrock` as user-facing alias of amazon-bedrock
-    if !v.iter().any(|x| x == "bedrock") {
-        v.push("bedrock".to_string());
-    }
     v.sort();
     v.dedup();
     v
 }
 
-/// Back-compat export used by help text.
-pub const KNOWN_PROVIDERS: &[&str] = &[
-    "anthropic",
-    "openai",
-    "openrouter",
-    "opencode",
-    "opencode-cli",
-    "bedrock",
-    "amazon-bedrock",
-    "groq",
-    "deepseek",
-    "together",
-    "fireworks",
-    "xai",
-    "mistral",
-    "cerebras",
-    "huggingface",
-    "nvidia",
-    "moonshotai",
-    "vercel-ai-gateway",
-    "google",
-];
-
 pub fn is_known_provider(name: &str) -> bool {
     let n = name.to_lowercase();
-    if EXTRA_PROVIDERS.contains(&n.as_str()) || n == "bedrock" {
-        return true;
-    }
     catalog::catalog_providers()
         .iter()
         .any(|p| p.eq_ignore_ascii_case(&n))
 }
 
 fn canonicalize_provider(name: &str) -> String {
-    match name.to_lowercase().as_str() {
-        "bedrock" => "amazon-bedrock".to_string(),
-        other => other.to_string(),
-    }
+    name.to_lowercase()
 }
 
 pub fn default_model_for(provider: &str) -> String {
     let p = canonicalize_provider(provider);
-    if p == "amazon-bedrock" {
-        let models = catalog::models_for_provider(&p);
-        // Prefer a US inference-profile Claude id — bare foundation IDs fail on Bedrock.
-        if let Some(m) = models
-            .iter()
-            .find(|m| m.id.starts_with("us.anthropic.claude-sonnet"))
-        {
-            return m.id.clone();
-        }
-        if let Some(m) = models.iter().find(|m| m.id.starts_with("us.anthropic.")) {
-            return m.id.clone();
-        }
-        return "us.anthropic.claude-opus-4-8".to_string();
-    }
     if let Some(m) = catalog::models_for_provider(&p).first() {
         return m.id.clone();
     }
-    match p.as_str() {
-        "opencode-cli" => "opencode/deepseek-v4-flash-free".to_string(),
-        _ => "gpt-4o".to_string(),
-    }
+    "gpt-4o".to_string()
 }
 
 pub fn api_key_env_for(provider: &str) -> &'static str {
     match canonicalize_provider(provider).as_str() {
-        "openai" | "openai-codex" | "azure-openai-responses" => "OPENAI_API_KEY",
+        "openai" => "OPENAI_API_KEY",
         "anthropic" => "ANTHROPIC_API_KEY",
-        "openrouter" => "OPENROUTER_API_KEY",
-        "opencode" | "opencode-cli" => "OPENCODE_API_KEY",
+        "opencode" => "OPENCODE_API_KEY",
         "opencode-go" => "OPENCODE_GO_API_KEY",
-        "amazon-bedrock" => "AWS_ACCESS_KEY_ID",
+        "openrouter" => "OPENROUTER_API_KEY",
         "groq" => "GROQ_API_KEY",
         "deepseek" => "DEEPSEEK_API_KEY",
-        "together" => "TOGETHER_API_KEY",
-        "fireworks" => "FIREWORKS_API_KEY",
-        "xai" => "XAI_API_KEY",
         "mistral" => "MISTRAL_API_KEY",
-        "cerebras" => "CEREBRAS_API_KEY",
-        "huggingface" => "HF_TOKEN",
-        "nvidia" => "NVIDIA_API_KEY",
-        "moonshotai" | "moonshotai-cn" => "MOONSHOT_API_KEY",
-        "vercel-ai-gateway" | "cloudflare-ai-gateway" => "AI_GATEWAY_API_KEY",
-        "google" | "google-vertex" => "GEMINI_API_KEY",
-        "github-copilot" => "GH_TOKEN",
-        "minimax" | "minimax-cn" => "MINIMAX_API_KEY",
-        "kimi-coding" => "KIMI_API_KEY",
-        "zai" | "zai-coding-cn" => "ZAI_API_KEY",
-        "xiaomi" | "xiaomi-token-plan-ams" | "xiaomi-token-plan-cn" | "xiaomi-token-plan-sgp" => {
-            "XIAOMI_API_KEY"
-        }
-        "ant-ling" => "ANT_LING_API_KEY",
-        "cloudflare-workers-ai" => "CLOUDFLARE_API_TOKEN",
         _ => "API_KEY",
     }
 }
@@ -174,55 +94,34 @@ pub fn api_key_env_for(provider: &str) -> &'static str {
 /// True when we can construct a runnable client for this provider's catalog API.
 pub fn supports_runtime(provider: &str) -> bool {
     let p = canonicalize_provider(provider);
-    if p == "opencode-cli" || p == "amazon-bedrock" {
-        return true;
-    }
     let models = catalog::models_for_provider(&p);
     let Some(sample) = models.first() else {
         return false;
     };
     matches!(
         sample.api.as_str(),
-        "openai-completions"
-            | "openai-responses"
-            | "anthropic-messages"
-            | "bedrock-converse-stream"
-            | "mistral-conversations"
+        "openai-completions" | "openai-responses" | "anthropic-messages" | "mistral-conversations"
     )
 }
 
 pub fn has_configured_auth(provider: &str) -> bool {
     let p = canonicalize_provider(provider);
-    match p.as_str() {
-        "opencode-cli" => true,
-        "amazon-bedrock" => {
-            std::env::var("AWS_ACCESS_KEY_ID").is_ok()
-                || std::env::var("AWS_PROFILE").is_ok()
-                || std::path::Path::new(
-                    &std::env::var("HOME")
-                        .map(|h| format!("{}/.aws/credentials", h))
-                        .unwrap_or_default(),
-                )
-                .exists()
+    if p == "opencode" || p == "opencode-go" {
+        let env = api_key_env_for(&p);
+        if std::env::var(env).is_ok() {
+            return true;
         }
-        "opencode" | "opencode-go" => {
-            let env = api_key_env_for(&p);
-            if std::env::var(env).is_ok() {
-                return true;
-            }
-            if crate::config::Secrets::load().get_key(&p).is_some() {
-                return true;
-            }
-            // Zen keys live in OpenCode's auth store (not always exported).
-            opencode_auth_key(&p).is_some()
+        if crate::config::Secrets::load().get_key(&p).is_some() {
+            return true;
         }
-        other => {
-            let env = api_key_env_for(other);
-            if std::env::var(env).is_ok() {
-                return true;
-            }
-            crate::config::Secrets::load().get_key(other).is_some()
+        // Zen keys live in OpenCode's auth store (not always exported).
+        opencode_auth_key(&p).is_some()
+    } else {
+        let env = api_key_env_for(&p);
+        if std::env::var(env).is_ok() {
+            return true;
         }
+        crate::config::Secrets::load().get_key(&p).is_some()
     }
 }
 
@@ -285,24 +184,12 @@ pub fn export_opencode_auth_from_file() {
 pub fn provider_connect_url(provider: &str) -> Option<&'static str> {
     match canonicalize_provider(provider).as_str() {
         "anthropic" => Some("https://console.anthropic.com/settings/keys"),
-        "openai" | "openai-codex" => Some("https://platform.openai.com/api-keys"),
+        "openai" => Some("https://platform.openai.com/api-keys"),
         "openrouter" => Some("https://openrouter.ai/keys"),
         "groq" => Some("https://console.groq.com/keys"),
         "deepseek" => Some("https://platform.deepseek.com/api_keys"),
-        "together" => Some("https://api.together.xyz/settings/api-keys"),
-        "fireworks" => Some("https://fireworks.ai/account/api-keys"),
-        "xai" => Some("https://console.x.ai/"),
         "mistral" => Some("https://console.mistral.ai/api-keys/"),
-        "cerebras" => Some("https://cloud.cerebras.ai/"),
-        "huggingface" => Some("https://huggingface.co/settings/tokens"),
-        "nvidia" => Some("https://build.nvidia.com/settings/api-keys"),
-        "google" | "google-vertex" => Some("https://aistudio.google.com/apikey"),
         "opencode" | "opencode-go" => Some("https://opencode.ai/zen"),
-        "vercel-ai-gateway" => Some("https://vercel.com/docs/ai-gateway"),
-        "amazon-bedrock" => Some("https://console.aws.amazon.com/bedrock/"),
-        "moonshotai" | "moonshotai-cn" => Some("https://platform.moonshot.ai/"),
-        "minimax" | "minimax-cn" => Some("https://platform.minimax.io/"),
-        "github-copilot" => Some("https://github.com/settings/tokens"),
         _ => None,
     }
 }
@@ -348,9 +235,6 @@ fn open_url(url: &str) -> Result<(), String> {
 pub fn provider_picker_rows() -> Vec<String> {
     let mut rows = Vec::new();
     for p in known_providers() {
-        if !supports_runtime(&p) && p != "opencode-cli" {
-            continue;
-        }
         if !supports_runtime(&p) {
             continue;
         }
@@ -367,13 +251,7 @@ pub fn provider_picker_rows() -> Vec<String> {
         }
     }
     // Ensure core ones always appear even if catalog empty
-    for p in [
-        "anthropic",
-        "openai",
-        "openrouter",
-        "opencode-cli",
-        "bedrock",
-    ] {
+    for p in ["anthropic", "openai", "opencode"] {
         if !rows.iter().any(|r| r.starts_with(&format!("{p} "))) && supports_runtime(p) {
             let ready = has_configured_auth(p);
             let mark = if ready { "ready" } else { "needs key" };
@@ -482,15 +360,6 @@ pub fn create_provider(name: &str, opts: CreateProviderOpts) -> Result<Arc<dyn P
         export_opencode_auth_from_file();
     }
 
-    if p == "opencode-cli" {
-        return Ok(Arc::new(
-            OpenCodeCliProvider::new(None, opts.default_model).with_timeout(timeout),
-        ));
-    }
-    if p == "amazon-bedrock" {
-        return Ok(Arc::new(BedrockProvider::new(opts.base_url, None)));
-    }
-
     let sample = catalog_entry_for(&p, opts.default_model.as_deref());
     let api = sample
         .map(|m| m.api.as_str())
@@ -511,26 +380,31 @@ pub fn create_provider(name: &str, opts: CreateProviderOpts) -> Result<Arc<dyn P
             } else {
                 base
             };
-            Ok(Arc::new(OpenAIProvider::new(
-                Some(base),
-                Some(p.clone()),
-                Some(api_key_env_for(&p).to_string()),
-            )))
+            Ok(Arc::new(
+                OpenAIProvider::new(
+                    Some(base),
+                    Some(p.clone()),
+                    Some(api_key_env_for(&p).to_string()),
+                )
+                .with_timeout(timeout),
+            ))
         }
         "anthropic-messages" => {
             let base = catalog_url
                 .map(|u| normalize_anthropic_base(&u))
                 .unwrap_or_else(|| "https://api.anthropic.com/v1".to_string());
-            Ok(Arc::new(AnthropicProvider::with_key_env(
-                Some(base),
-                Some(p.clone()),
-                Some(api_key_env_for(&p).to_string()),
-            )))
+            Ok(Arc::new(
+                AnthropicProvider::with_key_env(
+                    Some(base),
+                    Some(p.clone()),
+                    Some(api_key_env_for(&p).to_string()),
+                )
+                .with_timeout(timeout),
+            ))
         }
-        "bedrock-converse-stream" => Ok(Arc::new(BedrockProvider::new(opts.base_url, None))),
         other => Err(format!(
             "Provider `{}` uses API `{}` which rs-agent cannot drive yet. \
-             Use openrouter / openai / anthropic / groq / … or set a compatible base URL.",
+             Use openai / anthropic / opencode or set a compatible base URL.",
             p, other
         )),
     }
@@ -545,13 +419,6 @@ pub fn available_catalog_models() -> Vec<&'static CatalogModel> {
         }
         out.extend(catalog::models_for_provider(p));
     }
-    // opencode-cli / bedrock aliases
-    if has_configured_auth("opencode-cli") {
-        // no catalog entries — synthetic default only via available_model_refs
-    }
-    if has_configured_auth("amazon-bedrock") || has_configured_auth("bedrock") {
-        out.extend(catalog::models_for_provider("amazon-bedrock"));
-    }
     out
 }
 
@@ -561,23 +428,6 @@ pub fn available_model_displays() -> Vec<String> {
         .into_iter()
         .map(|m| format!("{}/{}", m.provider, m.id))
         .collect();
-    if has_configured_auth("opencode-cli") {
-        // Prefer live `opencode models` list; fall back to catalog `opencode/*` ids.
-        let live = crate::ai::opencode_cli::list_opencode_models_blocking("opencode");
-        if !live.is_empty() {
-            for m in live {
-                out.push(format!("opencode-cli/{}", m));
-            }
-        } else {
-            for m in catalog::models_for_provider("opencode") {
-                out.push(format!("opencode-cli/opencode/{}", m.id));
-            }
-            out.push(format!(
-                "opencode-cli/{}",
-                default_model_for("opencode-cli")
-            ));
-        }
-    }
     out.sort();
     out.dedup();
     out
@@ -595,19 +445,13 @@ pub fn available_model_refs() -> Vec<ModelRef> {
             });
         }
     }
-    if has_configured_auth("opencode-cli") && seen.insert("opencode-cli".into()) {
-        out.push(ModelRef {
-            provider: "opencode-cli".into(),
-            model: default_model_for("opencode-cli"),
-        });
-    }
     out
 }
 
 /// Human-readable auth status lines for `/provider`.
 pub fn provider_status_lines() -> Vec<String> {
     let mut providers = known_providers();
-    providers.retain(|p| supports_runtime(p) || p == "google" || p == "github-copilot");
+    providers.retain(|p| supports_runtime(p));
     // Prefer showing runnable ones first
     providers.sort_by_key(|p| (!supports_runtime(p), p.clone()));
     providers
@@ -666,23 +510,6 @@ pub async fn fetch_all_model_displays(timeout_secs: u64) -> Vec<String> {
             }
         }
     }
-    // Always refresh opencode-cli from the local CLI when present.
-    if has_configured_auth("opencode-cli") {
-        if let Ok(provider) = create_provider(
-            "opencode-cli",
-            CreateProviderOpts {
-                default_model: Some(default_model_for("opencode-cli")),
-                timeout_secs,
-                ..Default::default()
-            },
-        ) {
-            if let Ok(list) = provider.fetch_models("").await {
-                for m in list {
-                    out.push(format!("opencode-cli/{}", m));
-                }
-            }
-        }
-    }
     out.sort();
     out.dedup();
     out
@@ -697,13 +524,6 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn parse_opencode_cli_nested_model_id() {
-        let r = ModelRef::parse("opencode-cli/opencode/deepseek-v4-flash-free", "anthropic");
-        assert_eq!(r.provider, "opencode-cli");
-        assert_eq!(r.model, "opencode/deepseek-v4-flash-free");
-    }
-
-    #[test]
     fn parse_bare_model_keeps_default_provider() {
         let r = ModelRef::parse("claude-sonnet-4-20250514", "anthropic");
         assert_eq!(r.provider, "anthropic");
@@ -712,8 +532,9 @@ mod tests {
 
     #[test]
     fn parse_colon_form() {
-        let r = ModelRef::parse("bedrock:us.anthropic.claude-opus-4-8", "openai");
-        assert_eq!(r.provider, "bedrock");
+        let r = ModelRef::parse("openai:gpt-4o", "anthropic");
+        assert_eq!(r.provider, "openai");
+        assert_eq!(r.model, "gpt-4o");
     }
 
     #[test]
@@ -847,29 +668,31 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_is_known_and_runnable() {
-        assert!(is_known_provider("openrouter"));
-        assert!(supports_runtime("openrouter"));
+    fn core_providers_are_known_and_runnable() {
+        for p in ["anthropic", "openai", "opencode"] {
+            assert!(is_known_provider(p), "{p} should be known");
+            assert!(supports_runtime(p), "{p} should be runnable");
+        }
     }
 
     #[test]
-    fn catalog_hides_openrouter_without_its_key() {
+    fn catalog_hides_unkeyed_providers() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let before_env = std::env::var_os("OPENROUTER_API_KEY");
+        let before_env = std::env::var_os("OPENAI_API_KEY");
         let before_home = std::env::var_os("HOME");
-        std::env::remove_var("OPENROUTER_API_KEY");
+        std::env::remove_var("OPENAI_API_KEY");
         // Isolate from ~/.rs-agent/secrets.toml on the developer machine.
         let tmp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("HOME", tmp.path());
 
         let d = available_model_displays();
         assert!(
-            !d.iter().any(|x| x.starts_with("openrouter/")),
-            "openrouter should be hidden without OPENROUTER_API_KEY or secrets"
+            !d.iter().any(|x| x.starts_with("openai/")),
+            "openai should be hidden without OPENAI_API_KEY or secrets"
         );
 
         if let Some(v) = before_env {
-            std::env::set_var("OPENROUTER_API_KEY", v);
+            std::env::set_var("OPENAI_API_KEY", v);
         }
         match before_home {
             Some(v) => std::env::set_var("HOME", v),

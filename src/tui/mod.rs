@@ -1,6 +1,5 @@
 pub mod app;
 pub mod command_catalog;
-pub mod fleet_panel;
 pub mod help;
 pub mod hit;
 pub mod keys;

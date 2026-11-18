@@ -9,6 +9,7 @@ pub struct AnthropicProvider {
     pub base_url: String,
     pub name: String,
     pub key_env: String,
+    pub timeout_secs: u64,
 }
 
 impl Default for AnthropicProvider {
@@ -17,6 +18,7 @@ impl Default for AnthropicProvider {
             base_url: "https://api.anthropic.com/v1".to_string(),
             name: "anthropic".to_string(),
             key_env: "ANTHROPIC_API_KEY".to_string(),
+            timeout_secs: 300,
         }
     }
 }
@@ -43,7 +45,13 @@ impl AnthropicProvider {
             base_url: base_url.unwrap_or_else(|| "https://api.anthropic.com/v1".to_string()),
             name,
             key_env,
+            timeout_secs: 300,
         }
+    }
+
+    pub fn with_timeout(mut self, secs: u64) -> Self {
+        self.timeout_secs = if secs == 0 { 300 } else { secs };
+        self
     }
 }
 
@@ -203,7 +211,7 @@ impl Provider for AnthropicProvider {
 
     async fn chat(&self, api_key: &str, request: ChatRequest) -> ProviderResult<AssistantMessage> {
         let client = Client::builder()
-            .timeout(Duration::from_secs(300))
+            .timeout(Duration::from_secs(self.timeout_secs))
             .build()
             .map_err(|e| ProviderError::Other(e.to_string()))?;
 
@@ -280,7 +288,7 @@ impl Provider for AnthropicProvider {
 
     async fn chat_stream(&self, api_key: &str, request: ChatRequest) -> ProviderResult<BoxStream> {
         let client = Client::builder()
-            .timeout(Duration::from_secs(300))
+            .timeout(Duration::from_secs(self.timeout_secs))
             .build()
             .map_err(|e| ProviderError::Other(e.to_string()))?;
 
@@ -448,12 +456,12 @@ fn parse_anthropic_response(data: serde_json::Value) -> ProviderResult<Assistant
         }
     }
 
-    let stop_reason = data["stop_reason"].as_str().and_then(|r| match r {
-        "end_turn" => Some(StopReason::EndTurn),
-        "tool_use" => Some(StopReason::ToolUse),
-        "max_tokens" => Some(StopReason::MaxTokens),
-        "stop_sequence" => Some(StopReason::StopSequence),
-        _ => Some(StopReason::Other(r.to_string())),
+    let stop_reason = data["stop_reason"].as_str().map(|r| match r {
+        "end_turn" => StopReason::EndTurn,
+        "tool_use" => StopReason::ToolUse,
+        "max_tokens" => StopReason::MaxTokens,
+        "stop_sequence" => StopReason::StopSequence,
+        _ => StopReason::Other(r.to_string()),
     });
 
     let usage = data["usage"].as_object().map(|u| Usage {
@@ -547,15 +555,13 @@ fn parse_anthropic_stream_event(line: &str) -> Option<StreamDelta> {
                 }
             }
             Some("message_delta") => {
-                let stop_reason = value["delta"]["stop_reason"]
-                    .as_str()
-                    .and_then(|r| match r {
-                        "end_turn" => Some(StopReason::EndTurn),
-                        "tool_use" => Some(StopReason::ToolUse),
-                        "max_tokens" => Some(StopReason::MaxTokens),
-                        "stop_sequence" => Some(StopReason::StopSequence),
-                        r => Some(StopReason::Other(r.to_string())),
-                    });
+                let stop_reason = value["delta"]["stop_reason"].as_str().map(|r| match r {
+                    "end_turn" => StopReason::EndTurn,
+                    "tool_use" => StopReason::ToolUse,
+                    "max_tokens" => StopReason::MaxTokens,
+                    "stop_sequence" => StopReason::StopSequence,
+                    r => StopReason::Other(r.to_string()),
+                });
                 Some(StreamDelta {
                     content_index: 0,
                     r#type: DeltaType::Stop { stop_reason },

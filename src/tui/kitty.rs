@@ -25,10 +25,11 @@ pub fn find_image_paths(text: &str) -> Vec<String> {
                 '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}'
             )
         });
-        if is_image_path(cleaned) && Path::new(cleaned).is_file() {
-            if !out.iter().any(|p| p == cleaned) {
-                out.push(cleaned.to_string());
-            }
+        if is_image_path(cleaned)
+            && Path::new(cleaned).is_file()
+            && !out.iter().any(|p| p == cleaned)
+        {
+            out.push(cleaned.to_string());
         }
     }
     out
@@ -56,7 +57,7 @@ pub fn write_kitty_image(out: &mut dyn Write, path: &str, max_cols: u16) -> std:
     }
     let bytes = fs::read(path)?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    let cols = max_cols.max(20).min(120);
+    let cols = max_cols.clamp(20, 120);
 
     // Chunked transmission (Kitty recommends chunks ≤ 4096).
     let chunk_size = 4096;

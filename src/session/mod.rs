@@ -36,12 +36,6 @@ pub struct SessionData {
     /// Session-scoped `/goal` (restored on `--resume` if still active/paused).
     #[serde(default)]
     pub goal: Option<crate::agent::goal::GoalState>,
-    /// Bound seat name for persistent identity.
-    #[serde(default)]
-    pub seat: Option<String>,
-    /// Last handoff notes (agent-authored continuity).
-    #[serde(default)]
-    pub handoff: Option<crate::agent::handoff::HandoffNotes>,
     /// Canonical project directory this session belongs to (cwd at save time).
     /// Used by the sessions side panel to filter "this project" vs all.
     #[serde(default)]
@@ -310,6 +304,12 @@ fn html_escape(s: &str) -> String {
 
 pub struct SessionStore {
     dir: String,
+}
+
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SessionStore {
@@ -620,8 +620,6 @@ mod tests {
             call_tree: None,
             todos: None,
             goal: None,
-            seat: None,
-            handoff: None,
             project_root: None,
         }
     }

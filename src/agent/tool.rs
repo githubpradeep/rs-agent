@@ -26,7 +26,6 @@ pub enum ToolExecutionMode {
 pub struct ToolExecuteResult {
     pub content: String,
     pub is_error: bool,
-    pub terminate: bool,
 }
 
 impl ToolExecuteResult {
@@ -34,7 +33,6 @@ impl ToolExecuteResult {
         Self {
             content: content.into(),
             is_error: false,
-            terminate: false,
         }
     }
 
@@ -42,15 +40,6 @@ impl ToolExecuteResult {
         Self {
             content: content.into(),
             is_error: true,
-            terminate: false,
-        }
-    }
-
-    pub fn terminate(content: impl Into<String>) -> Self {
-        Self {
-            content: content.into(),
-            is_error: false,
-            terminate: true,
         }
     }
 }

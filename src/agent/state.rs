@@ -1,5 +1,4 @@
 use crate::agent::goal::GoalState;
-use crate::agent::handoff::HandoffNotes;
 use crate::agent::mode::AgentMode;
 use crate::ai::token_count;
 use crate::ai::types::*;
@@ -20,12 +19,6 @@ pub struct AgentState {
     pub skill_tools: Vec<String>,
     /// Session-scoped `/goal` completion condition (Claude Code–style).
     pub goal: Option<GoalState>,
-    /// Bound seat name (persistent identity).
-    pub seat: Option<String>,
-    /// Last handoff notes for this session.
-    pub handoff: Option<HandoffNotes>,
-    /// Inject wake packet on next stream_assistant call.
-    pub pending_wake: bool,
 }
 
 impl AgentState {
@@ -42,9 +35,6 @@ impl AgentState {
             mode: AgentMode::Agent,
             skill_tools: Vec::new(),
             goal: None,
-            seat: None,
-            handoff: None,
-            pending_wake: false,
         }
     }
 
@@ -224,43 +214,44 @@ impl AgentState {
                         }
                         // If a User/System (not Assistant) sits between the assistant
                         // and remaining tool results, pull matching results forward.
-                        if !pending.is_empty() && i < old.len() {
-                            if matches!(old[i].role, Role::User | Role::System) {
-                                let gap_start = i;
-                                // Find how far the gap goes before next Assistant
-                                // or end; scan for answering tools inside.
-                                let mut j = i;
-                                while j < old.len() && !matches!(old[j].role, Role::Assistant) {
-                                    j += 1;
-                                }
-                                let mut pulled: HashMap<String, Message> = HashMap::new();
-                                let mut keep_gap: Vec<Message> = Vec::new();
-                                for k in gap_start..j {
-                                    if old[k].role == Role::Tool {
-                                        if let Some(id) = Self::tool_result_id(&old[k]) {
-                                            if pending.iter().any(|(p, _)| p == id)
-                                                && !pulled.contains_key(id)
-                                            {
-                                                pulled.insert(id.to_string(), old[k].clone());
-                                                continue;
-                                            }
-                                        }
-                                        dropped += 1;
-                                        continue;
-                                    }
-                                    keep_gap.push(old[k].clone());
-                                }
-                                for (id, name) in pending.drain(..) {
-                                    if let Some(m) = pulled.remove(&id) {
-                                        out.push(m);
-                                    } else {
-                                        out.push(Self::interrupted_tool_result(id, name));
-                                        synthesized += 1;
-                                    }
-                                }
-                                out.extend(keep_gap);
-                                i = j;
+                        if !pending.is_empty()
+                            && i < old.len()
+                            && matches!(old[i].role, Role::User | Role::System)
+                        {
+                            let gap_start = i;
+                            // Find how far the gap goes before next Assistant
+                            // or end; scan for answering tools inside.
+                            let mut j = i;
+                            while j < old.len() && !matches!(old[j].role, Role::Assistant) {
+                                j += 1;
                             }
+                            let mut pulled: HashMap<String, Message> = HashMap::new();
+                            let mut keep_gap: Vec<Message> = Vec::new();
+                            for msg in &old[gap_start..j] {
+                                if msg.role == Role::Tool {
+                                    if let Some(id) = Self::tool_result_id(msg) {
+                                        if pending.iter().any(|(p, _)| p == id)
+                                            && !pulled.contains_key(id)
+                                        {
+                                            pulled.insert(id.to_string(), msg.clone());
+                                            continue;
+                                        }
+                                    }
+                                    dropped += 1;
+                                    continue;
+                                }
+                                keep_gap.push(msg.clone());
+                            }
+                            for (id, name) in pending.drain(..) {
+                                if let Some(m) = pulled.remove(&id) {
+                                    out.push(m);
+                                } else {
+                                    out.push(Self::interrupted_tool_result(id, name));
+                                    synthesized += 1;
+                                }
+                            }
+                            out.extend(keep_gap);
+                            i = j;
                         }
                         // Still-open after contiguous tools and no pullable gap.
                         for (id, name) in pending.drain(..) {

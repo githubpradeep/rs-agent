@@ -22,7 +22,7 @@ cargo build --release
 
 # Explicit provider/model
 ./scripts/eval-agent.sh --provider anthropic --model claude-sonnet-4-20250514
-./scripts/eval-agent.sh --provider amazon-bedrock --model us.anthropic.claude-opus-4-6-v1
+./scripts/eval-agent.sh --provider openai --model gpt-4o
 
 # Subset
 ./scripts/eval-agent.sh --only write_hello,fix_bug

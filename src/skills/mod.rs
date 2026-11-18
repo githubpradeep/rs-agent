@@ -3,10 +3,8 @@
 //! Skills 2.0: optional `tools:` frontmatter whitelists built-in tools while the
 //! skill is active. See [`docs/skills.md`] for the authoring guide.
 
-pub mod pack;
 pub mod templates;
 
-pub use pack::{export_pack, import_pack};
 pub use templates::{discover_templates, find_template, render_template, Template};
 
 use std::path::{Path, PathBuf};
@@ -58,7 +56,7 @@ fn find_markdown_files(dir: &Path) -> Vec<PathBuf> {
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .map(|e| e.into_path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "md"))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "md"))
         .collect();
     files.sort();
     files

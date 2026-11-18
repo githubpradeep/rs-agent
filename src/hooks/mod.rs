@@ -9,10 +9,6 @@
 //! - `before_goal_continue` — argv: none; stdin = goal condition.
 //!   Non-zero exit pauses goal auto-continue.
 //! - `on_goal_achieved` — argv: none; stdin = condition + reason (advisory).
-//! - `before_handoff` — argv: none; stdin = handoff summary.
-//!   Non-zero exit blocks the handoff tool.
-//! - `before_bead_close` — argv: none; stdin = bead JSON (id, kind, title, …).
-//!   Non-zero exit blocks closing the bead.
 //!
 //! Hooks are best-effort: missing dirs/scripts are ignored. Timeout: 5s.
 
@@ -30,8 +26,6 @@ pub struct HookRegistry {
     on_message: Option<PathBuf>,
     before_goal_continue: Option<PathBuf>,
     on_goal_achieved: Option<PathBuf>,
-    before_handoff: Option<PathBuf>,
-    before_bead_close: Option<PathBuf>,
 }
 
 impl HookRegistry {
@@ -65,12 +59,6 @@ impl HookRegistry {
             if let Some(p) = find_hook(dir, "on_goal_achieved") {
                 reg.on_goal_achieved = Some(p);
             }
-            if let Some(p) = find_hook(dir, "before_handoff") {
-                reg.before_handoff = Some(p);
-            }
-            if let Some(p) = find_hook(dir, "before_bead_close") {
-                reg.before_bead_close = Some(p);
-            }
         }
         reg
     }
@@ -81,8 +69,6 @@ impl HookRegistry {
             || self.on_message.is_some()
             || self.before_goal_continue.is_some()
             || self.on_goal_achieved.is_some()
-            || self.before_handoff.is_some()
-            || self.before_bead_close.is_some()
     }
 
     pub fn summary(&self) -> String {
@@ -101,12 +87,6 @@ impl HookRegistry {
         }
         if let Some(p) = &self.on_goal_achieved {
             parts.push(format!("on_goal_achieved={}", p.display()));
-        }
-        if let Some(p) = &self.before_handoff {
-            parts.push(format!("before_handoff={}", p.display()));
-        }
-        if let Some(p) = &self.before_bead_close {
-            parts.push(format!("before_bead_close={}", p.display()));
         }
         if parts.is_empty() {
             "no hooks loaded".into()
@@ -181,66 +161,19 @@ impl HookRegistry {
         let body = format!("{condition}\n---\n{reason}");
         let _ = run_hook(script, &[], Some(&body));
     }
-
-    /// Returns `Err(message)` to block the handoff tool.
-    pub fn before_handoff(&self, summary: &str) -> Result<(), String> {
-        let Some(script) = &self.before_handoff else {
-            return Ok(());
-        };
-        match run_hook(script, &[], Some(summary)) {
-            HookResult::Ok => Ok(()),
-            HookResult::Failed { code, stderr } => Err(format!(
-                "before_handoff hook blocked handoff (exit {code}): {}",
-                if stderr.trim().is_empty() {
-                    "(no stderr)".into()
-                } else {
-                    stderr.trim().chars().take(500).collect::<String>()
-                }
-            )),
-            HookResult::Error(e) => {
-                tracing::warn!(error = %e, "before_handoff hook error (allowing handoff)");
-                Ok(())
-            }
-        }
-    }
-
-    /// Returns `Err(message)` to block bead close.
-    pub fn before_bead_close(&self, bead_json: &str) -> Result<(), String> {
-        let Some(script) = &self.before_bead_close else {
-            return Ok(());
-        };
-        match run_hook(script, &[], Some(bead_json)) {
-            HookResult::Ok => Ok(()),
-            HookResult::Failed { code, stderr } => Err(format!(
-                "before_bead_close hook blocked close (exit {code}): {}",
-                if stderr.trim().is_empty() {
-                    "(no stderr)".into()
-                } else {
-                    stderr.trim().chars().take(500).collect::<String>()
-                }
-            )),
-            HookResult::Error(e) => {
-                tracing::warn!(error = %e, "before_bead_close hook error (allowing close)");
-                Ok(())
-            }
-        }
-    }
 }
 
 fn find_hook(dir: &Path, name: &str) -> Option<PathBuf> {
     if !dir.is_dir() {
         return None;
     }
-    for candidate in [
+    [
         dir.join(name),
         dir.join(format!("{name}.sh")),
         dir.join(format!("{name}.py")),
-    ] {
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file())
 }
 
 #[derive(Debug)]

@@ -34,6 +34,7 @@ pub struct ReplTool {
 }
 
 impl ReplTool {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         repl: SharedRepl,
         provider: Arc<dyn Provider>,

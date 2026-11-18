@@ -10,7 +10,7 @@ pub fn estimate_tokens(text: &str) -> usize {
 }
 
 pub fn estimate_message_tokens(msgs: &[Message]) -> usize {
-    msgs.iter().map(|m| estimate_message(m)).sum()
+    msgs.iter().map(estimate_message).sum()
 }
 
 pub fn estimate_message(msg: &Message) -> usize {

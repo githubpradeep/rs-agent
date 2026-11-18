@@ -111,6 +111,7 @@ pub fn ellipsize(s: &str, max: usize) -> String {
 }
 
 /// Build a single header line: state · model · mode · chips | tokens cost
+#[allow(clippy::too_many_arguments)]
 pub fn render_header_line(
     state: SessionUiState,
     provider: &str,
@@ -122,7 +123,6 @@ pub fn render_header_line(
     session_short: &str,
     title: Option<&str>,
     goal: &str,
-    attach: &str,
     tokens: &str,
     cost: &str,
     max_width: usize,
@@ -181,12 +181,6 @@ pub fn render_header_line(
         left.push(Span::styled(
             format!(" {goal}"),
             Style::default().fg(palette.accent),
-        ));
-    }
-    if !attach.is_empty() {
-        left.push(Span::styled(
-            format!(" {attach}"),
-            Style::default().fg(palette.warn),
         ));
     }
 

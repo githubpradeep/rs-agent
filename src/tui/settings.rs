@@ -61,24 +61,16 @@ pub struct SettingsState {
     pub mouse_enabled: bool,
     pub toast: bool,
     pub toast_sound: bool,
-    pub notify: String,
 }
 
 impl SettingsState {
-    pub fn from_app(
-        theme: ThemeName,
-        mouse_enabled: bool,
-        toast: bool,
-        toast_sound: bool,
-        notify: &str,
-    ) -> Self {
+    pub fn from_app(theme: ThemeName, mouse_enabled: bool, toast: bool, toast_sound: bool) -> Self {
         Self {
             tab: SettingsTab::Theme,
             theme,
             mouse_enabled,
             toast,
             toast_sound,
-            notify: notify.to_string(),
         }
     }
 }
@@ -149,15 +141,14 @@ pub fn render_settings(frame: &mut Frame, full: Rect, state: &SettingsState, pal
         SettingsTab::Alerts => {
             lines.push(Line::from(Span::styled(
                 format!(
-                    " {} toast   {} sound   notify={}",
+                    " {} toast   {} sound",
                     if state.toast { "●" } else { "○" },
                     if state.toast_sound { "●" } else { "○" },
-                    state.notify
                 ),
                 Style::default().fg(palette.text),
             )));
             lines.push(Line::from(Span::styled(
-                " t toast · s sound · n cycle notify off|terminal|system",
+                " t toast · s sound",
                 Style::default().fg(palette.overlay0),
             )));
         }

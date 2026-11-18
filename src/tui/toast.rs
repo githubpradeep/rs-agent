@@ -78,7 +78,6 @@ pub fn play_sound(kind: ToastKind) {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
-        return;
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -91,7 +90,7 @@ pub fn play_sound(kind: ToastKind) {
 
 /// Top-right toast rect.
 pub fn toast_area(full: Rect) -> Rect {
-    let width = full.width.min(42).max(18);
+    let width = full.width.clamp(18, 42);
     let height = 4u16;
     Rect {
         x: full.x + full.width.saturating_sub(width + 1),

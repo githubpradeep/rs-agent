@@ -60,13 +60,13 @@ Typing `/skill <partial>`, `/prompt <partial>`, or `/p <partial>` and pressing `
 
 ### Model picker (`/model`)
 
-Running `/model` with no arguments opens an interactive **cross-provider** picker (pi-style):
+Running `/model` with no arguments opens an interactive **cross-provider** picker:
 
-- Seeded from the **built-in static catalog** (~1000 models) for every provider that has credentials
-  configured — same rule as pi (“only models from configured providers”)
-- Export keys like `OPENROUTER_API_KEY` / `ANTHROPIC_API_KEY` to unlock those catalog slices
+- Seeded from the **built-in catalog** for every provider that has credentials
+  configured — only models from configured providers are shown
+- Export keys like `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` to unlock those catalog slices
 - Background live `fetch_models` merges any extra IDs the API returns
-- **Fuzzy filter** as you type (subsequence + multi-word tokens) — e.g. `sonnet`, `ocs4`, `deep flash`
+- **Fuzzy filter** as you type (subsequence + multi-word tokens) — e.g. `sonnet`, `gpt-4o`
 - Selecting an entry switches **provider and model** mid-session when needed (no restart)
 
 `/model <name-or-alias>` and `/model <provider>/<model>` work non-interactively.
@@ -91,6 +91,9 @@ Secrets do not overwrite env vars that are already set.
 
 | Key | Action |
 |-----|--------|
+| `Enter` | **Steer** — queue your typed message as a follow-up once the current turn finishes, without waiting for it to fully complete first |
+| `Esc` | Abort the current turn (kills running bash processes) |
+
 ## Live bash console (bottom)
 
 Bash/repl/task output goes to a **fixed bottom console** (does not resize the chat column):
@@ -102,33 +105,12 @@ Bash/repl/task output goes to a **fixed bottom console** (does not resize the ch
 
 Esc aborts and kills the bash process group.
 
-| `Enter` | **Steer** — queue your typed message as a follow-up once the current turn finishes, without waiting for it to fully complete first |
-
-## Fleet attach (TUI takeover)
-
-While a headless fleet worker runs in the background:
-
-| Slash command | Action |
-|---------------|--------|
-| `/city` | Seat board (all workers) |
-| `/seat follow <seat>` | Live formatted log tail; worker keeps running |
-| `/seat steer <text>` | Steer followed worker without attach |
-| `/seat abort` | Abort followed/attached turn |
-| `/seat open <seat>` | Inspect session read-only (no pause) |
-| `/seat attach <seat>` | Pause worker, load its session, chat as that seat |
-| `/seat detach` or `/detach` | Save session and resume the background worker |
-
-`/fleet …` aliases work for follow/attach/detach/logs. Prefer the **City panel** (`c`) seat
-detail for follow/steer so logs stay in the side pane. Footer chip shows `VIEW` / `FOLLOW` /
-`ATTACHING` / `ATTACHED` / `INSPECT`. Quitting the TUI while attached auto-resumes the worker.
-Esc / Enter steer work as in Waiting mode once you are attached and a turn is running.
-
 ## Global (any mode)
 
 | Key | Action |
 |-----|--------|
 | `Ctrl-C` | Quit immediately |
-| `Ctrl-P` | Cycle to the next ready `provider/model` (pi-style) |
+| `Ctrl-P` | Cycle to the next ready `provider/model` |
 | Mouse click on a `💭 ...` line | Toggle that message's thinking trace open/closed |
 | Mouse click on a `⚙ ...` / `⚠ ...` line | Toggle that tool result block open/closed |
 | Mouse scroll | Scroll chat history |
@@ -153,54 +135,30 @@ message) or by clicking the block's header line.
 
 ## Tool-in-progress spinner
 
-While a tool call is running, the status bar shows an animated spinner frame (`| / - \`) plus
+While a tool call is running, the status bar shows an animated spinner frame plus
 the tool name and elapsed seconds, e.g. `⠋ bash (2.3s)`, so long-running tools (shell commands,
 `repl`, web fetches) don't look stalled. It clears automatically when the tool result, an error,
 `Done`, or `Aborted` arrives.
 
-## Attention chrome (Wave 1+)
+## Attention chrome
 
 - Header chip: `○ idle` / `◐ working` / `● blocked` / `✓ done`
-- Toasts on blocked/done (config: `toast`, `toast_sound`, `notify = off|terminal|system`)
+- Toasts on blocked/done (config: `toast`, `toast_sound`)
 - `?` filterable help · `Ctrl+K` command palette · `/settings` modal
 - Permission always-allow key defaults to `A` (not `t`)
 
 ## Live `/tree` side panel
 
 `/tree` (or the `T` key in normal mode) toggles a right-hand side panel showing the Deep Context
-call tree with a Conductor-style turn bar, expand markers, and status glyphs. Auto-opens on `repl`;
+call tree with a turn bar, expand markers, and status glyphs. Auto-opens on `repl`;
 status bar shows `[D]` while Deep Context is active.
-
-## City cockpit (agents / wishes / workers)
-
-Overview + inspector (board never replaced). See [ui-ia.md](ui-ia.md).
-
-```text
-c / /city / /fleet     toggle City
-Tab / BackTab          cycle zones: wish → board → inspect → steer → spawn
-wish> …                type ambition · ↵ create
-u                      focus spawn (Fleet/Crew counts · ↵)
-↑↓ · Enter             select worker/flow → inspector
-g                      jump to first blocked worker
-T                      tree drawer under City (Deep Context coexist)
-```
-
-| Zone | Keys |
-|------|------|
-| **wish** | type · ↵ submit |
-| **board** | ↑↓ · Enter · u spawn · d stop · **X delete** · m marshal · A assign · g blocked |
-| **inspect** | f follow · a attach · o open · b abort · D detach · d stop · **X delete** · ↵ → steer |
-| **steer** | type · ↵ send (log stays in panel, not chat) |
-| **spawn** | digits · ←/→ field · ↵ spawn |
-
-Footer: `VIEW` / `FOLLOW` / `ATTACHED` / `INSPECT`. Socket: `city.board`, `wish.create`, `fleet.up` ([runtime.md](runtime.md)).
 
 ## Sessions panel (multi-chat per project)
 
-Herdr-style session switcher for the project you’re in. **True parallel**: each
+Session switcher for the project you're in. **True parallel**: each
 session gets its own agent OS thread that keeps running when you switch away
 (◐ in the panel). Switch back to watch the live turn; messages on the focused
-session go to that session’s runtime immediately.
+session go to that session's runtime immediately.
 
 ```text
 /sessions       toggle Sessions side panel
@@ -213,37 +171,11 @@ Enter           switch to selected session (saves current first)
 
 Sessions are tagged with `project_root` (cwd) on save. Panel defaults to **THIS PROJECT**.
 
-Fleet workers remain available for headless seats outside the TUI.
-
-## Runtime control plane
-
-```bash
-rs-agent status show
-rs-agent status wait --until blocked --timeout-secs 60
-rs-agent runtime serve
-rs-agent api ping
-```
-
-Lifecycle is written to `~/.rs-agent/lifecycle.json`. Ops skill: `skills/runtime-ops/`.
-
 ## REPL output panel
 
 While the `repl` tool (RLM Python REPL) is executing, a short panel above the input box streams
 its live stdout/stderr (stderr lines prefixed with `!`), capped to the most recent ~8KB, so you
 can watch progress instead of waiting for the final tool result block.
-
-## Screenshots (reference chrome)
-
-Capture these for docs / demos (Kitty / iTerm recommended):
-
-1. **Idle** — header `○ idle`, lean footer, empty chat + input
-2. **Blocked** — permission modal + toast + `● blocked` chip; optional OSC notify when unfocused
-3. **Sessions** — `/sessions` side panel with this-project chats + active ●
-4. **City** — split wish composer + WORKERS/FLOW + inspector log/steer
-5. **City + tree** — Deep Context drawer under City while `[D]` active
-6. **Palette** — `Ctrl+K` filtered command list; `?` help overlay
-
-Theme: `/theme auto` follows host `COLORFGBG`. Settings: `/settings`.
 
 ## Soft themes
 
@@ -255,7 +187,7 @@ Set a persistent default via `theme = "dark"` (or `"light"` / `"forest"`) in
 ## Configurable keybindings
 
 The single-key bindings shown throughout this doc (`insert`, `quit`, `toggle_thinking`,
-`jump_bottom`, `expand_tool`, `toggle_tree`, `toggle_sessions`, `toggle_city`, `perm_once`,
+`jump_bottom`, `expand_tool`, `toggle_tree`, `toggle_sessions`, `perm_once`,
 `perm_always`, `perm_path`, `perm_deny`) can be remapped in `~/.rs-agent/config.toml`:
 
 ```toml
@@ -267,7 +199,6 @@ jump_bottom = "G"
 expand_tool = "e"
 toggle_tree = "T"
 toggle_sessions = "s"
-toggle_city = "c"
 perm_once = "a"
 perm_always = "t"
 perm_path = "p"
@@ -319,13 +250,20 @@ Typed in insert mode, run on `Enter`.
 | `/mode plan\|ask\|agent` | Switch agent interaction mode (tool filtering) |
 | `/model [name]` | With no args, opens an interactive model picker (aliases + live provider fetch); with a name/alias, switches immediately |
 | `/provider [name]` / `/login` | Interactive provider menu: switch ready providers, or open signup URL + paste API key into `~/.rs-agent/secrets.toml` |
+| `/goal [condition\|clear\|pause\|resume]` | Set / pause / clear an auto-continue goal |
+| `/recall <id>` | Read one archived trajectory step by id |
 | `/theme [dark\|light\|forest]` | Switch (or show) the TUI color theme |
+| `/settings` | Settings modal (theme / mouse / toasts) |
+| `/timeline` | Session timeline side panel (fork at a point) |
 | `/compact` | Compact/summarize the conversation to reclaim context |
 | `/new` | Start a fresh session (new session id; saves the current one first) |
 | `/fork [label]` | Fork current session (same messages; new id + parent) |
 | `/sessions` | Toggle Sessions side panel (project chats · Enter switch · `n` new) |
 | `/sessions list` | Text dump of saved sessions |
 | `/export [md\|json\|html]` | Export the current session transcript (markdown default; json/html for sharing) |
+| `/image <path>` | Queue a Kitty graphics render (Kitty/WezTerm/Ghostty) |
+| `/lsp [start\|stop\|status]` | rust-analyzer diagnostics integration |
+| `/revert` | Restore files changed in the last turn (turn snapshot) |
 | `/trust list\|reset` | Manage the per-project trust store |
 | `/rename <title>` | Rename the current session |
 | `/history [query\|n]` | Browse/search/recall input history |

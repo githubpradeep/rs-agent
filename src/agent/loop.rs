@@ -149,8 +149,8 @@ pub(crate) fn snap_compact_split(messages: &[Message], budget_split: usize) -> u
     }
     let mut split = budget_split.min(total);
 
-    for i in split..total {
-        if messages[i].role == Role::User {
+    for (i, msg) in messages.iter().enumerate().skip(split) {
+        if msg.role == Role::User {
             return i;
         }
     }
@@ -304,7 +304,7 @@ pub struct AgentLoop {
     /// Inject one-shot RLM escalate system note on the next model turn.
     rlm_escalate_hint_pending: std::sync::atomic::AtomicBool,
     rlm_escalate_hint_sent: std::sync::atomic::AtomicBool,
-    /// Optional disk-loaded hooks (before_tool / after_tool / on_message / goal / handoff).
+    /// Optional disk-loaded hooks (before_tool / after_tool / on_message / goal).
     hooks: HookRegistry,
     /// When true, `/goal` may spawn a tool-using verify subagent.
     goal_verify: bool,
@@ -315,9 +315,6 @@ pub struct AgentLoop {
     verify_cmd: Option<String>,
     /// Consecutive deterministic-gate continuations (reset on tool activity).
     exit_strikes: u8,
-    /// A terminal tool ran this turn (escalate / handoff / bead block) — the
-    /// turn is allowed to end even if the goal looks unmet.
-    terminal_tool_seen: bool,
     /// User explicitly cleared the goal — do not re-arm the auto goal.
     auto_goal_disabled: bool,
 }
@@ -351,7 +348,6 @@ impl AgentLoop {
             exit_gates: true,
             verify_cmd: None,
             exit_strikes: 0,
-            terminal_tool_seen: false,
             auto_goal_disabled: false,
         }
     }
@@ -611,22 +607,6 @@ impl AgentLoop {
             }
             return Ok(false);
         }
-        {
-            let hay: String = self
-                .state
-                .messages
-                .iter()
-                .rev()
-                .take(6)
-                .flat_map(|m| m.content.iter().filter_map(|c| c.text.as_deref()))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if let Some(true) = goal.eval_cond_dsl(&hay) {
-                return self
-                    .finish_goal_eval(true, "cond_dsl matched".into(), &goal.condition, callback)
-                    .await;
-            }
-        }
         if goal.consecutive_blocks >= MAX_CONSECUTIVE_BLOCKS {
             callback(AgentEvent::Status {
                 message: format!(
@@ -659,12 +639,8 @@ impl AgentLoop {
             return Ok(false);
         }
 
-        // Fast path: bead-store conditions without an LLM round-trip.
-        if let Some((met, reason)) = crate::beads::evaluate_bead_condition(&goal.condition) {
-            return self
-                .finish_goal_eval(met, reason, &goal.condition, callback)
-                .await;
-        }
+        // Fast path: conditions with no LLM round-trip are handled by the
+        // transcript check below; run the evaluator next.
 
         callback(AgentEvent::Status {
             message: "evaluating /goal…".into(),
@@ -672,12 +648,8 @@ impl AgentLoop {
 
         let (mut met, mut reason) = self.evaluate_goal_condition(&goal.condition).await?;
 
-        // Tool-using verify when enabled and transcript says unmet, or when
-        // condition looks like it needs external proof (tests/files/beads).
-        let needs_tools = self.goal_verify
-            && (!met
-                || crate::beads::goal_mentions_beads(&goal.condition)
-                || goal_likely_needs_tools(&goal.condition));
+        // Tool-using verify when enabled and the transcript check says unmet.
+        let needs_tools = self.goal_verify && (!met || goal_likely_needs_tools(&goal.condition));
         if needs_tools {
             callback(AgentEvent::Status {
                 message: "◎ verifying /goal with tools…".into(),
@@ -709,20 +681,6 @@ impl AgentLoop {
         condition: &str,
         callback: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<bool, String> {
-        let mut met = met;
-        let mut reason = reason;
-
-        // Soft goals must not achieve while the bead backlog still has work.
-        if met && crate::beads::soft_goal_blocked_by_backlog(condition) {
-            met = false;
-            let ready = crate::beads::list_ready(None).map(|r| r.len()).unwrap_or(0);
-            let open = crate::beads::list_open(None).map(|r| r.len()).unwrap_or(0);
-            reason = format!(
-                "backlog remains ({ready} ready / {open} open) — keep implementing; \
-                 use /goal no open beads for a hard stop"
-            );
-        }
-
         if let Some(g) = self.state.goal.as_mut() {
             g.turns_evaluated = g.turns_evaluated.saturating_add(1);
             g.last_reason.replace(reason.clone());
@@ -792,7 +750,7 @@ impl AgentLoop {
         let args = json!({
             "task": verify_user_prompt(condition),
             "profile": "verify",
-            "tools": ["bash", "read", "grep", "ls", "find", "bead"],
+            "tools": ["bash", "read", "grep", "ls", "find"],
         });
         let result = tool.execute("goal-verify", args).await;
         if result.is_error {
@@ -974,7 +932,7 @@ impl AgentLoop {
         }
     }
 
-    /// Public for worker soft-fail classification.
+    /// Heuristic transport-level failure detection (network / stream errors).
     pub fn is_transport_failure_msg(e: &str) -> bool {
         let l = e.to_lowercase();
         l.contains("stream error")
@@ -1005,7 +963,7 @@ impl AgentLoop {
         }
     }
 
-    /// Settle tools, restore files, crash-handoff, inject recover nudge.
+    /// Settle tools, restore files, inject recover nudge.
     /// Returns `true` if the outer loop should `continue` (retry the turn).
     async fn recover_from_stream_failure(
         &mut self,
@@ -1016,18 +974,6 @@ impl AgentLoop {
 
         let _ = self.state.settle_dangling_tools();
         let restored = crate::tools::turn_snapshot::restore_last_turn().unwrap_or(0);
-        let notes = crate::agent::handoff::HandoffNotes::new(
-            format!("interrupted: {err}"),
-            if restored > 0 {
-                format!("restored {restored} file(s) from turn snapshot")
-            } else {
-                String::new()
-            },
-            "Retry or type continue — prefer small tool calls".into(),
-            vec![],
-        );
-        crate::agent::handoff::store(notes.clone());
-        self.state.handoff = Some(notes);
 
         self.stream_recoveries = self.stream_recoveries.saturating_add(1);
         let n = self.stream_recoveries;
@@ -1049,8 +995,7 @@ impl AgentLoop {
                 content_type: ContentType::Text,
                 text: Some(format!(
                     "[recover] Provider stream failed (attempt {n}/{MAX_STREAM_RECOVERIES}): {err}\n\
-                     Continue from the last good state. Prefer small tool calls. \
-                     If blocked, call escalate or bead block."
+                     Continue from the last good state. Prefer small tool calls."
                 )),
                 ..Default::default()
             }],
@@ -1065,9 +1010,7 @@ impl AgentLoop {
             true
         } else {
             callback(AgentEvent::Status {
-                message:
-                    "stream failed after recoveries — type continue or /handoff (session ready)"
-                        .into(),
+                message: "stream failed after recoveries — type continue to retry".into(),
             });
             // Soft end: do not surface as hard Error / do not leave Waiting wedged.
             callback(AgentEvent::Done);
@@ -1081,9 +1024,6 @@ impl AgentLoop {
         callback: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<(), String> {
         self.abort.clear();
-        // A fresh user turn is never terminal, even if the previous one ended
-        // via escalate/handoff.
-        self.terminal_tool_seen = false;
         if self.rlm_depth == 0 {
             crate::agent::ancestor::publish_goal(
                 self.state.goal.as_ref().map(|g| g.condition.as_str()),
@@ -1283,22 +1223,10 @@ impl AgentLoop {
             let fraction = used as f64 / limit as f64;
 
             if fraction >= 0.95 {
-                // Welfare: prefer handoff over a hard clonk when context is exhausted.
-                let notes = crate::agent::handoff::HandoffNotes::new(
-                    format!(
-                        "Context limit approaching ({used}/{limit} tokens, {:.0}%)",
-                        fraction * 100.0
-                    ),
-                    "Session near context ceiling".into(),
-                    "Open a new session with same seat; wake packet has diary".into(),
-                    vec![],
-                );
-                crate::agent::handoff::store(notes.clone());
-                self.state.handoff = Some(notes);
                 callback(AgentEvent::Error {
                     message: format!(
                         "Context limit approaching ({used}/{limit} tokens, {:.0}%). \
-                         Handoff notes written — please use a new session (/handoff done).",
+                         Use /compact or start a new session.",
                         fraction * 100.0
                     ),
                 });
@@ -1436,7 +1364,7 @@ impl AgentLoop {
                 // Harness exit gates: refuse a narrative-only stop when cheap
                 // deterministic evidence says work remains. Bounded by strikes
                 // so a stuck model still stops after a few nudges.
-                if self.exit_gates_apply() && !self.terminal_tool_seen {
+                if self.exit_gates_apply() {
                     if let Some(reason) = self.deterministic_exit_blockers().await {
                         if self.exit_strikes < MAX_EXIT_STRIKES {
                             self.exit_strikes = self.exit_strikes.saturating_add(1);
@@ -1563,27 +1491,6 @@ impl AgentLoop {
                 system.push_str("\n\n");
             }
             system.push_str(&note);
-        }
-        if self.state.pending_wake {
-            let seat = self
-                .state
-                .seat
-                .as_ref()
-                .and_then(|n| crate::agent::seat::load(n).ok());
-            let handoff = self
-                .state
-                .handoff
-                .clone()
-                .or_else(crate::agent::handoff::snapshot);
-            let inputs =
-                crate::agent::wake::WakeInputs::from_parts(seat, handoff, self.state.goal.clone());
-            if let Some(packet) = crate::agent::wake::build(&inputs) {
-                if !system.is_empty() {
-                    system.push_str("\n\n");
-                }
-                system.push_str(&packet);
-            }
-            self.state.pending_wake = false;
         }
         let tools: Vec<_> = self
             .tools
@@ -1788,12 +1695,6 @@ impl AgentLoop {
                 result: result.clone(),
             });
             self.store_tool_result(id, name, &result.content, result.is_error);
-            self.after_tool_side_effects(name, &result, callback);
-            self.note_terminal_tool(name, &input, &result);
-
-            if result.terminate {
-                break;
-            }
         }
         Ok(())
     }
@@ -1831,73 +1732,9 @@ impl AgentLoop {
                 result: result.clone(),
             });
             self.store_tool_result(&job.id, &job.name, &result.content, result.is_error);
-            self.after_tool_side_effects(&job.name, result, callback);
-            self.note_terminal_tool(&job.name, &job.input, result);
-        }
-
-        for result in &results {
-            if result.terminate {
-                break;
-            }
         }
 
         Ok(())
-    }
-
-    /// Record that this turn ended through a legitimate terminal tool
-    /// (escalate / handoff terminate; a successfully blocked bead is a
-    /// deliberate stopping point). Exit gates skip such turns.
-    fn note_terminal_tool(
-        &mut self,
-        name: &str,
-        input: &serde_json::Value,
-        result: &ToolExecuteResult,
-    ) {
-        if result.terminate {
-            self.terminal_tool_seen = true;
-            return;
-        }
-        if !result.is_error && name.eq_ignore_ascii_case("bead") {
-            let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("");
-            if action.eq_ignore_ascii_case("block") {
-                self.terminal_tool_seen = true;
-            }
-        }
-    }
-
-    /// Sync handoff notes / escalate → pause goal after tool execution.
-    fn after_tool_side_effects(
-        &mut self,
-        name: &str,
-        result: &ToolExecuteResult,
-        callback: &mut (dyn FnMut(AgentEvent) + Send),
-    ) {
-        let resolved = resolve_tool(&self.tools, name)
-            .map(|t| t.name().to_string())
-            .unwrap_or_else(|_| name.to_lowercase());
-
-        if resolved == "handoff" && !result.is_error {
-            if let Some(notes) = crate::agent::handoff::snapshot() {
-                self.state.handoff = Some(notes);
-                self.state.pending_wake = true;
-                callback(AgentEvent::Status {
-                    message: "handoff recorded — next wake will load these notes".into(),
-                });
-            }
-        }
-
-        if resolved == "escalate" && !result.is_error {
-            if let Some(esc) = crate::tools::escalate::take_pending() {
-                if self.pause_goal() {
-                    callback(AgentEvent::GoalUpdate {
-                        summary: format!("paused (escalated): {}", esc.reason),
-                    });
-                }
-                callback(AgentEvent::Status {
-                    message: format!("escalated (needs: {}) — {}", esc.needs, esc.reason),
-                });
-            }
-        }
     }
 
     fn store_tool_result(&mut self, id: &str, name: &str, content: &str, is_error: bool) {
@@ -1982,7 +1819,7 @@ impl AgentLoop {
         for msg in &to_summarize {
             if msg.role == Role::System
                 && msg.content.iter().any(|c| {
-                    c.text.as_deref().map_or(false, |t| {
+                    c.text.as_deref().is_some_and(|t| {
                         t.starts_with("[Compacted summary of earlier conversation]")
                     })
                 })
@@ -2022,46 +1859,15 @@ impl AgentLoop {
             .map_err(|_| format!("{} not set", self.provider.api_key_env_var()))?;
 
         let user_msg = if let Some(prev) = previous_summary.as_deref() {
-            let handoff_snap = crate::agent::handoff::snapshot();
-            let handoff_seed = self
-                .state
-                .handoff
-                .as_ref()
-                .or(handoff_snap.as_ref())
-                .map(|h| h.compaction_seed())
-                .unwrap_or_default();
-            let handoff_block = if handoff_seed.is_empty() {
-                String::new()
-            } else {
-                format!("\n\n<agent-handoff>\n{handoff_seed}\n</agent-handoff>\n")
-            };
             format!(
                 "Update the anchored summary below with the new conversation. \
-                 Preserve still-true details, remove stale details, and merge in new facts.\
-                 Prefer facts from <agent-handoff> when present.\n\n\
-                 <previous-summary>\n{prev}\n</previous-summary>\
-                 {handoff_block}\n\
+                 Preserve still-true details, remove stale details, and merge in new facts.\n\n\
+                 <previous-summary>\n{prev}\n</previous-summary>\n\
                  <new-conversation>\n{conv_text}\n</new-conversation>"
             )
         } else {
-            let handoff_snap = crate::agent::handoff::snapshot();
-            let handoff_seed = self
-                .state
-                .handoff
-                .as_ref()
-                .or(handoff_snap.as_ref())
-                .map(|h| h.compaction_seed())
-                .unwrap_or_default();
-            let preface = if handoff_seed.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "Prefer the agent-authored handoff below when summarizing.\n\
-                     <agent-handoff>\n{handoff_seed}\n</agent-handoff>\n\n"
-                )
-            };
             format!(
-                "{preface}Summarize the following conversation. Use this exact structure:\n\
+                "Summarize the following conversation. Use this exact structure:\n\
                  ## Goal\n...\n\
                  ## Constraints & Preferences\n...\n\
                  ## Progress\n\
@@ -2187,19 +1993,6 @@ impl AgentLoop {
             ));
         }
 
-        if resolved_name == "bead" && self.state.mode == AgentMode::Plan {
-            let action = input
-                .get("action")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_lowercase();
-            if !matches!(action.as_str(), "list" | "ls" | "show" | "get" | "") {
-                return ToolExecuteResult::error(
-                    "In plan mode, bead only allows list/show. Switch to /mode agent to mutate beads.",
-                );
-            }
-        }
-
         let args = match prepare_tool_args(tool.as_ref(), input.clone()) {
             Ok(a) => a,
             Err(msg) => return ToolExecuteResult::error(msg),
@@ -2207,13 +2000,6 @@ impl AgentLoop {
 
         if let Err(msg) = self.hooks.before_tool(&resolved_name, &args.to_string()) {
             return ToolExecuteResult::error(msg);
-        }
-
-        if resolved_name == "handoff" {
-            let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("");
-            if let Err(msg) = self.hooks.before_handoff(summary) {
-                return ToolExecuteResult::error(msg);
-            }
         }
 
         let fp = tool_call_fingerprint(&resolved_name, &args);

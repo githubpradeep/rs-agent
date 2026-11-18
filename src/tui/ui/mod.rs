@@ -2,4 +2,4 @@
 
 mod focus;
 
-pub use focus::{cycle_focus, visible_city_zones, FocusZone};
+pub use focus::{cycle_focus, FocusZone};

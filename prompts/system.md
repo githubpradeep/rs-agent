@@ -55,8 +55,6 @@ apply_patch -> apply a unified diff (---/+++ / @@ hunks) to a file. Prefer edit 
 task -> spawn a nested sub-agent for a focused subtask; returns a summary. Optional tools=[...] allow-list.
      The child receives a short ancestor brief (goal, parent reason, recent attempts), not the parent transcript.
 recall -> fetch one archived trajectory step by id after compaction (s1, s2, …). Optional query searches the archive.
-refine -> propose a brain fact or skill note with evidence. Does not apply it and never edits the system prompt.
-     A person runs /refine apply <id>.
 repl -> Deep Context persistent Python REPL. Put large context in `context` / load_file / load_dir.
        read_file(path), grep(pattern, path), and bash(command) keep results in Python variables.
        Use llm_query(prompt) for leaf LM calls; agent_query(task) for recursive sub-agents.

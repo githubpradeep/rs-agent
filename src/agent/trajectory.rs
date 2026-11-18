@@ -129,14 +129,14 @@ pub fn archive(messages: &[Message]) -> Result<Vec<ArchivedStep>, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir trajectory: {e}"))?;
     }
-    let mut n = next_index(&path);
+    let base = next_index(&path);
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
         .map_err(|e| format!("open trajectory: {e}"))?;
     let mut out = Vec::new();
-    for msg in messages {
+    for (offset, msg) in messages.iter().enumerate() {
         let (role, text) = message_text(msg);
         let chars = text.chars().count();
         let stored = if chars > TEXT_CAP {
@@ -146,12 +146,11 @@ pub fn archive(messages: &[Message]) -> Result<Vec<ArchivedStep>, String> {
             text
         };
         let step = ArchivedStep {
-            id: format!("s{n}"),
+            id: format!("s{}", base + offset),
             role,
             preview: one_line(&stored, PREVIEW_CHARS),
             text: stored,
         };
-        n += 1;
         let line = serde_json::to_string(&step).map_err(|e| e.to_string())?;
         writeln!(file, "{line}").map_err(|e| format!("write trajectory: {e}"))?;
         out.push(step);

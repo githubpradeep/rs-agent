@@ -8,7 +8,6 @@ pub enum HitTarget {
     Tool { msg_idx: usize, tool_idx: usize },
     Toast,
     Help,
-    FleetRow { index: usize },
     SessionRow { index: usize },
     OutputTab { index: usize },
     ModalDismiss,

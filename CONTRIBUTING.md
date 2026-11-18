@@ -1,9 +1,9 @@
 # Contributing to rs-agent
 
-Thanks for taking a look. rs-agent is a local overnight coding factory (Rust CLI/TUI,
-beads/fleet, skills) with a Deep Context core (persistent Python REPL + `llm_query` /
-`agent_query`) so large context stays out of the model window. Product sequence:
-[`docs/productize.md`](docs/productize.md). Trust model: [`docs/trust.md`](docs/trust.md).
+Thanks for taking a look. rs-agent is a lean terminal coding agent (Rust CLI/TUI,
+skills) with a Deep Context core (persistent Python REPL + `llm_query` /
+`agent_query`) so large context stays out of the model window. Trust model:
+[`docs/trust.md`](docs/trust.md).
 
 ## Getting set up
 
@@ -52,14 +52,14 @@ clippy unless the lint is a genuine false positive — explain why in the PR des
 - Describe *why* in the PR body, not just *what* — especially for anything touching permissions,
   abort/steer, or provider request shaping.
 - If you're adding a new provider, follow the existing `Provider` trait implementations in
-  `src/ai/` (anthropic, openai, bedrock, opencode) as a template.
+  `src/ai/` (anthropic, openai) as a template.
 
 ## Project layout (orientation)
 
 ```
 src/
   agent/     agent loop, state, tool dispatch, abort/steer control
-  ai/        provider trait + Anthropic/OpenAI/Bedrock/OpenCode implementations
+  ai/        provider trait + Anthropic/OpenAI implementations
   cli/       clap argument definitions
   context/   AGENTS.md/CLAUDE.md discovery, project commands, system prompt assembly
   permission/ trust store + permission prompts for risky tools

@@ -1,33 +1,18 @@
 pub mod agent;
 pub mod ai;
-pub mod beads;
-pub mod brain;
 pub mod cli;
 pub mod config;
 pub mod context;
-pub mod fleet;
 pub mod hooks;
-pub mod lifecycle;
 pub mod lsp;
-pub mod mail;
-pub mod marshal;
 pub mod mcp;
-pub mod moot;
-pub mod notify;
-pub mod orchestration;
 pub mod permission;
 pub mod prompts;
-pub mod queue;
 pub mod rlm;
-pub mod roles;
-pub mod runtime;
-pub mod schedule;
 pub mod session;
 pub mod skills;
 pub mod tools;
 pub mod tui;
-pub mod wish;
-pub mod worker;
 
 /// Serialize tests that mutate process CWD (tempdir races otherwise).
 #[cfg(test)]

@@ -14,6 +14,11 @@ use std::time::Duration;
 use super::helpers::summarize_api_messages;
 use super::AppCommand;
 
+/// Exponential transport-retry backoff: 2s, 4s, 8s, 16s, capped at 30s.
+fn backoff_delay(attempt: u32) -> Duration {
+    Duration::from_millis((2_000u64.saturating_mul(1 << attempt.min(4))).min(30_000))
+}
+
 pub struct SessionRuntime {
     pub id: String,
     pub command_tx: channel::Sender<AppCommand>,
@@ -45,12 +50,11 @@ pub struct SessionRuntimeConfig {
     pub branch_label: Option<String>,
     pub messages: Vec<Message>,
     pub goal: Option<crate::agent::goal::GoalState>,
-    pub seat: Option<String>,
-    pub handoff: Option<crate::agent::handoff::HandoffNotes>,
     pub todos: Option<Vec<crate::tools::todowrite::TodoItem>>,
 }
 
 impl SessionRuntimeConfig {
+    #[allow(clippy::too_many_arguments)]
     pub fn from_session_data(
         data: &SessionData,
         provider: Arc<dyn Provider>,
@@ -92,12 +96,11 @@ impl SessionRuntimeConfig {
             branch_label: data.branch_label.clone(),
             messages: data.messages.clone(),
             goal,
-            seat: data.seat.clone(),
-            handoff: data.handoff.clone(),
             todos: data.todos.clone(),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn empty_new(
         provider: Arc<dyn Provider>,
         model: String,
@@ -126,8 +129,6 @@ impl SessionRuntimeConfig {
             branch_label: None,
             messages: Vec::new(),
             goal: None,
-            seat: None,
-            handoff: None,
             todos: None,
         }
     }
@@ -160,8 +161,6 @@ pub fn spawn_session_runtime(cfg: SessionRuntimeConfig) -> SessionRuntime {
     let branch_for_thread = cfg.branch_label;
     let resume_msgs = cfg.messages;
     let resume_goal = cfg.goal;
-    let resume_seat = cfg.seat;
-    let resume_handoff = cfg.handoff;
     let resume_todos = cfg.todos;
 
     std::thread::spawn(move || {
@@ -187,14 +186,6 @@ pub fn spawn_session_runtime(cfg: SessionRuntimeConfig) -> SessionRuntime {
                 .with_system_prompt(sp)
                 .with_thinking_budget(thinking_budget);
             state.goal = resume_goal;
-            state.seat = resume_seat.clone();
-            state.handoff = resume_handoff.clone();
-            crate::agent::handoff::restore(resume_handoff);
-            if let Some(ref seat_name) = resume_seat {
-                crate::tools::handoff::set_active_seat(Some(seat_name.clone()));
-            }
-            state.pending_wake =
-                state.seat.is_some() || state.handoff.is_some() || state.goal.is_some();
 
             for msg in &resume_msgs {
                 state.add_message(msg.clone());
@@ -280,13 +271,8 @@ pub fn spawn_session_runtime(cfg: SessionRuntimeConfig) -> SessionRuntime {
                     AppCommand::NewSession => {
                         agent_loop.clear_messages();
                         agent_loop.clear_goal();
-                        agent_loop.state_mut().seat = None;
-                        agent_loop.state_mut().handoff = None;
-                        agent_loop.state_mut().pending_wake = false;
                         agent_loop.state_mut().total_input_tokens = 0;
                         agent_loop.state_mut().total_output_tokens = 0;
-                        crate::agent::handoff::clear();
-                        crate::tools::handoff::set_active_seat(None);
                         abort_for_thread.clear();
                         steer_for_thread.clear();
                         crate::tools::todowrite::clear();
@@ -344,8 +330,6 @@ pub fn spawn_session_runtime(cfg: SessionRuntimeConfig) -> SessionRuntime {
                             call_tree: tree_snapshot,
                             todos: Some(crate::tools::todowrite::snapshot()),
                             goal: s.goal.clone(),
-                            seat: s.seat.clone(),
-                            handoff: s.handoff.clone().or_else(crate::agent::handoff::snapshot),
                             project_root: None,
                         };
                         current.ensure_title();
@@ -360,11 +344,6 @@ pub fn spawn_session_runtime(cfg: SessionRuntimeConfig) -> SessionRuntime {
                                 branch_label_local = forked.branch_label.clone();
                                 agent_loop.state_mut().messages = forked.messages.clone();
                                 agent_loop.state_mut().goal = forked.goal.clone();
-                                agent_loop.state_mut().seat = forked.seat.clone();
-                                agent_loop.state_mut().handoff = forked.handoff.clone();
-                                crate::agent::handoff::restore(forked.handoff.clone());
-                                crate::tools::handoff::set_active_seat(forked.seat.clone());
-                                agent_loop.state_mut().pending_wake = true;
                                 let _ = event_tx.send((
                                     0,
                                     AgentEvent::SessionMeta {
@@ -543,184 +522,6 @@ pub fn spawn_session_runtime(cfg: SessionRuntimeConfig) -> SessionRuntime {
                             },
                         ));
                     }
-                    AppCommand::HandoffRequest => {
-                        let text = crate::agent::handoff::handoff_request_message();
-                        let mut prompt = text;
-                        let mut wall_attempt = 0u32;
-                        const MAX_WALL_RETRIES: u32 = 3;
-                        loop {
-                            abort_for_thread.clear();
-                            let event_tx2 = event_tx.clone();
-                            let mut cb = move |event: AgentEvent| {
-                                let _ = event_tx2.send((0, event));
-                            };
-                            let result =
-                                tokio::time::timeout(timeout, agent_loop.run(&prompt, &mut cb))
-                                    .await;
-                            match result {
-                                Ok(Ok(())) => {
-                                    let _ = event_tx.send((
-                                        0,
-                                        AgentEvent::TreeUpdate {
-                                            tree: agent_loop.call_tree().clone(),
-                                        },
-                                    ));
-                                    break;
-                                }
-                                Ok(Err(e)) => {
-                                    let _ = event_tx.send((0, AgentEvent::Error { message: e }));
-                                    break;
-                                }
-                                Err(_) => {
-                                    abort_for_thread.abort();
-                                    let _ = agent_loop.state_mut().settle_dangling_tools();
-                                    let _ = agent_loop.state_mut().repair_tool_pairing();
-                                    wall_attempt += 1;
-                                    if wall_attempt <= MAX_WALL_RETRIES {
-                                        let delay = crate::orchestration::backoff_delay(
-                                            wall_attempt.saturating_sub(1),
-                                            2_000,
-                                            30_000,
-                                            500,
-                                        );
-                                        let _ = event_tx.send((
-                                            0,
-                                            AgentEvent::Status {
-                                                message: format!(
-                                                    "wall timeout after {timeout_secs}s — auto-continuing ({wall_attempt}/{MAX_WALL_RETRIES}) in {}s…",
-                                                    delay.as_secs()
-                                                ),
-                                            },
-                                        ));
-                                        tokio::time::sleep(delay).await;
-                                        prompt = "continue".to_string();
-                                        continue;
-                                    }
-                                    let _ = event_tx.send((
-                                        0,
-                                        AgentEvent::Error {
-                                            message: format!(
-                                                "Request timed out after {timeout_secs}s (auto-retry exhausted)"
-                                            ),
-                                        },
-                                    ));
-                                    break;
-                                }
-                            }
-                        }
-                        let now =
-                            chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                        let s = agent_loop.state();
-                        let tree_snapshot =
-                            serde_json::to_value(agent_loop.call_tree().snapshot()).ok();
-                        let mut session_data = SessionData {
-                            id: session_id_local.clone(),
-                            title: title_local.clone(),
-                            parent_id: parent_id_local.clone(),
-                            branch_label: branch_label_local.clone(),
-                            created_at: created_at_local.clone(),
-                            updated_at: now,
-                            model: s.model.clone(),
-                            provider: s.provider.clone(),
-                            system_prompt: s.system_prompt.clone(),
-                            messages: s.messages.clone(),
-                            total_input_tokens: s.total_input_tokens,
-                            total_output_tokens: s.total_output_tokens,
-                            call_tree: tree_snapshot,
-                            todos: Some(crate::tools::todowrite::snapshot()),
-                            goal: s.goal.clone(),
-                            seat: s.seat.clone(),
-                            handoff: s.handoff.clone().or_else(crate::agent::handoff::snapshot),
-                            project_root: None,
-                        };
-                        session_data.ensure_title();
-                        session_data.stamp_project();
-                        title_local = session_data.title.clone();
-                        let _ = store.save(&session_data);
-                    }
-                    AppCommand::SetSeat { name } => {
-                        agent_loop.state_mut().seat = name.clone();
-                        crate::tools::handoff::set_active_seat(name.clone());
-                        agent_loop.state_mut().pending_wake = true;
-                        let msg = match name {
-                            Some(n) => format!("Seat bound: {n} — wake packet armed"),
-                            None => "Seat cleared".to_string(),
-                        };
-                        let _ = event_tx.send((0, AgentEvent::Status { message: msg }));
-                    }
-                    AppCommand::LoadSession { data } => {
-                        abort_for_thread.clear();
-                        steer_for_thread.clear();
-                        agent_loop.clear_messages();
-                        session_id_local = data.id.clone();
-                        created_at_local = data.created_at.clone();
-                        title_local = data.title.clone();
-                        parent_id_local = data.parent_id.clone();
-                        branch_label_local = data.branch_label.clone();
-                        if !data.system_prompt.trim().is_empty() {
-                            agent_loop.state_mut().system_prompt = data.system_prompt.clone();
-                        }
-                        agent_loop.state_mut().seat = data.seat.clone();
-                        agent_loop.state_mut().handoff = data.handoff.clone();
-                        agent_loop.state_mut().goal = data.goal.clone();
-                        agent_loop.state_mut().total_input_tokens = data.total_input_tokens;
-                        agent_loop.state_mut().total_output_tokens = data.total_output_tokens;
-                        agent_loop.state_mut().pending_wake = data.seat.is_some()
-                            || data.handoff.is_some()
-                            || data.goal.as_ref().is_some_and(|g| {
-                                matches!(
-                                    g.status,
-                                    crate::agent::goal::GoalStatus::Active
-                                        | crate::agent::goal::GoalStatus::Paused
-                                )
-                            });
-                        crate::agent::handoff::restore(data.handoff.clone());
-                        crate::tools::handoff::set_active_seat(data.seat.clone());
-                        if let Some(todos) = data.todos.clone() {
-                            crate::tools::todowrite::restore(todos);
-                        } else {
-                            crate::tools::todowrite::clear();
-                        }
-                        agent_loop.state_mut().messages = data.messages.clone();
-                        let msg_count = data.messages.len();
-                        let _ = event_tx.send((
-                            0,
-                            AgentEvent::SessionMeta {
-                                id: data.id.clone(),
-                                title: data.title.clone(),
-                            },
-                        ));
-                        let _ = event_tx.send((
-                            0,
-                            AgentEvent::ReloadTranscript {
-                                messages: data.messages.clone(),
-                            },
-                        ));
-                        if let Some(ref g) = data.goal {
-                            let _ = event_tx.send((
-                                0,
-                                AgentEvent::GoalUpdate {
-                                    summary: format!("◎ /goal {}", g.status.as_str()),
-                                },
-                            ));
-                        } else {
-                            let _ = event_tx.send((
-                                0,
-                                AgentEvent::GoalUpdate {
-                                    summary: String::new(),
-                                },
-                            ));
-                        }
-                        let _ = event_tx.send((
-                            0,
-                            AgentEvent::Status {
-                                message: format!(
-                                    "loaded session {} ({msg_count} msgs)",
-                                    data.id
-                                ),
-                            },
-                        ));
-                    }
                     AppCommand::SwitchSession { data } => {
                         let target_id = data.id.clone();
                         {
@@ -746,11 +547,6 @@ pub fn spawn_session_runtime(cfg: SessionRuntimeConfig) -> SessionRuntime {
                                 call_tree: tree_snapshot,
                                 todos: Some(crate::tools::todowrite::snapshot()),
                                 goal: s.goal.clone(),
-                                seat: s.seat.clone(),
-                                handoff: s
-                                    .handoff
-                                    .clone()
-                                    .or_else(crate::agent::handoff::snapshot),
                                 project_root: None,
                             };
                             session_data.ensure_title();
@@ -769,22 +565,9 @@ pub fn spawn_session_runtime(cfg: SessionRuntimeConfig) -> SessionRuntime {
                         if !data.system_prompt.trim().is_empty() {
                             agent_loop.state_mut().system_prompt = data.system_prompt.clone();
                         }
-                        agent_loop.state_mut().seat = data.seat.clone();
-                        agent_loop.state_mut().handoff = data.handoff.clone();
                         agent_loop.state_mut().goal = data.goal.clone();
                         agent_loop.state_mut().total_input_tokens = data.total_input_tokens;
                         agent_loop.state_mut().total_output_tokens = data.total_output_tokens;
-                        agent_loop.state_mut().pending_wake = data.seat.is_some()
-                            || data.handoff.is_some()
-                            || data.goal.as_ref().is_some_and(|g| {
-                                matches!(
-                                    g.status,
-                                    crate::agent::goal::GoalStatus::Active
-                                        | crate::agent::goal::GoalStatus::Paused
-                                )
-                            });
-                        crate::agent::handoff::restore(data.handoff.clone());
-                        crate::tools::handoff::set_active_seat(data.seat.clone());
                         if let Some(todos) = data.todos.clone() {
                             crate::tools::todowrite::restore(todos);
                         } else {
@@ -852,8 +635,6 @@ pub fn spawn_session_runtime(cfg: SessionRuntimeConfig) -> SessionRuntime {
                             call_tree: tree_snapshot,
                             todos: Some(crate::tools::todowrite::snapshot()),
                             goal: s.goal.clone(),
-                            seat: s.seat.clone(),
-                            handoff: s.handoff.clone().or_else(crate::agent::handoff::snapshot),
                             project_root: None,
                         };
                         session_data.ensure_title();
@@ -890,8 +671,6 @@ pub fn spawn_session_runtime(cfg: SessionRuntimeConfig) -> SessionRuntime {
                             call_tree: tree_snapshot,
                             todos: Some(crate::tools::todowrite::snapshot()),
                             goal: s.goal.clone(),
-                            seat: s.seat.clone(),
-                            handoff: s.handoff.clone().or_else(crate::agent::handoff::snapshot),
                             project_root: None,
                         };
                         session_data.stamp_project();
@@ -933,12 +712,7 @@ pub fn spawn_session_runtime(cfg: SessionRuntimeConfig) -> SessionRuntime {
                                         wall_attempt += 1;
                                         let _ = agent_loop.state_mut().settle_dangling_tools();
                                         let _ = agent_loop.state_mut().repair_tool_pairing();
-                                        let delay = crate::orchestration::backoff_delay(
-                                            wall_attempt.saturating_sub(1),
-                                            2_000,
-                                            30_000,
-                                            500,
-                                        );
+                                        let delay = backoff_delay(wall_attempt.saturating_sub(1));
                                         let _ = event_tx.send((
                                             0,
                                             AgentEvent::Status {
@@ -966,12 +740,7 @@ pub fn spawn_session_runtime(cfg: SessionRuntimeConfig) -> SessionRuntime {
                                     let _ = agent_loop.state_mut().repair_tool_pairing();
                                     wall_attempt += 1;
                                     if wall_attempt <= MAX_WALL_RETRIES {
-                                        let delay = crate::orchestration::backoff_delay(
-                                            wall_attempt.saturating_sub(1),
-                                            2_000,
-                                            30_000,
-                                            500,
-                                        );
+                                        let delay = backoff_delay(wall_attempt.saturating_sub(1));
                                         let _ = event_tx.send((
                                             0,
                                             AgentEvent::Status {
@@ -1018,8 +787,6 @@ pub fn spawn_session_runtime(cfg: SessionRuntimeConfig) -> SessionRuntime {
                             call_tree: tree_snapshot,
                             todos: Some(crate::tools::todowrite::snapshot()),
                             goal: s.goal.clone(),
-                            seat: s.seat.clone(),
-                            handoff: s.handoff.clone().or_else(crate::agent::handoff::snapshot),
                             project_root: None,
                         };
                         session_data.ensure_title();

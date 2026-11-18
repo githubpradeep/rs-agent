@@ -641,7 +641,7 @@ fn fuzzy_line_suggestions(content: &str, old_string: &str, limit: usize) -> Vec<
         if score >= 0.45 {
             scored.push((score, start));
         }
-        if window > 1 && end + 1 <= file_lines.len() {
+        if window > 1 && end < file_lines.len() {
             let chunk2 = file_lines[start..end + 1].join("\n");
             let score2 = similarity(&needle_norm, &normalize_for_score(&chunk2));
             if score2 >= 0.45 {

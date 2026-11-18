@@ -50,9 +50,6 @@ pub struct GoalState {
     /// DO_WHILE-style hard cap on auto-continue turns (0 = use MAX_CONSECUTIVE_BLOCKS only).
     #[serde(default)]
     pub max_iterations: u32,
-    /// Optional safe condition DSL (Conductor TerminationConfig).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cond_dsl: Option<String>,
 }
 
 /// Default max goal auto-continue iterations (Conductor DO_WHILE).
@@ -70,19 +67,12 @@ impl GoalState {
             tokens_baseline_out: output_tokens,
             consecutive_blocks: 0,
             max_iterations: DEFAULT_MAX_GOAL_ITERATIONS,
-            cond_dsl: None,
         }
     }
 
     /// True when hard iteration budget is exhausted.
     pub fn iterations_exhausted(&self) -> bool {
         self.max_iterations > 0 && self.turns_evaluated >= self.max_iterations
-    }
-
-    /// Evaluate optional cond_dsl against haystack; None if unset/invalid.
-    pub fn eval_cond_dsl(&self, haystack: &str) -> Option<bool> {
-        let dsl = self.cond_dsl.as_deref()?;
-        crate::orchestration::GoalCond::parse_dsl(dsl).map(|c| c.eval(haystack))
     }
 
     pub fn is_running(&self) -> bool {
@@ -181,7 +171,7 @@ pub fn parse_evaluator_reply(text: &str) -> (bool, String) {
         || upper.starts_with("YES,")
         || upper.starts_with("YES.");
     let reason = if let Some(rest) = first_line
-        .split_once(|c: char| c == ':' || c == '-' || c == '—' || c == ',')
+        .split_once([':', '-', '—', ','])
         .map(|(_, r)| r.trim())
         .filter(|r| !r.is_empty())
     {

@@ -132,18 +132,13 @@ impl LspClient {
 
         let handle = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
-            loop {
-                match read_message(&mut reader).await {
-                    Ok(msg) => {
-                        if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
-                            if method == "textDocument/publishDiagnostics" {
-                                if let Some(params) = msg.get("params") {
-                                    apply_publish_diagnostics(diags_reader.clone(), params);
-                                }
-                            }
+            while let Ok(msg) = read_message(&mut reader).await {
+                if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
+                    if method == "textDocument/publishDiagnostics" {
+                        if let Some(params) = msg.get("params") {
+                            apply_publish_diagnostics(diags_reader.clone(), params);
                         }
                     }
-                    Err(_) => break,
                 }
             }
         });

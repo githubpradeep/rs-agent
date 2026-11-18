@@ -344,13 +344,12 @@ mod tests {
 
     #[tokio::test]
     async fn repl_starts_when_python3_available() {
-        if std::process::Command::new("python3")
+        if !std::process::Command::new("python3")
             .arg("-c")
             .arg("print(1)")
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
-            == false
         {
             return;
         }

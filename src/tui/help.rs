@@ -10,19 +10,10 @@ use super::keys::KeyMap;
 use super::theme::Palette;
 use super::widgets;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct HelpOverlay {
     pub query: String,
     pub selection: usize,
-}
-
-impl Default for HelpOverlay {
-    fn default() -> Self {
-        Self {
-            query: String::new(),
-            selection: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -136,31 +127,6 @@ pub fn build_entries(keys: &KeyMap) -> Vec<HelpEntry> {
             group: "normal",
         },
         HelpEntry {
-            keys: keys.binding("toggle_city").into(),
-            desc: "workers cockpit (wish/spawn/watch)".into(),
-            group: "normal",
-        },
-        HelpEntry {
-            keys: "/fleet".into(),
-            desc: "workers cockpit (alias /city)".into(),
-            group: "slash",
-        },
-        HelpEntry {
-            keys: "Tab".into(),
-            desc: "city: cycle wish/board/inspect/steer/spawn".into(),
-            group: "city",
-        },
-        HelpEntry {
-            keys: "f/a/o/b".into(),
-            desc: "city inspect: follow/attach/open/abort".into(),
-            group: "city",
-        },
-        HelpEntry {
-            keys: "↵".into(),
-            desc: "city: submit wish/steer/spawn or open inspector".into(),
-            group: "city",
-        },
-        HelpEntry {
             keys: "/model /provider".into(),
             desc: "model / provider pickers".into(),
             group: "slash",
@@ -173,11 +139,6 @@ pub fn build_entries(keys: &KeyMap) -> Vec<HelpEntry> {
         HelpEntry {
             keys: "/recall".into(),
             desc: "read one archived trajectory step by id".into(),
-            group: "slash",
-        },
-        HelpEntry {
-            keys: "/refine".into(),
-            desc: "propose or apply a fact/skill note; does not edit the system prompt".into(),
             group: "slash",
         },
     ];

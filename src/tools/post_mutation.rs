@@ -116,10 +116,7 @@ fn diag_fp(d: &Diagnostic) -> String {
 }
 
 fn fingerprints_for(snap: &DiagnosticSnapshot, key: &str) -> Vec<String> {
-    diags_for(snap, key)
-        .into_iter()
-        .map(|d| diag_fp(d))
-        .collect()
+    diags_for(snap, key).into_iter().map(diag_fp).collect()
 }
 
 fn diags_for<'a>(snap: &'a DiagnosticSnapshot, key: &str) -> Vec<&'a Diagnostic> {

@@ -101,20 +101,6 @@ fn maybe_run_first_launch_wizard(
     if cli.prompt.is_some() || cli.list_models || cli.list_sessions {
         return Ok(());
     }
-    if matches!(
-        cli.command,
-        Some(rs_agent::cli::Commands::Marshal(_))
-            | Some(rs_agent::cli::Commands::Fleet(_))
-            | Some(rs_agent::cli::Commands::Wish(_))
-            | Some(rs_agent::cli::Commands::Role(_))
-            | Some(rs_agent::cli::Commands::Status(_))
-            | Some(rs_agent::cli::Commands::Api(_))
-            | Some(rs_agent::cli::Commands::Runtime(_))
-            | Some(rs_agent::cli::Commands::Schedule(_))
-            | Some(rs_agent::cli::Commands::PlanExecute { .. })
-    ) {
-        return Ok(());
-    }
     if !Config::user_config_needs_wizard() {
         return Ok(());
     }
@@ -123,9 +109,7 @@ fn maybe_run_first_launch_wizard(
     eprintln!("(Press Enter to accept defaults; Ctrl-C to cancel)\n");
 
     let provider = {
-        let raw = read_line_prompt(
-            "Provider [anthropic/openai/opencode/opencode-cli/bedrock] (anthropic): ",
-        )?;
+        let raw = read_line_prompt("Provider [anthropic/openai/opencode] (anthropic): ")?;
         if raw.is_empty() {
             "anthropic".to_string()
         } else {
@@ -162,21 +146,11 @@ fn maybe_run_first_launch_wizard(
     }
 
     let env_name = rs_agent::ai::registry::api_key_env_for(&provider).to_string();
-    if !matches!(
-        provider.to_lowercase().as_str(),
-        "opencode-cli" | "bedrock" | "amazon-bedrock"
-    ) && std::env::var(&env_name).is_err()
-    {
-        // OpenCode Zen: reuse local `auth.json` when present.
-        if matches!(provider.to_lowercase().as_str(), "opencode" | "opencode-go") {
-            rs_agent::ai::registry::export_opencode_auth_from_file();
-        }
+    // OpenCode Zen: reuse local `auth.json` when present.
+    if matches!(provider.to_lowercase().as_str(), "opencode" | "opencode-go") {
+        rs_agent::ai::registry::export_opencode_auth_from_file();
     }
-    if !matches!(
-        provider.to_lowercase().as_str(),
-        "opencode-cli" | "bedrock" | "amazon-bedrock"
-    ) && std::env::var(&env_name).is_err()
-        && !rs_agent::ai::registry::has_configured_auth(&provider)
+    if std::env::var(&env_name).is_err() && !rs_agent::ai::registry::has_configured_auth(&provider)
     {
         eprintln!("\nNo {} in the environment yet.", env_name);
         eprintln!("  export {}=...", env_name);
@@ -189,15 +163,6 @@ fn maybe_run_first_launch_wizard(
                 "Re-run rs-agent after exporting the key; smoke prompt: -p \"reply with pong\""
             );
         }
-    } else if matches!(
-        provider.to_lowercase().as_str(),
-        "bedrock" | "amazon-bedrock"
-    ) && std::env::var("AWS_ACCESS_KEY_ID").is_err()
-        && !rs_agent::ai::registry::has_configured_auth("amazon-bedrock")
-    {
-        eprintln!("\nNo AWS credentials found yet.");
-        eprintln!("  export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...");
-        eprintln!("  or configure ~/.aws/credentials ([default] or $AWS_PROFILE)");
     }
 
     eprintln!();
@@ -231,289 +196,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     rs_agent::agent::set_escalate_chars(escalate);
 
-    // City control plane (no provider required except fleet up / worker / role gargoyle).
-    // IMPORTANT: match once — `if let ... = cli.command.take()` drops non-matching
-    // variants and would fall through to the TUI (wish/fleet/role/worker).
-    match cli.command.take() {
-        Some(rs_agent::cli::Commands::Marshal(margs)) => {
-            if let Some(ref bead) = margs.assign {
-                let seat = margs.seat.clone().ok_or("--assign requires --seat")?;
-                match rs_agent::marshal::assign_bead(bead, &seat) {
-                    Ok(b) => println!("Assigned {} → {} — {}", b.id, seat, b.title),
-                    Err(e) => {
-                        eprintln!("{e}");
-                        std::process::exit(1);
-                    }
-                }
-                return Ok(());
-            }
-            let opts = rs_agent::marshal::MarshalOpts {
-                auto_assign: !margs.no_auto_assign,
-                max_assign: 8,
-                stuck_mins: margs.stuck_mins,
-                mail_stuck: margs.stuck_mins > 0,
-            };
-            if margs.r#loop {
-                rs_agent::marshal::run_loop(opts, margs.interval_secs, margs.budget_minutes).await;
-            } else {
-                println!("{}", rs_agent::marshal::run_with_opts(opts));
-            }
-            return Ok(());
-        }
-        Some(rs_agent::cli::Commands::Wish(wargs)) => {
-            let text = wargs.text.join(" ");
-            match rs_agent::wish::create_wish(&text, wargs.task, wargs.auto) {
-                Ok(b) => println!("{}", rs_agent::wish::format_created(&b)),
-                Err(e) => {
-                    eprintln!("{e}");
-                    std::process::exit(1);
-                }
-            }
-            return Ok(());
-        }
-        Some(rs_agent::cli::Commands::Role(rargs)) => {
-            let name = rargs
-                .seat
-                .or(rargs.role)
-                .ok_or("role requires --seat Beadle (or positional role name)")?;
-            let kind = rs_agent::roles::RoleKind::parse(&name).ok_or_else(|| {
-                format!("unknown role `{name}` — Beadle|Gargoyle|Drawbridge|Scryer|Marshal")
-            })?;
-            if rargs.r#loop {
-                rs_agent::roles::run_loop(
-                    kind,
-                    rargs.source.clone(),
-                    rargs.interval_secs,
-                    rargs.budget_minutes,
-                )
-                .await?;
-            } else {
-                match rs_agent::roles::run_once(kind, rargs.source.as_deref()) {
-                    Ok(msg) => println!("{msg}"),
-                    Err(e) => {
-                        eprintln!("{e}");
-                        std::process::exit(1);
-                    }
-                }
-            }
-            return Ok(());
-        }
-        Some(rs_agent::cli::Commands::Fleet(fargs)) => {
-            match fargs.command {
-                rs_agent::cli::FleetCommand::Up {
-                    seats,
-                    budget_minutes,
-                    sleep_secs,
-                    quiet,
-                    fail_fast,
-                    shared_worktree,
-                } => {
-                    let opts = rs_agent::fleet::FleetUpOpts {
-                        seats: rs_agent::fleet::parse_seat_list(&seats),
-                        budget_minutes,
-                        sleep_secs,
-                        quiet,
-                        provider: cli.provider.clone(),
-                        model: cli.model.clone(),
-                        approve: true, // fleet is unattended
-                        fail_fast,
-                        shared_worktree,
-                    };
-                    match rs_agent::fleet::fleet_up(opts) {
-                        Ok(msg) => println!("{msg}"),
-                        Err(e) => {
-                            eprintln!("{e}");
-                            std::process::exit(1);
-                        }
-                    }
-                }
-                rs_agent::cli::FleetCommand::Down { seats } => {
-                    let list = seats.as_deref().map(rs_agent::fleet::parse_seat_list);
-                    println!("{}", rs_agent::fleet::fleet_down(list));
-                }
-                rs_agent::cli::FleetCommand::Status => {
-                    println!("{}", rs_agent::fleet::fleet_status());
-                }
-                rs_agent::cli::FleetCommand::Logs { seat, lines } => {
-                    println!("{}", rs_agent::fleet::fleet_logs(&seat, lines));
-                }
-            }
-            return Ok(());
-        }
-        Some(rs_agent::cli::Commands::Status(sargs)) => {
-            match sargs.command.unwrap_or(rs_agent::cli::StatusCommand::Show) {
-                rs_agent::cli::StatusCommand::Show => {
-                    let snap = rs_agent::lifecycle::read_snapshot_file()
-                        .unwrap_or_else(rs_agent::lifecycle::snapshot);
-                    println!(
-                        "lifecycle={} detail={} updated={}",
-                        snap.lifecycle.as_str(),
-                        snap.detail,
-                        snap.updated_at
-                    );
-                }
-                rs_agent::cli::StatusCommand::Wait {
-                    until,
-                    timeout_secs,
-                } => {
-                    let until = rs_agent::lifecycle::Lifecycle::parse(&until);
-                    match rs_agent::lifecycle::wait_until(
-                        until,
-                        std::time::Duration::from_secs(timeout_secs),
-                    ) {
-                        Ok(snap) => {
-                            println!(
-                                "ok lifecycle={} detail={}",
-                                snap.lifecycle.as_str(),
-                                snap.detail
-                            );
-                        }
-                        Err(e) => {
-                            eprintln!("{e}");
-                            std::process::exit(1);
-                        }
-                    }
-                }
-                rs_agent::cli::StatusCommand::Resume { seat, answer } => {
-                    match rs_agent::fleet::resume_human(&seat, &answer) {
-                        Ok(msg) => println!("{msg}"),
-                        Err(e) => {
-                            eprintln!("{e}");
-                            std::process::exit(1);
-                        }
-                    }
-                }
-            }
-            return Ok(());
-        }
-        Some(rs_agent::cli::Commands::Api(aargs)) => {
-            let path = aargs
-                .socket
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(rs_agent::runtime::default_socket_path);
-            let params: serde_json::Value =
-                serde_json::from_str(&aargs.params).unwrap_or_else(|_| serde_json::json!({}));
-            let req = rs_agent::runtime::ApiRequest {
-                method: aargs.method,
-                params,
-                id: Some(serde_json::json!(1)),
-            };
-            match rs_agent::runtime::socket::call(&path, &req) {
-                Ok(resp) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&resp).unwrap_or_default()
-                    );
-                    if !resp.ok {
-                        std::process::exit(1);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("api call failed: {e}");
-                    std::process::exit(1);
-                }
-            }
-            return Ok(());
-        }
-        Some(rs_agent::cli::Commands::Runtime(rargs)) => {
-            match rargs.command {
-                rs_agent::cli::RuntimeCommand::Serve { socket } => {
-                    let path = socket
-                        .map(std::path::PathBuf::from)
-                        .unwrap_or_else(rs_agent::runtime::default_socket_path);
-                    let _ = rs_agent::runtime::write_pid(&rs_agent::runtime::pid_path());
-                    eprintln!("rs-agent runtime listening on {}", path.display());
-                    if let Err(e) = rs_agent::runtime::serve_socket(&path) {
-                        eprintln!("runtime error: {e}");
-                        std::process::exit(1);
-                    }
-                }
-                rs_agent::cli::RuntimeCommand::Stop { socket } => {
-                    let path = socket
-                        .map(std::path::PathBuf::from)
-                        .unwrap_or_else(rs_agent::runtime::default_socket_path);
-                    let req = rs_agent::runtime::ApiRequest {
-                        method: "server.stop".into(),
-                        params: serde_json::json!({}),
-                        id: Some(serde_json::json!(1)),
-                    };
-                    match rs_agent::runtime::socket::call(&path, &req) {
-                        Ok(resp) => println!(
-                            "{}",
-                            serde_json::to_string_pretty(&resp).unwrap_or_default()
-                        ),
-                        Err(e) => {
-                            // Fallback: write stop flag even if connect fails mid-shutdown.
-                            let _ = std::fs::write(path.with_extension("stop"), "1\n");
-                            eprintln!("stop signalled ({e})");
-                        }
-                    }
-                }
-            }
-            return Ok(());
-        }
-        Some(rs_agent::cli::Commands::Schedule(sargs)) => {
-            match sargs.command {
-                rs_agent::cli::ScheduleCommand::List => {
-                    for s in rs_agent::schedule::load_all() {
-                        println!(
-                            "{} | {} | {} | paused={} last={:?}",
-                            s.name, s.cron, s.command, s.paused, s.last_run_at
-                        );
-                    }
-                }
-                rs_agent::cli::ScheduleCommand::Add {
-                    name,
-                    cron,
-                    command,
-                } => {
-                    let mut items = rs_agent::schedule::load_all();
-                    items.push(rs_agent::schedule::Schedule {
-                        name,
-                        cron,
-                        command,
-                        paused: false,
-                        catchup: false,
-                        last_run_at: None,
-                    });
-                    rs_agent::schedule::save_all(&items)?;
-                    println!("schedule saved ({} total)", items.len());
-                }
-                rs_agent::cli::ScheduleCommand::Due => {
-                    for s in rs_agent::schedule::due_now(true) {
-                        println!("DUE {} → {}", s.name, s.command);
-                    }
-                }
-            }
-            return Ok(());
-        }
-        Some(rs_agent::cli::Commands::PlanExecute { text }) => {
-            let plan = text.join("\n");
-            match rs_agent::schedule::plan_execute_emit_beads(&plan) {
-                Ok(ids) => {
-                    println!("created {} implement beads:", ids.len());
-                    for id in ids {
-                        println!("  {id}");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("{e}");
-                    std::process::exit(1);
-                }
-            }
-            return Ok(());
-        }
-        other => {
-            // Worker needs a provider; put it back for the later handler.
-            cli.command = other;
-        }
-    }
-
     let provider_name = cli
         .provider
         .clone()
         .unwrap_or_else(|| "anthropic".to_string());
-    let mut model = {
+    let model = {
         let m = cli
             .model
             .clone()
@@ -521,48 +208,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.resolve_model_alias(&m)
     };
 
-    // Fleet seat may override model (and optionally provider) before provider construction.
-    let mut provider_name = provider_name;
-    if let Some(rs_agent::cli::Commands::Worker(ref wargs)) = cli.command {
-        if let Some(ref seat_name) = wargs.seat {
-            if let Ok(seat) = rs_agent::agent::seat::load(seat_name) {
-                if let Some(ref p) = seat.provider {
-                    if !p.trim().is_empty() {
-                        provider_name = p.trim().to_string();
-                    }
-                }
-                if let Some(ref m) = seat.model {
-                    if !m.trim().is_empty() {
-                        model = cfg.resolve_model_alias(m.trim());
-                    }
-                }
-                if seat.role.eq_ignore_ascii_case("marshal") {
-                    eprintln!(
-                        "[worker] seat `{seat_name}` has role marshal — prefer `rs-agent marshal --once` for reclaim/summary"
-                    );
-                }
-            }
-        }
-    }
-
     let provider = get_provider(
         &provider_name,
         cli.base_url.as_deref(),
         Some(model.as_str()),
         cli.timeout,
     )?;
-
-    if provider_name.eq_ignore_ascii_case("opencode-cli") {
-        std::env::set_var("OPENCODE_API_KEY", "cli-mode-no-key-needed");
-    }
-
-    if provider_name.eq_ignore_ascii_case("bedrock")
-        || provider_name.eq_ignore_ascii_case("amazon-bedrock")
-    {
-        if std::env::var("AWS_ACCESS_KEY_ID").is_err() {
-            rs_agent::ai::bedrock::export_credentials_from_file();
-        }
-    }
 
     // Re-export after provider construction path may have run (auth.json).
     if matches!(
@@ -585,11 +236,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let provider_lower = provider_name.to_lowercase();
-    let skips_api_key_env = matches!(
-        provider_lower.as_str(),
-        "opencode-cli" | "bedrock" | "amazon-bedrock"
-    );
-    if !skips_api_key_env && std::env::var(&env_name).is_err() {
+    if std::env::var(&env_name).is_err() {
         eprintln!("Missing API key for {}.", provider_lower);
         eprintln!("  export {}=sk-...", env_name);
         if matches!(provider_lower.as_str(), "opencode" | "opencode-go") {
@@ -597,65 +244,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         eprintln!("Or paste a key via /provider|/login (saved to ~/.rs-agent/secrets.toml).");
         std::process::exit(1);
-    }
-
-    // Bedrock: env optional if ~/.aws/credentials (or AWS_PROFILE) is present.
-    if matches!(provider_lower.as_str(), "bedrock" | "amazon-bedrock")
-        && std::env::var("AWS_ACCESS_KEY_ID").is_err()
-        && !rs_agent::ai::registry::has_configured_auth("amazon-bedrock")
-    {
-        eprintln!("Missing AWS credentials for Bedrock.");
-        eprintln!("  export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...");
-        eprintln!("  or put keys in ~/.aws/credentials under [default] / $AWS_PROFILE");
-        std::process::exit(1);
-    }
-
-    // Overnight factory worker (headless).
-    if let Some(rs_agent::cli::Commands::Worker(wargs)) = cli.command.take() {
-        let thinking_budget = resolve_thinking_budget(&cli, provider.as_ref());
-        let mut system_prompt = if let Some(ref sp) = cli.system_prompt {
-            sp.clone()
-        } else {
-            rs_agent::agent::default_system_prompt()
-        };
-        for extra in &cli.append_system_prompt {
-            if let Some(path) = extra.strip_prefix('@') {
-                if let Ok(body) = std::fs::read_to_string(path) {
-                    system_prompt.push_str("\n\n");
-                    system_prompt.push_str(&body);
-                }
-            } else {
-                system_prompt.push_str("\n\n");
-                system_prompt.push_str(extra);
-            }
-        }
-        if !cli.no_context_files {
-            let context_files = context::discover_context_files();
-            let context_section = context::build_context_section(&context_files);
-            if !context_section.is_empty() {
-                system_prompt.push_str(&context_section);
-            }
-        }
-        let wcfg = rs_agent::worker::WorkerConfig {
-            loop_mode: wargs.r#loop && !wargs.once,
-            budget_minutes: wargs.budget_minutes,
-            approve: true, // unattended requires approve
-            seat: wargs.seat,
-            fail_fast: wargs.fail_fast,
-            max_rlm_depth: cli.rlm_depth,
-            max_iterations: cli.max_iterations,
-            thinking_budget,
-            sleep_secs: wargs.sleep_secs,
-            goal_verify: cfg.goal_verify.unwrap_or(true),
-            verbose: wargs.verbose && !wargs.quiet,
-            response_timeout_secs: 600,
-        };
-        eprintln!(
-            "rs-agent worker — loop={} budget={}m seat={:?}",
-            wcfg.loop_mode, wcfg.budget_minutes, wcfg.seat
-        );
-        rs_agent::worker::run_worker(provider, model, provider_name, system_prompt, wcfg).await?;
-        return Ok(());
     }
 
     if cli.list_models {
@@ -678,7 +266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let base_prompt = cli
         .system_prompt
         .clone()
-        .unwrap_or_else(|| rs_agent::agent::default_system_prompt());
+        .unwrap_or_else(rs_agent::agent::default_system_prompt);
 
     let mut system_prompt = base_prompt;
 
@@ -843,7 +431,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     sessions.sort_by(|a, b| b.id.cmp(&a.id));
                     println!("Saved sessions (newest first):");
-                    println!("  {:<22}  {:>4}  {}", "ID (use with -r)", "msgs", "title");
+                    println!("  {:<22}  {:>4}  title", "ID (use with -r)", "msgs");
                     for s in sessions.iter().take(30) {
                         let short = SessionStore::short_id(&s.id);
                         let title = s.title.as_deref().unwrap_or("(untitled)");

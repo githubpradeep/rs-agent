@@ -203,6 +203,12 @@ pub struct TrustStore {
     data: Mutex<HashMap<String, bool>>,
 }
 
+impl Default for TrustStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TrustStore {
     pub fn new() -> Self {
         let home = std::env::var("HOME")

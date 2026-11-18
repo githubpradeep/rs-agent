@@ -23,7 +23,7 @@ impl ThemeName {
     pub fn from_host() -> Self {
         // COLORFGBG is typically "fg;bg" with 0–15 ANSI indices (or 256-color).
         if let Ok(v) = std::env::var("COLORFGBG") {
-            if let Some(bg) = v.split(';').last() {
+            if let Some(bg) = v.split(';').next_back() {
                 if let Ok(n) = bg.trim().parse::<u16>() {
                     // Common heuristic: bright backgrounds → light theme.
                     if n >= 7 && n != 8 {
@@ -44,13 +44,6 @@ impl ThemeName {
             Self::Dark => "dark",
             Self::Light => "light",
             Self::Forest => "forest",
-        }
-    }
-
-    pub fn syntect_theme(self) -> &'static str {
-        match self {
-            Self::Light => "base16-ocean.light",
-            Self::Dark | Self::Forest => "base16-ocean.dark",
         }
     }
 }

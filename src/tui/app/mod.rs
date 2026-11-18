@@ -28,7 +28,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::Frame;
 
-use super::fleet_panel::{self, BoardRow, FleetPanelState};
 use super::help::{self, HelpOverlay};
 use super::hit::{HitMap, HitTarget};
 use super::keys::{merge_keybindings, KeyMap};
@@ -42,8 +41,6 @@ use super::toast::{self, Toast};
 use super::tree_view::{self, SidePanelMode};
 use super::ui::FocusZone;
 use super::widgets;
-use crate::lifecycle::{self, Lifecycle};
-use crate::notify::{self, NotifyMode};
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
@@ -107,6 +104,9 @@ enum PickerMode {
 }
 
 #[allow(dead_code)]
+/// Cross-thread commands for a session runtime. `SwitchSession` carries a full
+/// transcript, hence the allow for the size delta between variants.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum AppCommand {
     Submit {
         text: String,
@@ -154,84 +154,13 @@ pub(super) enum AppCommand {
     GoalPause,
     GoalResume,
     GoalStatus,
-    /// Request a consenting handoff (injects user message).
-    HandoffRequest,
-    /// Bind or clear seat identity (`None` = clear).
-    SetSeat {
-        name: Option<String>,
-    },
-    /// Replace agent state with a worker/TUI session (fleet attach).
-    LoadSession {
-        data: SessionData,
-    },
     /// Persist the current session, then load another (atomic session switch).
     SwitchSession {
         data: SessionData,
     },
-    /// Force-save current session to disk (fleet detach).
+    /// Force-save current session to disk.
     PersistSession,
     Exit,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FleetAttachPhase {
-    /// Live log follow only (worker keeps running).
-    Follow,
-    /// Sent pause; waiting for worker `state=paused`.
-    Attaching,
-    /// Human owns the seat session; worker is paused.
-    Attached,
-    /// Read-only session inspect; worker keeps running (no chat takeover).
-    Inspect,
-}
-
-struct FleetAttachState {
-    seat: String,
-    phase: FleetAttachPhase,
-    follower: crate::fleet::LogFollower,
-    /// Session id we adopted from the worker (Attached).
-    worker_session_id: Option<String>,
-    /// TUI session id before attach (reserved for future restore-on-detach).
-    #[allow(dead_code)]
-    prior_session_id: Option<String>,
-    attach_started: Instant,
-}
-
-mod city_ops;
-
-#[derive(Debug, Clone)]
-enum CityDeleteTarget {
-    Worker { seat: String },
-    Bead { id: String, title: String },
-}
-
-/// Confirm / assign only — wish/steer/spawn are inline composers.
-#[derive(Debug, Clone)]
-enum CityOverlay {
-    None,
-    ConfirmDown {
-        seat: Option<String>,
-    },
-    /// Hard-delete worker (files+profile) or bead/wish.
-    ConfirmDelete {
-        target: CityDeleteTarget,
-    },
-    Assign {
-        bead_id: String,
-        seat: String,
-    },
-}
-
-impl Default for CityOverlay {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
-impl CityOverlay {
-    fn is_open(&self) -> bool {
-        !matches!(self, Self::None)
-    }
 }
 
 mod helpers;
@@ -335,16 +264,11 @@ pub struct App {
     pending_kitty_images: Vec<String>,
     lsp_summary: String,
     lsp_cmd_tx: Option<channel::Sender<LspCmd>>,
-    /// Live fleet follow / attach takeover.
-    fleet_attach: Option<FleetAttachState>,
     /// Herdr-style "done but unseen" — cleared when the user interacts.
     unseen_done: bool,
-    /// Cached beads ready count (avoid disk I/O every frame).
-    beads_ready_cache: (Instant, usize),
     toast: Option<Toast>,
     toast_enabled: bool,
     toast_sound: bool,
-    notify_mode: NotifyMode,
     help_overlay: Option<HelpOverlay>,
     settings: Option<SettingsState>,
     /// Ctrl+K command palette.
@@ -352,23 +276,15 @@ pub struct App {
     palette_query: String,
     palette_selection: usize,
     palette_items: Vec<String>,
-    show_fleet_panel: bool,
-    fleet_panel: FleetPanelState,
-    /// Log follower for seat detail when not using fleet_attach.follower.
-    city_detail_follower: Option<crate::fleet::LogFollower>,
-    city_overlay: CityOverlay,
     focus_zone: FocusZone,
-    /// When true, Deep Context tree strip shows under City (coexist).
-    show_tree_with_city: bool,
     show_sessions_panel: bool,
     sessions_panel: SessionsPanelState,
+    /// Last sessions-panel refresh.
+    sessions_refresh_at: Instant,
     side_mode: SidePanelMode,
     tree_nodes: Vec<tree_view::CallTreeNode>,
     hit_map: HitMap,
     diagnostic_banner: Option<String>,
-    allowed_transitions: Vec<String>,
-    /// Last fleet refresh.
-    fleet_refresh_at: Instant,
     /// Session id the focused runtime is bound to (kept equal to `session_id`).
     agent_session_id: String,
     /// Focused runtime is mid-turn.
@@ -390,6 +306,7 @@ enum LspCmd {
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         provider: Arc<dyn Provider>,
         model: String,
@@ -541,8 +458,6 @@ impl App {
                 branch_label: None,
                 messages: Vec::new(),
                 goal: None,
-                seat: None,
-                handoff: None,
                 todos: None,
             }
         };
@@ -556,17 +471,12 @@ impl App {
         let trust_store = TrustStore::new();
         let path_allows = PathAllowStore::new();
 
-        let provider_banner = if provider_name_for_banner.contains("opencode-cli") {
-            format!("{} (experimental)", provider_name_for_banner)
-        } else {
-            provider_name_for_banner.clone()
-        };
+        let provider_banner = provider_name_for_banner.clone();
         let mut initial_msgs = vec![ChatMessage {
             role: "system".to_string(),
             text: format!(
-                "**rs-agent** · overnight factory + Deep Context\n\
+                "**rs-agent** · Deep Context coding agent\n\
                  `{provider}` / `{model}` · session `{session}`\n\n\
-                 Leave a wish (`c` cockpit) · workers implement · review in the morning\n\
                  Huge files stay in `/tree` — they don't blow the window\n\
                  Type to start · `/` commands · `@` files · Esc abort · Enter steer",
                 provider = provider_banner,
@@ -802,27 +712,20 @@ impl App {
             pending_kitty_images: Vec::new(),
             lsp_summary: String::new(),
             lsp_cmd_tx: Some(lsp_cmd_tx),
-            fleet_attach: None,
             unseen_done: false,
-            beads_ready_cache: (Instant::now() - Duration::from_secs(60), 0),
             toast: None,
             toast_enabled: cfg.toast.unwrap_or(true),
             toast_sound: cfg.toast_sound.unwrap_or(false),
-            notify_mode: NotifyMode::parse(cfg.notify.as_deref().unwrap_or("off")),
             help_overlay: None,
             settings: None,
             palette_open: false,
             palette_query: String::new(),
             palette_selection: 0,
             palette_items: Vec::new(),
-            show_fleet_panel: false,
-            fleet_panel: FleetPanelState::default(),
-            city_detail_follower: None,
-            city_overlay: CityOverlay::None,
             focus_zone: FocusZone::Chat,
-            show_tree_with_city: false,
             show_sessions_panel: false,
             sessions_panel: SessionsPanelState::default(),
+            sessions_refresh_at: Instant::now() - Duration::from_secs(60),
             side_mode: SidePanelMode::Tree,
             tree_nodes: Vec::new(),
             hit_map: HitMap::default(),
@@ -837,8 +740,6 @@ impl App {
                     Some(notes.join(" · "))
                 }
             },
-            allowed_transitions: cfg.allowed_transitions.clone(),
-            fleet_refresh_at: Instant::now() - Duration::from_secs(60),
             agent_session_id,
             agent_turn_active: false,
             bg_running_session: None,
@@ -856,11 +757,6 @@ impl App {
         if self.toast_sound {
             toast::play_sound(toast.kind);
         }
-        let life = match toast.kind {
-            toast::ToastKind::NeedsAttention => Lifecycle::Blocked,
-            toast::ToastKind::Finished => Lifecycle::Done,
-        };
-        notify::on_lifecycle(self.notify_mode, life, &toast.body);
         self.toast = Some(toast);
     }
 
@@ -869,7 +765,6 @@ impl App {
         self.settings = None;
         self.palette_open = false;
         self.palette_query.clear();
-        self.city_overlay = CityOverlay::None;
     }
 
     fn open_command_palette(&mut self) {
@@ -886,21 +781,10 @@ impl App {
         }
     }
 
-    fn publish_lifecycle(&mut self, life: Lifecycle, detail: &str) {
-        let changed = lifecycle::publish(life, detail);
-        lifecycle::set_session(Some(self.session_id.clone()), None);
-        if changed {
-            match life {
-                Lifecycle::Blocked => {
-                    self.push_toast(Toast::blocked("needs attention", detail));
-                }
-                Lifecycle::Done => {
-                    if self.unseen_done {
-                        self.push_toast(Toast::finished("done", detail));
-                    }
-                }
-                _ => {}
-            }
+    /// Toast when a turn ends while the user isn't looking.
+    fn notify_done(&mut self, detail: &str) {
+        if self.unseen_done {
+            self.push_toast(Toast::finished("done", detail));
         }
     }
 
@@ -931,8 +815,6 @@ impl App {
                 self.handle_agent_event(event);
             }
 
-            self.poll_fleet_attach();
-
             self.poll_model_picker();
 
             if let Ok(pending) = self.permission_rx.try_recv() {
@@ -950,7 +832,10 @@ impl App {
                 } else {
                     let tool = pending.request.tool_name.clone();
                     self.pending_permission = Some(pending);
-                    self.publish_lifecycle(Lifecycle::Blocked, &format!("permission: {tool}"));
+                    self.push_toast(Toast::blocked(
+                        "needs attention",
+                        format!("permission: {tool}"),
+                    ));
                 }
             }
 
@@ -960,7 +845,7 @@ impl App {
                 self.status = "awaiting answer...".to_string();
                 let q = pending.request.question.clone();
                 self.pending_question = Some(pending);
-                self.publish_lifecycle(Lifecycle::Blocked, &format!("question: {q}"));
+                self.push_toast(Toast::blocked("needs attention", format!("question: {q}")));
             }
 
             if let Some(t) = self.toast.as_ref() {
@@ -968,33 +853,18 @@ impl App {
                     self.toast = None;
                 }
             }
-            if self.show_fleet_panel && self.fleet_refresh_at.elapsed() >= Duration::from_secs(1) {
-                self.fleet_panel.refresh();
-                self.fleet_refresh_at = Instant::now();
-            }
-            // Deep Context auto-surface: show tree drawer with City when [D] active.
-            if self.tree_breadcrumb != "idle" && self.show_fleet_panel && !self.show_tree_with_city
-            {
-                self.show_tree_with_city = true;
-                self.show_tree_panel = true;
-            }
-            if self.tree_breadcrumb == "idle" && self.show_tree_with_city && self.show_fleet_panel {
-                // Keep drawer until user toggles; do not auto-hide (less surprising).
-            }
-            if self.show_sessions_panel && self.fleet_refresh_at.elapsed() >= Duration::from_secs(2)
+            if self.show_sessions_panel
+                && self.sessions_refresh_at.elapsed() >= Duration::from_secs(2)
             {
                 self.sessions_panel
                     .refresh(&self.session_id, self.bg_running_session.as_deref());
-                self.fleet_refresh_at = Instant::now();
+                self.sessions_refresh_at = Instant::now();
             }
 
             if self.should_exit {
                 break;
             }
         }
-
-        // Resume any paused fleet seat so workers are not wedged.
-        self.fleet_detach(true);
 
         for rt in self.runtimes.values() {
             let _ = rt.command_tx.send(AppCommand::Exit);
@@ -1074,11 +944,9 @@ impl App {
                     }
                 }
                 self.status = "thinking...".to_string();
-                self.publish_lifecycle(Lifecycle::Working, "thinking");
             }
             AgentEvent::ToolUseStart { id, name } => {
                 self.status = format!("using {}...", name);
-                self.publish_lifecycle(Lifecycle::Working, &format!("tool:{name}"));
                 if name == "repl" || name == "bash" || name == "task" {
                     let n = self.tool_output_tabs.len() + 1;
                     self.tool_output_tabs.push(ToolOutputTab {
@@ -1105,7 +973,7 @@ impl App {
                 }
                 let mut full = result.content.clone();
                 if full.starts_with("Exit code: ") {
-                    if let Some(rest) = full.splitn(2, '\n').nth(1) {
+                    if let Some(rest) = full.split_once('\n').map(|x| x.1) {
                         full = rest.to_string();
                     }
                 }
@@ -1208,7 +1076,7 @@ impl App {
                     self.refresh_bg_running();
                     self.push_system(format!(
                         "Provider hiccup: {message}\n\
-                         Auto-retry exhausted — type continue or /handoff (session stayed open)."
+                         Auto-retry exhausted — type continue (session stayed open)."
                     ));
                     self.status = "recover".to_string();
                     self.input_mode = InputMode::Insert;
@@ -1231,7 +1099,7 @@ impl App {
             AgentEvent::TurnEnd { stop_reason: _ } => {
                 self.status = "ready".to_string();
                 self.unseen_done = true;
-                self.publish_lifecycle(Lifecycle::Done, "turn end");
+                self.notify_done("turn end");
             }
             AgentEvent::Done => {
                 self.provider_auto_continues = 0;
@@ -1244,7 +1112,7 @@ impl App {
                 self.near_limit = false;
                 self.queued_steers = 0;
                 self.tool_in_progress = None;
-                self.publish_lifecycle(Lifecycle::Done, "ready");
+                self.notify_done("ready");
                 if self.show_sessions_panel {
                     self.sessions_panel
                         .refresh(&self.session_id, self.bg_running_session.as_deref());
@@ -1338,9 +1206,7 @@ impl App {
                             });
                         } else {
                             self.provider_auto_continues = 0;
-                            self.push_system(
-                                "stream failed — auto-retry exhausted; type continue or /handoff",
-                            );
+                            self.push_system("stream failed — auto-retry exhausted; type continue");
                             self.input_mode = InputMode::Insert;
                             self.tool_in_progress = None;
                         }
@@ -1386,7 +1252,6 @@ impl App {
                 self.session_title = title.filter(|t| !t.is_empty());
                 crate::tools::turn_snapshot::set_session(&self.session_id);
                 crate::agent::trajectory::set_session(&self.session_id);
-                lifecycle::set_session(Some(self.session_id.clone()), None);
                 if self.show_sessions_panel {
                     self.sessions_panel
                         .refresh(&self.session_id, self.bg_running_session.as_deref());
@@ -1449,9 +1314,7 @@ impl App {
                             }
                         }
                     }
-                    MouseEventKind::Down(button)
-                        if button == crossterm::event::MouseButton::Left =>
-                    {
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                         if let Some(target) = self.hit_map.hit_at(mouse.column, mouse.row).cloned()
                         {
                             match target {
@@ -1474,16 +1337,8 @@ impl App {
                                     if self.help_overlay.is_some()
                                         || self.settings.is_some()
                                         || self.palette_open
-                                        || self.city_overlay.is_open()
                                     {
                                         self.dismiss_overlays();
-                                    }
-                                }
-                                HitTarget::FleetRow { index } => {
-                                    if index < self.fleet_panel.board_rows.len() {
-                                        self.fleet_panel.selection = index;
-                                        self.activate_city_selection();
-                                        self.focus_zone = FocusZone::CityInspector;
                                     }
                                 }
                                 HitTarget::SessionRow { index } => {
@@ -1555,8 +1410,6 @@ impl App {
                     self.handle_settings_key(key);
                 } else if self.palette_open {
                     self.handle_palette_key(key);
-                } else if self.city_overlay.is_open() {
-                    let _ = self.handle_city_overlay_key(key);
                 } else if self.pending_permission.is_some() {
                     self.handle_permission_key(key);
                 } else if self.pending_question.is_some() {
@@ -1755,589 +1608,11 @@ impl App {
         self.follow_bottom = true;
     }
 
-    fn push_fleet_log_line(&mut self, line: &crate::fleet::ParsedLogLine) {
-        use crate::fleet::LogKind;
-        let prefix = match line.kind {
-            LogKind::Tool => "⚙",
-            LogKind::ToolResult => "↳",
-            LogKind::Say => "💬",
-            LogKind::Heartbeat => "♥",
-            LogKind::Claimed => "▶",
-            LogKind::Closed => "✓",
-            LogKind::Session => "◉",
-            LogKind::Error => "✗",
-            LogKind::Status => "·",
-            LogKind::Raw => "·",
-        };
-        let ts = line
-            .timestamp
-            .as_deref()
-            .map(|t| format!("[{t}] "))
-            .unwrap_or_default();
-        self.messages.push(ChatMessage {
-            role: match line.kind {
-                LogKind::Say => "assistant".to_string(),
-                LogKind::Tool | LogKind::ToolResult => "tool".to_string(),
-                LogKind::Error => "system".to_string(),
-                _ => "system".to_string(),
-            },
-            text: format!("{prefix} {ts}{}", line.body),
-            thinking: None,
-            show_thinking: false,
-            tool_blocks: Vec::new(),
-        });
-        self.follow_bottom = true;
-    }
-
-    fn fleet_start_follow(&mut self, seat: &str) {
-        if self.fleet_attach.is_some() {
-            self.fleet_detach(true);
-        }
-        self.fleet_panel.select_seat(seat);
-        let (follower, initial) = crate::fleet::LogFollower::from_tail(seat, 80);
-        self.fleet_panel.set_log_from_parsed(&initial);
-        self.city_detail_follower = None;
-        self.fleet_panel.status_line = format!("following {seat}");
-        self.fleet_attach = Some(FleetAttachState {
-            seat: seat.to_string(),
-            phase: FleetAttachPhase::Follow,
-            follower,
-            worker_session_id: None,
-            prior_session_id: None,
-            attach_started: Instant::now(),
-        });
-        self.status = format!("following {seat}");
-        self.focus_zone = FocusZone::CityInspector;
-        if !self.show_fleet_panel {
-            self.show_fleet_panel = true;
-        }
-        self.push_toast(Toast::finished("follow", seat));
-    }
-
-    fn fleet_start_attach(&mut self, seat: &str) {
-        if self.fleet_attach.is_some() {
-            self.fleet_detach(true);
-        }
-        let st = crate::fleet::read_seat_status(seat);
-        if st
-            .as_ref()
-            .map(|s| !s.running && s.state == "stopped")
-            .unwrap_or(false)
-        {
-            self.push_system(format!(
-                "Seat `{seat}` does not look running. Start with /fleet up first."
-            ));
-        }
-        crate::fleet::append_control(seat, crate::fleet::ControlOp::Pause, Some("tui attach"));
-        let (follower, initial) = crate::fleet::LogFollower::from_tail(seat, 30);
-        self.push_system(format!(
-            "Attaching to `{seat}` — pausing worker… (Esc abort once attached; /seat detach to return)"
-        ));
-        for line in &initial {
-            self.push_fleet_log_line(line);
-        }
-        self.fleet_attach = Some(FleetAttachState {
-            seat: seat.to_string(),
-            phase: FleetAttachPhase::Attaching,
-            follower,
-            worker_session_id: st.and_then(|s| s.session_id),
-            prior_session_id: Some(self.session_id.clone()),
-            attach_started: Instant::now(),
-        });
-        self.status = format!("attaching {seat}…");
-    }
-
-    /// Load a worker session, retrying briefly (file may appear just after status updates).
-    fn load_worker_session_retry(sid: &str) -> Result<SessionData, String> {
-        let store = SessionStore::new();
-        let mut last = String::new();
-        for attempt in 0..6 {
-            match store.load(sid) {
-                Ok(data) => return Ok(data),
-                Err(e) => {
-                    last = e;
-                    if attempt + 1 < 6 {
-                        std::thread::sleep(Duration::from_millis(400));
-                    }
-                }
-            }
-        }
-        Err(format!(
-            "{last}\n\
-             Tip: worker advertises session_id before the file exists on old binaries — \
-             `fleet down` + `fleet up` with the latest rs-agent, or wait for the turn to flush. \
-             Path: {}",
-            store.session_path(sid)
-        ))
-    }
-
-    /// Inspect session without pausing the worker (read-only).
-    fn fleet_open_inspect(&mut self, seat: &str) {
-        if self.fleet_attach.as_ref().map(|a| a.phase) == Some(FleetAttachPhase::Attached)
-            || self.fleet_attach.as_ref().map(|a| a.phase) == Some(FleetAttachPhase::Attaching)
-        {
-            self.push_system("Detach first (`/seat detach`) before opening another seat.");
-            return;
-        }
-        if self.fleet_attach.is_some() {
-            self.fleet_detach(true);
-        }
-        self.push_system(crate::fleet::format_seat_card(seat));
-        let st = crate::fleet::read_seat_status(seat);
-        let sid = st.as_ref().and_then(|s| s.session_id.clone());
-        let Some(sid) = sid else {
-            self.push_system(format!(
-                "No session_id for `{seat}` yet — follow logs with `/seat follow {seat}`."
-            ));
-            return;
-        };
-        match Self::load_worker_session_retry(&sid) {
-            Ok(data) => {
-                let (follower, _) = crate::fleet::LogFollower::from_tail(seat, 0);
-                self.fleet_attach = Some(FleetAttachState {
-                    seat: seat.to_string(),
-                    phase: FleetAttachPhase::Inspect,
-                    follower,
-                    worker_session_id: Some(sid.clone()),
-                    prior_session_id: Some(self.session_id.clone()),
-                    attach_started: Instant::now(),
-                });
-                self.push_system(format!(
-                    "INSPECT `{seat}` session {sid} (worker still running — chat disabled).\n\
-                     /seat follow {seat} · /seat attach {seat} · /seat detach"
-                ));
-                let _ = self.command_tx.send(AppCommand::LoadSession { data });
-                self.status = format!("inspect {seat}");
-            }
-            Err(e) => self.push_system(format!("Failed to load session {sid}: {e}")),
-        }
-    }
-
-    fn fleet_steer_remote(&mut self, text: &str) {
-        let text = text.trim();
-        if text.is_empty() {
-            self.push_system("Usage: /seat steer <instruction>");
-            return;
-        }
-        let Some(attach) = &self.fleet_attach else {
-            self.push_system("Follow or attach a seat first: /seat follow <seat>");
-            return;
-        };
-        let seat = attach.seat.clone();
-        match attach.phase {
-            FleetAttachPhase::Follow | FleetAttachPhase::Attaching => {
-                crate::fleet::append_control(&seat, crate::fleet::ControlOp::Steer, Some(text));
-                self.push_system(format!("Steer → `{seat}`: {text}"));
-            }
-            FleetAttachPhase::Attached => {
-                // Local steer queue (same as Waiting-mode Enter).
-                self.steer_queue.push(text.to_string());
-                let _ = self.command_tx.send(AppCommand::Steer {
-                    text: text.to_string(),
-                });
-                self.push_system(format!("Steer (attached): {text}"));
-            }
-            FleetAttachPhase::Inspect => {
-                self.push_system(
-                    "Inspect is read-only. `/seat follow` + `/seat steer …`, or `/seat attach`.",
-                );
-            }
-        }
-    }
-
-    fn fleet_abort_remote(&mut self) {
-        let Some(attach) = &self.fleet_attach else {
-            self.push_system("Follow or attach a seat first: /seat follow <seat>");
-            return;
-        };
-        let seat = attach.seat.clone();
-        match attach.phase {
-            FleetAttachPhase::Follow | FleetAttachPhase::Attaching => {
-                crate::fleet::append_control(&seat, crate::fleet::ControlOp::Abort, None);
-                self.push_system(format!("Abort → `{seat}` (worker turn)"));
-            }
-            FleetAttachPhase::Attached => {
-                self.abort_flag.abort();
-                let _ = self.command_tx.send(AppCommand::Abort);
-                self.push_system("Abort (attached turn)");
-            }
-            FleetAttachPhase::Inspect => {
-                self.push_system("Inspect is read-only. `/seat follow` then `/seat abort`.");
-            }
-        }
-    }
-
-    fn fleet_complete_attach(&mut self) {
-        let Some(attach) = self.fleet_attach.as_mut() else {
-            return;
-        };
-        if attach.phase != FleetAttachPhase::Attaching {
-            return;
-        }
-        let seat = attach.seat.clone();
-        let st = crate::fleet::read_seat_status(&seat);
-        let session_id = st
-            .as_ref()
-            .and_then(|s| s.session_id.clone())
-            .or_else(|| attach.worker_session_id.clone());
-        let Some(sid) = session_id else {
-            if attach.attach_started.elapsed() > Duration::from_secs(90) {
-                self.push_system(format!(
-                    "Attach to `{seat}` timed out waiting for session_id (is the worker alive?)."
-                ));
-                self.fleet_attach = None;
-                crate::fleet::append_control(&seat, crate::fleet::ControlOp::Resume, None);
-            }
-            return;
-        };
-        let paused = st
-            .as_ref()
-            .map(|s| s.state == "paused" || s.state == "attached")
-            .unwrap_or(false);
-        if !paused {
-            if attach.attach_started.elapsed() > Duration::from_secs(120) {
-                self.push_system(format!(
-                    "Attach to `{seat}` timed out waiting for pause. Sent resume."
-                ));
-                crate::fleet::append_control(&seat, crate::fleet::ControlOp::Resume, None);
-                self.fleet_attach = None;
-            }
-            return;
-        }
-        match Self::load_worker_session_retry(&sid) {
-            Ok(data) => {
-                attach.phase = FleetAttachPhase::Attached;
-                attach.worker_session_id = Some(sid.clone());
-                if let Some(mut status) = crate::fleet::read_seat_status(&seat) {
-                    status.state = "attached".into();
-                    status.paused_reason = Some("tui attached".into());
-                    crate::fleet::write_seat_status(&status);
-                }
-                let bead = st
-                    .as_ref()
-                    .and_then(|s| s.last_bead.clone())
-                    .unwrap_or_else(|| "-".into());
-                self.push_system(format!(
-                    "ATTACHED `{seat}` · bead {bead} · session {sid}\n\
-                     Chat to continue as this seat. Esc aborts the turn. /seat detach returns control."
-                ));
-                let _ = self.command_tx.send(AppCommand::LoadSession { data });
-                self.status = format!("ATTACHED {seat}");
-                self.input_mode = InputMode::Insert;
-            }
-            Err(e) => {
-                self.push_system(format!(
-                    "Paused `{seat}` but failed to load session `{sid}`: {e}. Detaching."
-                ));
-                crate::fleet::append_control(&seat, crate::fleet::ControlOp::Resume, None);
-                self.fleet_attach = None;
-            }
-        }
-    }
-
-    /// `quiet`: skip chatter when switching follow→attach.
-    fn fleet_detach(&mut self, quiet: bool) {
-        let Some(attach) = self.fleet_attach.take() else {
-            if !quiet {
-                self.push_system("Not attached to a fleet seat.");
-            }
-            return;
-        };
-        let seat = attach.seat;
-        match attach.phase {
-            FleetAttachPhase::Attached | FleetAttachPhase::Attaching => {
-                let _ = self.command_tx.send(AppCommand::PersistSession);
-                crate::fleet::append_control(&seat, crate::fleet::ControlOp::Resume, None);
-                if let Some(mut st) = crate::fleet::read_seat_status(&seat) {
-                    crate::fleet::clear_paused(&mut st);
-                    st.state = "idle".into();
-                    crate::fleet::write_seat_status(&st);
-                }
-                if !quiet {
-                    self.push_system(format!(
-                        "Detached from `{seat}` — worker resume signaled. Session saved."
-                    ));
-                }
-            }
-            FleetAttachPhase::Follow => {
-                if !quiet {
-                    self.push_system(format!("Stopped following `{seat}`."));
-                }
-            }
-            FleetAttachPhase::Inspect => {
-                if !quiet {
-                    self.push_system(format!("Closed inspect view for `{seat}`."));
-                }
-            }
-        }
-        self.status = "ready".to_string();
-    }
-
-    fn city_highlight_seat(&self) -> Option<&str> {
-        self.fleet_attach.as_ref().map(|a| a.seat.as_str())
-    }
-
-    fn show_city_board(&mut self) {
-        let highlight = self.city_highlight_seat().map(|s| s.to_string());
-        self.push_system(crate::fleet::format_city_board(highlight.as_deref()));
-    }
-
-    fn toggle_city_panel(&mut self) {
-        self.show_fleet_panel = !self.show_fleet_panel;
-        if self.show_fleet_panel {
-            self.show_sessions_panel = false;
-            self.show_timeline_panel = false;
-            // Tree can coexist via show_tree_with_city; keep tree panel flag for drawer.
-            self.fleet_panel.refresh();
-            self.focus_zone = FocusZone::CityWish;
-            self.fleet_panel.status_line = "wish→spawn→select→follow — Tab zones".into();
-        } else {
-            self.city_overlay = CityOverlay::None;
-            self.city_detail_follower = None;
-            if self.focus_zone.is_city() {
-                self.focus_zone = FocusZone::Chat;
-            }
-        }
-    }
-
-    fn city_select_seat(&mut self, seat: &str) {
-        self.fleet_panel.select_seat(seat);
-        let reuse_attach = self
-            .fleet_attach
-            .as_ref()
-            .map(|a| a.seat == seat)
-            .unwrap_or(false);
-        if !reuse_attach {
-            let (follower, initial) = crate::fleet::LogFollower::from_tail(seat, 80);
-            self.fleet_panel.set_log_from_parsed(&initial);
-            self.city_detail_follower = Some(follower);
-        }
-        self.focus_zone = FocusZone::CityInspector;
-        self.fleet_panel.refresh();
-    }
-
-    fn city_submit_wish(&mut self) {
-        let text = std::mem::take(&mut self.fleet_panel.wish_text);
-        if text.trim().is_empty() {
-            self.fleet_panel.status_line = "wish text empty".into();
-            return;
-        }
-        match crate::wish::create_wish(&text, false, true) {
-            Ok(b) => {
-                self.push_toast(Toast::finished("wish", &b.id));
-                self.fleet_panel.status_line = format!("wish {} accepted", b.id);
-                self.fleet_panel.refresh();
-                self.focus_zone = FocusZone::CityBoard;
-            }
-            Err(e) => {
-                self.fleet_panel.status_line = e;
-            }
-        }
-    }
-
-    fn city_submit_spawn(&mut self) {
-        let fn_ = city_ops::parse_count(&self.fleet_panel.spawn_fleet_n, 2);
-        let cn = city_ops::parse_count(&self.fleet_panel.spawn_crew_n, 0);
-        let seats = city_ops::seats_for_spawn(fn_, cn);
-        if seats.is_empty() {
-            self.fleet_panel.status_line = "spawn needs fleet or crew > 0".into();
-            return;
-        }
-        let opts = city_ops::fleet_up_opts(
-            seats,
-            Some(self.provider_name.clone()),
-            Some(self.model_name.clone()),
-        );
-        match crate::fleet::fleet_up(opts) {
-            Ok(msg) => {
-                self.push_toast(Toast::finished("fleet up", "spawned"));
-                self.fleet_panel.status_line = msg.lines().next().unwrap_or("spawned").into();
-                self.fleet_panel.refresh();
-                self.focus_zone = FocusZone::CityBoard;
-            }
-            Err(e) => self.fleet_panel.status_line = e,
-        }
-    }
-
-    fn city_submit_steer(&mut self) {
-        let text = std::mem::take(&mut self.fleet_panel.steer_text);
-        if text.trim().is_empty() {
-            return;
-        }
-        if self.fleet_attach.is_none() {
-            if let Some(seat) = self.fleet_panel.selected_seat.clone() {
-                self.fleet_start_follow(&seat);
-            }
-        }
-        self.fleet_steer_remote(&text);
-        self.fleet_panel.status_line = "steer sent".into();
-        self.focus_zone = FocusZone::CityInspector;
-    }
-
-    fn city_open_down_confirm(&mut self, seat: Option<String>) {
-        self.city_overlay = CityOverlay::ConfirmDown { seat };
-        self.status = "confirm stop…".into();
-    }
-
-    fn city_open_delete_confirm(&mut self, target: CityDeleteTarget) {
-        self.city_overlay = CityOverlay::ConfirmDelete { target };
-        self.status = "confirm delete…".into();
-    }
-
-    /// Delete selection: worker → remove seat; flow item → delete bead.
-    fn city_request_delete_selection(&mut self) {
-        let target = match self.fleet_panel.board_rows.get(self.fleet_panel.selection) {
-            Some(BoardRow::Worker { seat }) => Some(CityDeleteTarget::Worker {
-                seat: seat.seat.clone(),
-            }),
-            Some(BoardRow::Flow { item }) => Some(CityDeleteTarget::Bead {
-                id: item.id.clone(),
-                title: item.title.clone(),
-            }),
-            None => self
-                .fleet_panel
-                .selected_seat
-                .clone()
-                .map(|seat| CityDeleteTarget::Worker { seat }),
-        };
-        match target {
-            Some(t) => self.city_open_delete_confirm(t),
-            None => {
-                self.fleet_panel.status_line = "select a worker or wish to delete".into();
-            }
-        }
-    }
-
-    fn city_open_assign_modal(&mut self, bead_id: &str) {
-        self.city_overlay = CityOverlay::Assign {
-            bead_id: bead_id.to_string(),
-            seat: "Fleet-1".into(),
-        };
-        self.status = "assign bead…".into();
-    }
-
-    fn city_submit_overlay(&mut self) {
-        match self.city_overlay.clone() {
-            CityOverlay::ConfirmDown { seat } => {
-                self.city_overlay = CityOverlay::None;
-                let msg = match seat {
-                    Some(s) => crate::fleet::fleet_down(Some(vec![s])),
-                    None => crate::fleet::fleet_down(None),
-                };
-                self.fleet_panel.status_line = msg.lines().next().unwrap_or("stopped").into();
-                self.fleet_panel.refresh();
-                self.status = "ready".into();
-            }
-            CityOverlay::ConfirmDelete { target } => {
-                self.city_overlay = CityOverlay::None;
-                match target {
-                    CityDeleteTarget::Worker { seat } => {
-                        if self
-                            .fleet_attach
-                            .as_ref()
-                            .map(|a| a.seat == seat)
-                            .unwrap_or(false)
-                        {
-                            self.fleet_detach(true);
-                        }
-                        let msg = crate::fleet::delete_seat(&seat);
-                        self.push_toast(Toast::finished("deleted", &seat));
-                        self.fleet_panel.status_line =
-                            msg.lines().next().unwrap_or("deleted").into();
-                        if self.fleet_panel.selected_seat.as_deref() == Some(seat.as_str()) {
-                            self.fleet_panel.selected_seat = None;
-                            self.fleet_panel.detail_seat = None;
-                            self.fleet_panel.log_lines.clear();
-                            self.city_detail_follower = None;
-                            self.focus_zone = FocusZone::CityBoard;
-                        }
-                    }
-                    CityDeleteTarget::Bead { id, title } => match crate::beads::delete(None, &id) {
-                        Ok(b) => {
-                            self.push_toast(Toast::finished("deleted", &b.id));
-                            self.fleet_panel.status_line =
-                                format!("deleted bead {} ({})", b.id, title);
-                            if self.fleet_panel.selected_flow_id.as_deref() == Some(id.as_str()) {
-                                self.fleet_panel.selected_flow_id = None;
-                            }
-                        }
-                        Err(e) => self.fleet_panel.status_line = e,
-                    },
-                }
-                self.fleet_panel.refresh();
-                self.status = "ready".into();
-            }
-            CityOverlay::Assign { bead_id, seat } => {
-                self.city_overlay = CityOverlay::None;
-                match crate::marshal::assign_bead(&bead_id, &seat) {
-                    Ok(b) => {
-                        self.push_toast(Toast::finished(
-                            "assigned",
-                            &format!("{bead_id} → {seat}"),
-                        ));
-                        self.fleet_panel.status_line = format!("assigned {} to {seat}", b.id);
-                        self.fleet_panel.refresh();
-                    }
-                    Err(e) => self.fleet_panel.status_line = e,
-                }
-                self.status = "ready".into();
-            }
-            CityOverlay::None => {}
-        }
-    }
-
-    fn handle_city_overlay_key(&mut self, key: KeyEvent) -> bool {
-        if !self.city_overlay.is_open() {
-            return false;
-        }
-        match key.code {
-            KeyCode::Esc => {
-                self.city_overlay = CityOverlay::None;
-                self.status = "ready".into();
-                return true;
-            }
-            KeyCode::Enter => {
-                self.city_submit_overlay();
-                return true;
-            }
-            _ => {}
-        }
-        match &mut self.city_overlay {
-            CityOverlay::Assign { seat, .. } => match key.code {
-                KeyCode::Char(c) => {
-                    seat.push(c);
-                    true
-                }
-                KeyCode::Backspace => {
-                    seat.pop();
-                    true
-                }
-                _ => true,
-            },
-            CityOverlay::ConfirmDown { .. } | CityOverlay::ConfirmDelete { .. } => true,
-            CityOverlay::None => false,
-        }
-    }
-
-    fn city_run_marshal_once(&mut self) {
-        let out = crate::marshal::run_once();
-        let summary = out.lines().next().unwrap_or("marshal done");
-        self.fleet_panel.status_line = summary.into();
-        self.push_toast(Toast::finished("marshal", summary));
-        self.fleet_panel.refresh();
-    }
-
-    fn city_cycle_focus(&mut self, dir: i32) {
-        self.focus_zone = city_ops::cycle_city_focus(&self.fleet_panel, self.focus_zone, dir);
-    }
-
     fn toggle_sessions_panel(&mut self) {
         self.show_sessions_panel = !self.show_sessions_panel;
         if self.show_sessions_panel {
-            self.show_fleet_panel = false;
             self.show_timeline_panel = false;
             self.show_tree_panel = false;
-            self.show_tree_with_city = false;
             self.sessions_panel
                 .refresh(&self.session_id, self.bg_running_session.as_deref());
             self.focus_zone = FocusZone::Sessions;
@@ -2400,7 +1675,6 @@ impl App {
         self.provider_auto_continues = 0;
         crate::tools::turn_snapshot::set_session(&self.session_id);
         crate::agent::trajectory::set_session(&self.session_id);
-        lifecycle::set_session(Some(self.session_id.clone()), None);
         if self.show_sessions_panel {
             self.sessions_panel
                 .refresh(&self.session_id, self.bg_running_session.as_deref());
@@ -2490,7 +1764,6 @@ impl App {
         self.refresh_bg_running();
         crate::tools::turn_snapshot::set_session(&self.session_id);
         crate::agent::trajectory::set_session(&self.session_id);
-        lifecycle::set_session(Some(self.session_id.clone()), None);
     }
 
     /// Drain all session runtime event queues (update turn_active / offline buffers).
@@ -2564,7 +1837,7 @@ impl App {
                 AgentEvent::Error { message } => {
                     self.push_toast(Toast::blocked(
                         "background error",
-                        &format!("{short}: {message}"),
+                        format!("{short}: {message}"),
                     ));
                 }
                 AgentEvent::Aborted => {
@@ -2573,7 +1846,7 @@ impl App {
                 _ => {
                     self.push_toast(Toast::finished(
                         "background done",
-                        &format!("{short} finished"),
+                        format!("{short} finished"),
                     ));
                 }
             }
@@ -2802,144 +2075,18 @@ impl App {
             Some(SessionRow::Session { summary }) => {
                 self.switch_to_session_id(&summary.id);
             }
-            Some(SessionRow::Action { id, .. }) if id == "new" => {
-                self.start_new_project_session();
-            }
-            Some(SessionRow::Action { id, .. }) if id == "toggle_scope" => {
-                self.sessions_panel.show_all = !self.sessions_panel.show_all;
-                self.sessions_panel
-                    .refresh(&self.session_id, self.bg_running_session.as_deref());
-            }
+            Some(SessionRow::Action { id, .. }) => match id {
+                "new" => self.start_new_project_session(),
+                "toggle_scope" => {
+                    self.sessions_panel.show_all = !self.sessions_panel.show_all;
+                    self.sessions_panel
+                        .refresh(&self.session_id, self.bg_running_session.as_deref());
+                }
+                _ => {}
+            },
             _ => {
                 self.push_system("Nothing selected — ↑↓ to a session or action.");
             }
-        }
-    }
-
-    fn activate_city_selection(&mut self) {
-        self.fleet_panel.apply_selection();
-        if let Some(seat) = self.fleet_panel.selected_seat.clone() {
-            self.city_select_seat(&seat);
-        }
-        if let Some(fid) = self.fleet_panel.selected_flow_id.clone() {
-            // Ready flow item → offer assign via A; status already set
-            let _ = fid;
-            self.focus_zone = FocusZone::CityInspector;
-        }
-    }
-
-    /// Handle `/seat …` and shared fleet aliases. Returns true if handled.
-    fn handle_seat_ops(&mut self, raw: &str) -> bool {
-        let raw = raw.trim();
-        let lower = raw.to_lowercase();
-        if lower.is_empty() || lower == "status" || lower == "board" {
-            self.show_city_board();
-            return true;
-        }
-        if lower == "detach" {
-            self.fleet_detach(false);
-            return true;
-        }
-        if let Some(rest) = lower.strip_prefix("follow ") {
-            let seat = raw.split_whitespace().nth(1).unwrap_or(rest.trim());
-            if seat.is_empty() {
-                self.push_system("Usage: /seat follow <seat>");
-            } else {
-                self.fleet_start_follow(seat);
-            }
-            return true;
-        }
-        if let Some(rest) = lower.strip_prefix("attach ") {
-            let seat = raw.split_whitespace().nth(1).unwrap_or(rest.trim());
-            if seat.is_empty() {
-                self.push_system("Usage: /seat attach <seat>");
-            } else {
-                self.fleet_start_attach(seat);
-            }
-            return true;
-        }
-        if let Some(rest) = lower
-            .strip_prefix("open ")
-            .or_else(|| lower.strip_prefix("inspect "))
-        {
-            let seat = raw.split_whitespace().nth(1).unwrap_or(rest.trim());
-            if seat.is_empty() {
-                self.push_system("Usage: /seat open <seat>");
-            } else {
-                self.fleet_open_inspect(seat);
-            }
-            return true;
-        }
-        if let Some(rest) = lower.strip_prefix("steer ") {
-            // Preserve original casing for steer text from raw after first token.
-            let text = raw
-                .split_once(char::is_whitespace)
-                .map(|(_, r)| r.trim())
-                .unwrap_or(rest.trim());
-            self.fleet_steer_remote(text);
-            return true;
-        }
-        if lower == "abort" {
-            self.fleet_abort_remote();
-            return true;
-        }
-        if let Some(rest) = lower
-            .strip_prefix("logs ")
-            .or_else(|| lower.strip_prefix("log "))
-        {
-            let seat = raw.split_whitespace().nth(1).unwrap_or(rest.trim());
-            if seat.is_empty() {
-                self.push_system("Usage: /seat logs <seat>");
-            } else {
-                self.push_system(crate::fleet::fleet_logs(seat, 60));
-            }
-            return true;
-        }
-        self.push_system(
-            "Usage: /seat | /seat follow|attach|detach|open|steer|abort|logs <seat>\n\
-             Also: /city   (board)   /fleet up|down   aliases work for follow/attach/…",
-        );
-        true
-    }
-
-    fn poll_fleet_attach(&mut self) {
-        let attach_seat = self.fleet_attach.as_ref().map(|a| a.seat.clone());
-        let detail_seat = self.fleet_panel.selected_seat.clone();
-        if let Some(ref ds) = detail_seat {
-            let attach_covers = attach_seat.as_deref() == Some(ds.as_str());
-            if !attach_covers {
-                if let Some(f) = self.city_detail_follower.as_mut() {
-                    let lines = f.poll();
-                    for line in &lines {
-                        self.fleet_panel.push_log_line(line);
-                    }
-                }
-            }
-        }
-
-        let (lines, phase) = {
-            let Some(attach) = self.fleet_attach.as_mut() else {
-                return;
-            };
-            (attach.follower.poll(), attach.phase)
-        };
-        let divert = city_ops::should_divert_logs(
-            self.show_fleet_panel,
-            detail_seat.as_deref(),
-            attach_seat.as_deref(),
-        ) && matches!(
-            phase,
-            FleetAttachPhase::Follow | FleetAttachPhase::Attaching
-        );
-        for line in &lines {
-            if divert {
-                self.fleet_panel.push_log_line(line);
-            } else if !matches!(phase, FleetAttachPhase::Follow) {
-                self.push_fleet_log_line(line);
-            }
-        }
-        if phase == FleetAttachPhase::Attaching {
-            self.fleet_complete_attach();
         }
     }
 
@@ -2959,12 +2106,8 @@ impl App {
                      /skills  /skill <name>  /prompt|/p <name> [args]  /reload\n\
                      /mode plan|ask|agent  /model [provider/model]  /provider|/login [name]\n\
                      /goal [condition|clear|pause|resume]  /theme [dark|light|forest]\n\
-                     /handoff  /route <seat>  /seat […]  /beads [ready]  /laurel <text>\n\
-                     /worker [seat]  /marshal  /city  /fleet [panel|status|up|down]\n\
-                     /detach  /mail [send|ack]  /wish …  /moot …  /brain remember|falsify <…>\n\
-                     /refine [list|apply|reject|rollback]  /recall <id>\n\
-                     /compact  /new  /fork [@N] [label]  /timeline  /sessions\n\
-                     /export [md|json|html]  /image [path]  /lsp [start|stop|status]  /skill-pack export|import\n\
+                     /recall <id>  /compact  /new  /fork [@N] [label]  /timeline  /sessions\n\
+                     /export [md|json|html]  /image [path]  /lsp [start|stop|status]\n\
                      /revert  /trust list|reset  /rename <title>  /history [query|n]\n\n\
                      Keys: {}\n\
                      Ctrl+P cycle model · Tab-complete /skill|/prompt|/model|/theme|/mode|/provider · @ file · # dir",
@@ -3019,31 +2162,7 @@ impl App {
                     self.mouse_enabled,
                     self.toast_enabled,
                     self.toast_sound,
-                    self.notify_mode.as_str(),
                 ));
-            }
-            "/route" | "/handoff-route" => {
-                // Continuity notes stay on /handoff; this routes control to another seat.
-                let mut parts = arg.split_whitespace();
-                let to = parts.next().unwrap_or("");
-                let reason = parts.collect::<Vec<_>>().join(" ");
-                if to.is_empty() {
-                    self.push_system("Usage: /route <seat> [reason]");
-                } else {
-                    match crate::agent::handoff::route_to_seat(
-                        None,
-                        to,
-                        if reason.is_empty() {
-                            "routed from TUI"
-                        } else {
-                            &reason
-                        },
-                        &self.allowed_transitions,
-                    ) {
-                        Ok(rec) => self.push_system(rec.format_block()),
-                        Err(e) => self.push_system(e),
-                    }
-                }
             }
             "/history" => {
                 if arg.is_empty() {
@@ -3156,506 +2275,6 @@ impl App {
                         self.submit_user_text(condition);
                     }
                     Err(e) => self.push_system(e),
-                }
-            }
-            "/handoff" => {
-                self.push_system("Requesting handoff — agent will write notes then end the turn.");
-                let _ = self.command_tx.send(AppCommand::HandoffRequest);
-            }
-            "/seat" => {
-                let raw = arg.trim();
-                let lower = raw.to_lowercase();
-                let is_ops = lower.is_empty()
-                    || lower == "status"
-                    || lower == "board"
-                    || lower == "detach"
-                    || lower == "abort"
-                    || lower.starts_with("follow ")
-                    || lower.starts_with("attach ")
-                    || lower.starts_with("open ")
-                    || lower.starts_with("inspect ")
-                    || lower.starts_with("steer ")
-                    || lower.starts_with("logs ")
-                    || lower.starts_with("log ");
-                if is_ops {
-                    let _ = self.handle_seat_ops(raw);
-                } else {
-                    match crate::agent::parse_seat_arg(arg) {
-                        Ok(crate::agent::SeatCommand::Status) => {
-                            self.push_system(
-                            "Usage: /seat <name> | clear | list | pronouns … | role … | caste … | orders … | model … | rename …\n\
-                             Ops: /city | /seat follow|attach|detach|steer|abort|open <seat>",
-                        );
-                        }
-                        Ok(crate::agent::SeatCommand::Clear) => {
-                            let _ = self.command_tx.send(AppCommand::SetSeat { name: None });
-                            self.push_system("Seat cleared");
-                        }
-                        Ok(crate::agent::SeatCommand::List) => {
-                            let names = crate::agent::seat::list_names();
-                            if names.is_empty() {
-                                self.push_system("No seats yet. Create with /seat <name>");
-                            } else {
-                                self.push_system(format!("Seats: {}", names.join(", ")));
-                            }
-                        }
-                        Ok(crate::agent::SeatCommand::Bind(name)) => {
-                            match crate::agent::seat::load_or_create(&name) {
-                                Ok(seat) => {
-                                    let _ = self.command_tx.send(AppCommand::SetSeat {
-                                        name: Some(seat.name.clone()),
-                                    });
-                                    self.push_system(format!(
-                                        "Seat `{}` bound{}",
-                                        seat.name,
-                                        if seat.role.is_empty() {
-                                            " — set role with /seat role …".to_string()
-                                        } else {
-                                            format!(" ({})", seat.role)
-                                        }
-                                    ));
-                                }
-                                Err(e) => self.push_system(e),
-                            }
-                        }
-                        Ok(crate::agent::SeatCommand::SetPronouns(p)) => {
-                            if let Some(name) = crate::tools::handoff::active_seat() {
-                                match crate::agent::seat::load(&name) {
-                                    Ok(mut seat) => {
-                                        seat.pronouns = p;
-                                        if let Err(e) = crate::agent::seat::save(&seat) {
-                                            self.push_system(e);
-                                        } else {
-                                            let _ = self.command_tx.send(AppCommand::SetSeat {
-                                                name: Some(seat.name),
-                                            });
-                                            self.push_system("Pronouns updated");
-                                        }
-                                    }
-                                    Err(e) => self.push_system(e),
-                                }
-                            } else {
-                                self.push_system("Bind a seat first: /seat <name>");
-                            }
-                        }
-                        Ok(crate::agent::SeatCommand::SetRole(role)) => {
-                            if let Some(name) = crate::tools::handoff::active_seat() {
-                                match crate::agent::seat::load(&name) {
-                                    Ok(mut seat) => {
-                                        seat.role = role;
-                                        if let Err(e) = crate::agent::seat::save(&seat) {
-                                            self.push_system(e);
-                                        } else {
-                                            let _ = self.command_tx.send(AppCommand::SetSeat {
-                                                name: Some(seat.name),
-                                            });
-                                            self.push_system("Role updated");
-                                        }
-                                    }
-                                    Err(e) => self.push_system(e),
-                                }
-                            } else {
-                                self.push_system("Bind a seat first: /seat <name>");
-                            }
-                        }
-                        Ok(crate::agent::SeatCommand::SetCaste(caste)) => {
-                            if let Some(name) = crate::tools::handoff::active_seat() {
-                                match crate::agent::seat::load(&name) {
-                                    Ok(mut seat) => {
-                                        seat.caste = caste;
-                                        if let Err(e) = crate::agent::seat::save(&seat) {
-                                            self.push_system(e);
-                                        } else {
-                                            let _ = self.command_tx.send(AppCommand::SetSeat {
-                                                name: Some(seat.name.clone()),
-                                            });
-                                            self.push_system(format!(
-                                                "Caste set to `{}` (effective: {})",
-                                                caste.as_str(),
-                                                seat.effective_caste().as_str()
-                                            ));
-                                        }
-                                    }
-                                    Err(e) => self.push_system(e),
-                                }
-                            } else {
-                                self.push_system("Bind a seat first: /seat <name>");
-                            }
-                        }
-                        Ok(crate::agent::SeatCommand::SetOrders(orders)) => {
-                            if let Some(name) = crate::tools::handoff::active_seat() {
-                                match crate::agent::seat::load(&name) {
-                                    Ok(mut seat) => {
-                                        seat.standing_orders = orders;
-                                        if let Err(e) = crate::agent::seat::save(&seat) {
-                                            self.push_system(e);
-                                        } else {
-                                            let _ = self.command_tx.send(AppCommand::SetSeat {
-                                                name: Some(seat.name),
-                                            });
-                                            self.push_system("Standing orders updated");
-                                        }
-                                    }
-                                    Err(e) => self.push_system(e),
-                                }
-                            } else {
-                                self.push_system("Bind a seat first: /seat <name>");
-                            }
-                        }
-                        Ok(crate::agent::SeatCommand::SetModel(model)) => {
-                            if let Some(name) = crate::tools::handoff::active_seat() {
-                                match crate::agent::seat::load(&name) {
-                                    Ok(mut seat) => {
-                                        seat.model = model.clone();
-                                        if let Err(e) = crate::agent::seat::save(&seat) {
-                                            self.push_system(e);
-                                        } else {
-                                            let _ = self.command_tx.send(AppCommand::SetSeat {
-                                                name: Some(seat.name),
-                                            });
-                                            self.push_system(match model {
-                                                Some(m) => format!("Seat model set to {m}"),
-                                                None => "Seat model cleared".into(),
-                                            });
-                                        }
-                                    }
-                                    Err(e) => self.push_system(e),
-                                }
-                            } else {
-                                self.push_system("Bind a seat first: /seat <name>");
-                            }
-                        }
-                        Ok(crate::agent::SeatCommand::Rename(new_name)) => {
-                            if let Some(old) = crate::tools::handoff::active_seat() {
-                                match crate::agent::seat::rename(&old, &new_name) {
-                                    Ok(seat) => {
-                                        let _ = self.command_tx.send(AppCommand::SetSeat {
-                                            name: Some(seat.name.clone()),
-                                        });
-                                        self.push_system(format!(
-                                            "Renamed seat → {} (history preserved)",
-                                            seat.name
-                                        ));
-                                    }
-                                    Err(e) => self.push_system(e),
-                                }
-                            } else {
-                                self.push_system("Bind a seat first: /seat <name>");
-                            }
-                        }
-                        Err(e) => self.push_system(e),
-                    }
-                } // end else identity
-            }
-            "/beads" => {
-                let sub = arg.trim().to_lowercase();
-                if sub == "ready" {
-                    match crate::beads::list_ready(None) {
-                        Ok(items) => {
-                            let mut out = String::new();
-                            if let Some(c) = crate::beads::format_counts_line(None) {
-                                out.push_str(&c);
-                                out.push('\n');
-                            }
-                            if items.is_empty() {
-                                out.push_str("No ready beads.");
-                            } else {
-                                out.push_str("Ready:\n");
-                                out.push_str(&crate::beads::format_summary(&items));
-                            }
-                            self.push_system(out);
-                        }
-                        Err(e) => self.push_system(e),
-                    }
-                } else {
-                    match crate::beads::list(None) {
-                        Ok(items) => {
-                            let mut out = String::new();
-                            if let Some(c) = crate::beads::format_counts_line(None) {
-                                out.push_str(&c);
-                                out.push('\n');
-                            }
-                            out.push_str(&crate::beads::format_summary(&items));
-                            self.push_system(out);
-                        }
-                        Err(e) => self.push_system(e),
-                    }
-                }
-            }
-            "/worker" => {
-                let seat = arg.trim();
-                if seat.is_empty() {
-                    self.push_system(crate::fleet::format_worker_help(None));
-                } else {
-                    self.push_system(crate::fleet::format_worker_help(Some(seat)));
-                }
-            }
-            "/marshal" => {
-                let rest = arg.trim();
-                if rest.is_empty() {
-                    let mut out = crate::marshal::run_once();
-                    if let Some(r) = crate::marshal::read_last_report() {
-                        out.push_str(&format!("\n(report saved at {})", r.at));
-                    }
-                    self.push_system(out);
-                } else if let Some(rest) = rest.strip_prefix("assign ") {
-                    let mut parts = rest.split_whitespace();
-                    let bead = parts.next().unwrap_or("");
-                    let seat = parts.next().unwrap_or("");
-                    if bead.is_empty() || seat.is_empty() {
-                        self.push_system("Usage: /marshal assign <bead> <seat>");
-                    } else {
-                        match crate::marshal::assign_bead(bead, seat) {
-                            Ok(b) => self
-                                .push_system(format!("Assigned {} → {} — {}", b.id, seat, b.title)),
-                            Err(e) => self.push_system(e),
-                        }
-                    }
-                } else {
-                    self.push_system("Usage: /marshal | /marshal assign <bead> <seat>");
-                }
-            }
-            "/mail" => {
-                let rest = arg.trim();
-                if rest.is_empty() || rest == "inbox" || rest == "read" {
-                    let seat = crate::tools::handoff::active_seat();
-                    self.push_system(crate::mail::format_inbox(seat.as_deref()));
-                } else if let Some(rest) = rest.strip_prefix("ack ") {
-                    match crate::mail::ack(rest.trim()) {
-                        Ok(m) => self.push_system(format!("Acked {}", m.id)),
-                        Err(e) => self.push_system(e),
-                    }
-                } else if let Some(rest) = rest.strip_prefix("send ") {
-                    // /mail send <to> <body…>
-                    let mut parts = rest.splitn(2, char::is_whitespace);
-                    let to = parts.next().unwrap_or("").trim();
-                    let body = parts.next().unwrap_or("").trim();
-                    if to.is_empty() || body.is_empty() {
-                        self.push_system("Usage: /mail send <to> <body>");
-                    } else {
-                        let from =
-                            crate::tools::handoff::active_seat().unwrap_or_else(|| "human".into());
-                        match crate::mail::send(&from, to, body, vec![]) {
-                            Ok(m) => self.push_system(format!("Sent {} → {}", m.id, m.to)),
-                            Err(e) => self.push_system(e),
-                        }
-                    }
-                } else {
-                    self.push_system("Usage: /mail | /mail send <to> <body> | /mail ack <id>");
-                }
-            }
-            "/wish" => {
-                let text = arg.trim();
-                if text.is_empty() {
-                    self.push_system("Usage: /wish <text>  (creates a design bead labeled wish)");
-                } else {
-                    match crate::wish::create_wish(text, false, true) {
-                        Ok(b) => self.push_system(crate::wish::format_created(&b)),
-                        Err(e) => self.push_system(e),
-                    }
-                }
-            }
-            "/moot" => {
-                let rest = arg.trim();
-                if rest.is_empty() || rest == "list" {
-                    self.push_system(crate::moot::list());
-                } else if let Some(topic) = rest.strip_prefix("open ") {
-                    match crate::moot::open(topic.trim()) {
-                        Ok(m) => self.push_system(format!("Opened {} — {}", m.id, m.topic)),
-                        Err(e) => self.push_system(e),
-                    }
-                } else if let Some(rest) = rest.strip_prefix("append ") {
-                    let mut parts = rest.splitn(2, char::is_whitespace);
-                    let id = parts.next().unwrap_or("");
-                    let text = parts.next().unwrap_or("").trim();
-                    let from =
-                        crate::tools::handoff::active_seat().unwrap_or_else(|| "human".into());
-                    match crate::moot::append(id, &from, text) {
-                        Ok(m) => self.push_system(format!(
-                            "Appended to {} ({} entries)",
-                            m.id,
-                            m.entries.len()
-                        )),
-                        Err(e) => self.push_system(e),
-                    }
-                } else if let Some(rest) = rest.strip_prefix("close ") {
-                    let mut parts = rest.splitn(2, char::is_whitespace);
-                    let id = parts.next().unwrap_or("");
-                    let summary = parts.next().map(|s| s.trim());
-                    match crate::moot::close(id, summary) {
-                        Ok(m) => self.push_system(format!("Closed {}", m.id)),
-                        Err(e) => self.push_system(e),
-                    }
-                } else if let Some(id) = rest.strip_prefix("show ") {
-                    match crate::moot::show(id.trim()) {
-                        Ok(s) => self.push_system(s),
-                        Err(e) => self.push_system(e),
-                    }
-                } else {
-                    self.push_system(
-                        "Usage: /moot | open <topic> | append <id> <text> | close <id> [summary] | show <id>",
-                    );
-                }
-            }
-            "/laurels" => {
-                let items = crate::agent::laurel::recent(12);
-                if items.is_empty() {
-                    self.push_system(
-                        "No laurels yet. Sit with this quiet — recognition comes without chasing.\n\
-                         Add with /laurel <praise text>.",
-                    );
-                } else {
-                    let mut out = String::from("## Laurels (sit with these — no work attached)\n");
-                    for l in &items {
-                        let seat = l.seat.as_deref().unwrap_or("—");
-                        out.push_str(&format!(
-                            "- [{}] ({}) {}\n",
-                            l.written_at,
-                            seat,
-                            l.text.trim()
-                        ));
-                    }
-                    self.push_system(out);
-                }
-            }
-            "/city" => {
-                let raw = arg.trim().to_lowercase();
-                if raw == "board" || raw == "status" || raw == "text" {
-                    self.show_city_board();
-                } else {
-                    self.toggle_city_panel();
-                }
-            }
-            "/fleet" => {
-                let raw = arg.trim();
-                let lower = raw.to_lowercase();
-                if lower.is_empty() || lower == "panel" {
-                    self.toggle_city_panel();
-                } else if lower == "status" {
-                    self.show_city_board();
-                } else if lower == "down" {
-                    self.push_system(crate::fleet::fleet_down(None));
-                } else if let Some(rest) = lower.strip_prefix("down ") {
-                    let seats = crate::fleet::parse_seat_list(rest);
-                    self.push_system(crate::fleet::fleet_down(Some(seats)));
-                } else if let Some(rest) = lower
-                    .strip_prefix("up ")
-                    .or_else(|| (lower == "up").then_some(""))
-                {
-                    let seats = if rest.trim().is_empty() {
-                        vec!["Fleet-1".into(), "Fleet-2".into()]
-                    } else {
-                        let after = raw
-                            .split_once(char::is_whitespace)
-                            .map(|(_, r)| r.trim())
-                            .unwrap_or("");
-                        crate::fleet::parse_seat_list(if after.is_empty() {
-                            "Fleet-1,Fleet-2"
-                        } else {
-                            after
-                        })
-                    };
-                    let opts = crate::fleet::FleetUpOpts {
-                        seats,
-                        budget_minutes: 480,
-                        sleep_secs: 5,
-                        quiet: false,
-                        provider: Some(self.provider_name.clone()),
-                        model: Some(self.model_name.clone()),
-                        approve: true,
-                        fail_fast: false,
-                        shared_worktree: false,
-                    };
-                    match crate::fleet::fleet_up(opts) {
-                        Ok(msg) => self.push_system(msg),
-                        Err(e) => self.push_system(e),
-                    }
-                } else if self.handle_seat_ops(raw) {
-                    // follow/attach/detach/steer/abort/open/logs
-                } else {
-                    self.push_system(
-                        "Usage: /fleet | /fleet up|down | /seat follow|attach|detach|steer|abort|open",
-                    );
-                }
-            }
-            "/detach" => {
-                self.fleet_detach(false);
-            }
-            "/brain" => {
-                let rest = arg.trim();
-                if let Some(fact) = rest
-                    .strip_prefix("remember ")
-                    .or_else(|| rest.strip_prefix("remember"))
-                {
-                    let fact = fact.trim();
-                    if fact.is_empty() {
-                        self.push_system("Usage: /brain remember <short operational fact>");
-                    } else if let Err(e) = crate::brain::remember(fact) {
-                        self.push_system(e);
-                    } else {
-                        self.push_system(format!("Remembered: {fact}"));
-                    }
-                } else if let Some(q) = rest.strip_prefix("falsify ") {
-                    match crate::brain::falsify(q.trim()) {
-                        Ok(n) => self.push_system(format!("Falsified {n} fact(s)")),
-                        Err(e) => self.push_system(e),
-                    }
-                } else if rest == "ledger" {
-                    let items = crate::brain::recent_ledger(20);
-                    if items.is_empty() {
-                        self.push_system("Ledger empty.");
-                    } else {
-                        let mut out = String::from("Ledger:\n");
-                        for e in items {
-                            out.push_str(&format!(
-                                "  [{}] {} {} — {}\n",
-                                e.at,
-                                e.bead,
-                                e.kind.as_deref().unwrap_or("?"),
-                                e.summary
-                            ));
-                        }
-                        self.push_system(out);
-                    }
-                } else {
-                    let facts = crate::brain::recent_facts(12);
-                    if facts.is_empty() {
-                        self.push_system(
-                            "No brain facts yet. Usage: /brain remember <fact> | falsify <q> | ledger\n\
-                             Doctrine: put markdown in ./brain/*.md",
-                        );
-                    } else {
-                        let mut out = String::from("Brain facts:\n");
-                        for f in facts {
-                            out.push_str(&format!(
-                                "- [{}] [{}] {}\n",
-                                f.id.as_deref().unwrap_or("-"),
-                                f.written_at,
-                                f.text
-                            ));
-                        }
-                        self.push_system(out);
-                    }
-                }
-            }
-            "/laurel" => {
-                let text = arg.trim();
-                if text.is_empty() {
-                    self.push_system("Usage: /laurel <praise text>");
-                } else {
-                    let seat = crate::tools::handoff::active_seat();
-                    let laurel = crate::agent::laurel::Laurel::new(text.to_string(), seat.clone());
-                    if let Err(e) = crate::agent::laurel::append(&laurel) {
-                        self.push_system(e);
-                    } else {
-                        if let Some(ref name) = seat {
-                            if let Ok(mut s) = crate::agent::seat::load(name) {
-                                s.append_laurel(laurel);
-                                let _ = crate::agent::seat::save(&s);
-                            }
-                        }
-                        self.push_system(format!("Laurel recorded (recognition only): {text}"));
-                    }
                 }
             }
             "/context" => match arg.to_lowercase().as_str() {
@@ -3992,52 +2611,6 @@ impl App {
                     }
                 }
             }
-            "/refine" => {
-                let rest = arg.trim();
-                if rest.is_empty() {
-                    let pending =
-                        crate::agent::refine::format_list(&crate::agent::refine::list_pending());
-                    self.push_system(pending);
-                    self.submit_user_text(
-                        "Review this session for one durable operational lesson. \
-                         If you have one, call refine with action=propose, kind=fact or skill, \
-                         text, and evidence quoted from what happened. \
-                         Do not edit the system prompt. Do not apply the proposal."
-                            .into(),
-                    );
-                } else if rest == "list" {
-                    self.push_system(crate::agent::refine::format_list(
-                        &crate::agent::refine::list_all(),
-                    ));
-                } else if let Some(id) = rest.strip_prefix("apply").map(str::trim) {
-                    if id.is_empty() {
-                        self.push_system("Usage: /refine apply <id>");
-                    } else {
-                        match crate::agent::refine::apply(id) {
-                            Ok(msg) => self.push_system(msg),
-                            Err(e) => self.push_system(e),
-                        }
-                    }
-                } else if let Some(id) = rest.strip_prefix("reject").map(str::trim) {
-                    if id.is_empty() {
-                        self.push_system("Usage: /refine reject <id>");
-                    } else {
-                        match crate::agent::refine::reject(id) {
-                            Ok(msg) => self.push_system(msg),
-                            Err(e) => self.push_system(e),
-                        }
-                    }
-                } else if rest == "rollback" {
-                    match crate::agent::refine::rollback() {
-                        Ok(msg) => self.push_system(msg),
-                        Err(e) => self.push_system(e),
-                    }
-                } else {
-                    self.push_system(
-                        "Usage: /refine | /refine list | /refine apply <id> | /refine reject <id> | /refine rollback",
-                    );
-                }
-            }
             "/revert" => match crate::tools::turn_snapshot::restore_last_turn() {
                 Ok(n) => {
                     self.status = format!("restored {n} file(s) from turn");
@@ -4064,7 +2637,6 @@ impl App {
             "/timeline" => {
                 self.show_timeline_panel = !self.show_timeline_panel;
                 if self.show_timeline_panel {
-                    self.show_fleet_panel = false;
                     self.show_sessions_panel = false;
                     let _ = self.command_tx.send(AppCommand::RequestTimeline);
                     self.push_system(
@@ -4115,40 +2687,6 @@ impl App {
                         }
                     }
                     _ => self.push_system("Usage: /lsp start|stop|status"),
-                }
-            }
-            "/skill-pack" => {
-                let mut parts = arg.split_whitespace();
-                let sub = parts.next().unwrap_or("");
-                match sub {
-                    "export" => {
-                        let names: Vec<String> = parts.map(|s| s.to_string()).collect();
-                        let out = std::path::PathBuf::from(if names.is_empty() {
-                            "skills-pack.zip".into()
-                        } else {
-                            format!("{}-skills.zip", names[0])
-                        });
-                        match crate::skills::export_pack(&names, &out) {
-                            Ok(msg) => self.push_system(msg),
-                            Err(e) => self.push_system(format!("skill-pack export failed: {e}")),
-                        }
-                    }
-                    "import" => {
-                        let path = parts.next().unwrap_or("");
-                        if path.is_empty() {
-                            self.push_system("Usage: /skill-pack import <pack.zip>");
-                        } else {
-                            match crate::skills::import_pack(std::path::Path::new(path)) {
-                                Ok(msg) => {
-                                    self.push_system(format!("{msg}\nRun /reload to pick up new skills."));
-                                }
-                                Err(e) => self.push_system(format!("skill-pack import failed: {e}")),
-                            }
-                        }
-                    }
-                    _ => self.push_system(
-                        "Usage:\n  /skill-pack export [skill names…]\n  /skill-pack import <pack.zip>",
-                    ),
                 }
             }
             "/model" => {
@@ -4206,7 +2744,6 @@ impl App {
                 }
             }
             "/tree" => {
-                self.show_fleet_panel = false;
                 self.show_timeline_panel = false;
                 if self.show_tree_panel && self.side_mode == SidePanelMode::Tree {
                     self.show_tree_panel = false;
@@ -4308,7 +2845,6 @@ impl App {
                 self.palette = Palette::for_theme(self.theme_name);
                 self.toast_enabled = st.toast;
                 self.toast_sound = st.toast_sound;
-                self.notify_mode = NotifyMode::parse(&st.notify);
                 self.mouse_enabled = st.mouse_enabled;
                 self.settings = None;
                 self.push_system("Settings applied");
@@ -4332,13 +2868,6 @@ impl App {
             }
             KeyCode::Char('s') if st.tab == settings::SettingsTab::Alerts => {
                 st.toast_sound = !st.toast_sound;
-            }
-            KeyCode::Char('n') if st.tab == settings::SettingsTab::Alerts => {
-                st.notify = match NotifyMode::parse(&st.notify) {
-                    NotifyMode::Off => "terminal".into(),
-                    NotifyMode::Terminal => "system".into(),
-                    NotifyMode::System => "off".into(),
-                };
             }
             _ => {}
         }
@@ -4386,224 +2915,6 @@ impl App {
                 return;
             }
             _ => {}
-        }
-        if self.show_fleet_panel {
-            if !self.focus_zone.is_city() && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-                self.focus_zone = FocusZone::CityBoard;
-                return;
-            }
-        }
-        if self.show_fleet_panel && self.focus_zone.is_city() {
-            match key.code {
-                KeyCode::Tab => {
-                    self.city_cycle_focus(1);
-                    return;
-                }
-                KeyCode::BackTab => {
-                    self.city_cycle_focus(-1);
-                    return;
-                }
-                KeyCode::Esc => {
-                    match self.focus_zone {
-                        FocusZone::CityWish | FocusZone::CitySteer | FocusZone::CitySpawn => {
-                            self.focus_zone = FocusZone::CityBoard;
-                        }
-                        FocusZone::CityInspector => {
-                            self.focus_zone = FocusZone::CityBoard;
-                        }
-                        _ => {
-                            self.toggle_city_panel();
-                        }
-                    }
-                    return;
-                }
-                _ => {}
-            }
-            match self.focus_zone {
-                FocusZone::CityWish => match key.code {
-                    KeyCode::Enter => {
-                        self.city_submit_wish();
-                        return;
-                    }
-                    KeyCode::Char(c) => {
-                        self.fleet_panel.wish_text.push(c);
-                        return;
-                    }
-                    KeyCode::Backspace => {
-                        self.fleet_panel.wish_text.pop();
-                        return;
-                    }
-                    _ => {}
-                },
-                FocusZone::CitySteer => match key.code {
-                    KeyCode::Enter => {
-                        self.city_submit_steer();
-                        return;
-                    }
-                    KeyCode::Char(c) => {
-                        self.fleet_panel.steer_text.push(c);
-                        return;
-                    }
-                    KeyCode::Backspace => {
-                        self.fleet_panel.steer_text.pop();
-                        return;
-                    }
-                    _ => {}
-                },
-                FocusZone::CitySpawn => match key.code {
-                    KeyCode::Enter => {
-                        self.city_submit_spawn();
-                        return;
-                    }
-                    KeyCode::Char(c) if c.is_ascii_digit() => {
-                        if self.fleet_panel.spawn_focus_fleet {
-                            self.fleet_panel.spawn_fleet_n.push(c);
-                        } else {
-                            self.fleet_panel.spawn_crew_n.push(c);
-                        }
-                        return;
-                    }
-                    KeyCode::Backspace => {
-                        if self.fleet_panel.spawn_focus_fleet {
-                            self.fleet_panel.spawn_fleet_n.pop();
-                        } else {
-                            self.fleet_panel.spawn_crew_n.pop();
-                        }
-                        return;
-                    }
-                    KeyCode::Left | KeyCode::Right => {
-                        self.fleet_panel.spawn_focus_fleet = !self.fleet_panel.spawn_focus_fleet;
-                        return;
-                    }
-                    _ => {}
-                },
-                FocusZone::CityInspector => match key.code {
-                    KeyCode::PageUp => {
-                        self.fleet_panel.log_scroll_by(-8);
-                        return;
-                    }
-                    KeyCode::PageDown => {
-                        self.fleet_panel.log_scroll_by(8);
-                        return;
-                    }
-                    KeyCode::Char('f') => {
-                        if let Some(seat) = self.fleet_panel.selected_seat.clone() {
-                            self.fleet_start_follow(&seat);
-                        }
-                        return;
-                    }
-                    KeyCode::Char('a') => {
-                        if let Some(seat) = self.fleet_panel.selected_seat.clone() {
-                            self.fleet_start_attach(&seat);
-                        }
-                        return;
-                    }
-                    KeyCode::Char('o') => {
-                        if let Some(seat) = self.fleet_panel.selected_seat.clone() {
-                            self.fleet_open_inspect(&seat);
-                        }
-                        return;
-                    }
-                    KeyCode::Char('b') => {
-                        self.fleet_abort_remote();
-                        return;
-                    }
-                    KeyCode::Char('D') => {
-                        self.fleet_detach(false);
-                        return;
-                    }
-                    KeyCode::Char('d') => {
-                        if let Some(seat) = self.fleet_panel.selected_seat.clone() {
-                            self.city_open_down_confirm(Some(seat));
-                        }
-                        return;
-                    }
-                    KeyCode::Char('X') | KeyCode::Delete => {
-                        self.city_request_delete_selection();
-                        return;
-                    }
-                    KeyCode::Enter => {
-                        self.focus_zone = FocusZone::CitySteer;
-                        return;
-                    }
-                    KeyCode::Char('A') => {
-                        if let Some(id) = self.fleet_panel.selected_flow_id.clone() {
-                            self.city_open_assign_modal(&id);
-                        }
-                        return;
-                    }
-                    _ => {}
-                },
-                FocusZone::CityBoard => {
-                    match key.code {
-                        KeyCode::Up => {
-                            self.fleet_panel.move_sel(-1);
-                            return;
-                        }
-                        KeyCode::Down => {
-                            self.fleet_panel.move_sel(1);
-                            return;
-                        }
-                        KeyCode::Enter => {
-                            self.activate_city_selection();
-                            return;
-                        }
-                        KeyCode::Char('u') => {
-                            self.focus_zone = FocusZone::CitySpawn;
-                            return;
-                        }
-                        KeyCode::Char('d') => {
-                            let seat = self
-                                .fleet_panel
-                                .board_rows
-                                .get(self.fleet_panel.selection)
-                                .and_then(|r| match r {
-                                    BoardRow::Worker { seat } => Some(seat.seat.clone()),
-                                    _ => None,
-                                });
-                            self.city_open_down_confirm(seat);
-                            return;
-                        }
-                        KeyCode::Char('X') | KeyCode::Delete => {
-                            self.city_request_delete_selection();
-                            return;
-                        }
-                        KeyCode::Char('m') => {
-                            self.city_run_marshal_once();
-                            return;
-                        }
-                        KeyCode::Char('A') => {
-                            let id = self
-                                .fleet_panel
-                                .board_rows
-                                .get(self.fleet_panel.selection)
-                                .and_then(|r| match r {
-                                    BoardRow::Flow { item } => Some(item.id.clone()),
-                                    _ => None,
-                                });
-                            if let Some(id) = id {
-                                self.city_open_assign_modal(&id);
-                            }
-                            return;
-                        }
-                        KeyCode::Char('g') => {
-                            // Jump to first blocked seat (attention)
-                            if let Some(s) =
-                                self.fleet_panel.first_blocked_seat().map(|s| s.to_string())
-                            {
-                                self.city_select_seat(&s);
-                            }
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
-            }
-        }
-        if self.key_matches("toggle_city", key) {
-            self.toggle_city_panel();
-            return;
         }
         if self.show_sessions_panel {
             match key.code {
@@ -4668,24 +2979,13 @@ impl App {
             return;
         }
         if self.key_matches("toggle_tree", key) {
-            if self.show_fleet_panel {
-                // Coexist: tree drawer under City
-                self.show_tree_with_city = !self.show_tree_with_city;
-                self.show_tree_panel = self.show_tree_with_city;
-                self.side_mode = SidePanelMode::Tree;
-                self.status = if self.show_tree_with_city {
-                    "city + tree".into()
-                } else {
-                    "city".into()
-                };
-            } else if self.show_tree_panel && !self.show_sessions_panel {
+            if self.show_tree_panel && !self.show_sessions_panel {
                 self.side_mode = self.side_mode.toggle();
                 self.status = format!("side · {}", self.side_mode.label());
             } else {
                 self.show_sessions_panel = false;
                 self.show_timeline_panel = false;
                 self.show_tree_panel = true;
-                self.show_tree_with_city = false;
                 self.side_mode = SidePanelMode::Tree;
                 self.focus_zone = FocusZone::Tree;
             }
@@ -4871,13 +3171,6 @@ impl App {
     /// Push a non-slash user message to the agent: records it in
     /// `input_history`, appends chat bubbles, and dispatches `Submit`.
     fn submit_user_text(&mut self, text: String) {
-        if self.fleet_attach.as_ref().map(|a| a.phase) == Some(FleetAttachPhase::Inspect) {
-            self.push_system(
-                "Inspect is read-only. Use `/seat attach <seat>` to take over, or `/seat follow` + `/seat steer …`.",
-            );
-            self.input.clear();
-            return;
-        }
         if self.input_history.last().map(|s| s.as_str()) != Some(text.as_str()) {
             self.input_history.push(text.clone());
         }
@@ -5115,18 +3408,6 @@ impl App {
                 msg.push_str(&w);
             }
             return Ok(msg);
-        }
-
-        if mref.provider.eq_ignore_ascii_case("opencode-cli")
-            && std::env::var("OPENCODE_API_KEY").is_err()
-        {
-            std::env::set_var("OPENCODE_API_KEY", "cli-mode-no-key-needed");
-        }
-        if (mref.provider.eq_ignore_ascii_case("bedrock")
-            || mref.provider.eq_ignore_ascii_case("amazon-bedrock"))
-            && std::env::var("AWS_ACCESS_KEY_ID").is_err()
-        {
-            crate::ai::bedrock::export_credentials_from_file();
         }
 
         let provider = crate::ai::registry::create_provider(
@@ -5585,7 +3866,7 @@ impl App {
     fn rank_and_filter(items: &[String], query: &str, cap: usize) -> Vec<String> {
         let query = query.trim().to_lowercase();
         if query.is_empty() {
-            let mut out: Vec<String> = items.iter().cloned().collect();
+            let mut out: Vec<String> = items.to_vec();
             out.truncate(cap);
             return out;
         }
@@ -5596,9 +3877,7 @@ impl App {
                 let lower = item.to_lowercase();
                 let mut total = 0i32;
                 for tok in &tokens {
-                    let Some(s) = Self::fuzzy_score(&lower, tok) else {
-                        return None;
-                    };
+                    let s = Self::fuzzy_score(&lower, tok)?;
                     total += s;
                 }
                 Some((total, item.len(), item))
@@ -5804,21 +4083,16 @@ impl App {
         let area = frame.area();
         self.hit_map.clear();
         self.console_area = None;
-        lifecycle::set_focused(true);
 
-        let show_side = self.show_fleet_panel
-            || self.show_sessions_panel
-            || self.show_timeline_panel
-            || self.show_tree_panel;
+        let show_side =
+            self.show_sessions_panel || self.show_timeline_panel || self.show_tree_panel;
         let show_repl = self.show_repl_panel || !self.tool_output_tabs.is_empty();
         let view = compute_view(
             area,
             LayoutOpts {
                 show_repl,
                 show_side,
-                side_pct: if self.show_fleet_panel {
-                    42
-                } else if self.show_sessions_panel {
+                side_pct: if self.show_sessions_panel {
                     34
                 } else if self.show_timeline_panel || self.show_tree_panel {
                     32
@@ -5856,7 +4130,7 @@ impl App {
             }
         }
         // Turn bar when Deep Context active
-        if self.tree_breadcrumb != "idle" && !self.show_fleet_panel {
+        if self.tree_breadcrumb != "idle" {
             let bar = tree_view::turn_bar_line(&self.tree_breadcrumb, &self.palette);
             // Drawn into chat top via messages; keep side tree rich.
             let _ = bar;
@@ -5904,47 +4178,6 @@ impl App {
                         }
                     }
                 }
-            } else if self.show_fleet_panel {
-                let city_focus = if self.focus_zone.is_city() {
-                    self.focus_zone
-                } else {
-                    FocusZone::CityBoard
-                };
-                // Optionally split side: City top + Tree drawer bottom when coexist.
-                let (city_area, tree_area) =
-                    if self.show_tree_with_city && self.tree_breadcrumb != "idle" {
-                        let parts = ratatui::layout::Layout::default()
-                            .direction(ratatui::layout::Direction::Vertical)
-                            .constraints([
-                                ratatui::layout::Constraint::Percentage(72),
-                                ratatui::layout::Constraint::Percentage(28),
-                            ])
-                            .split(side);
-                        (parts[0], Some(parts[1]))
-                    } else {
-                        (side, None)
-                    };
-                fleet_panel::render_city_panel(
-                    frame,
-                    city_area,
-                    &self.fleet_panel,
-                    &self.palette,
-                    city_focus,
-                );
-                let mut y = city_area.y.saturating_add(3);
-                for (i, _row) in self.fleet_panel.board_rows.iter().enumerate() {
-                    self.hit_map.push_line(
-                        city_area.x,
-                        y,
-                        city_area.width,
-                        HitTarget::FleetRow { index: i },
-                    );
-                    y = y.saturating_add(1);
-                }
-                if let Some(tree_area) = tree_area {
-                    self.render_tree_panel(frame, tree_area);
-                }
-            } else if self.show_timeline_panel || self.side_mode == SidePanelMode::Timeline {
             } else if self.show_timeline_panel || self.side_mode == SidePanelMode::Timeline {
                 self.render_timeline_panel(frame, side);
             } else {
@@ -5968,8 +4201,7 @@ impl App {
             || self.pending_question.is_some()
             || self.help_overlay.is_some()
             || self.settings.is_some()
-            || self.palette_open
-            || self.city_overlay.is_open();
+            || self.palette_open;
         if overlay {
             widgets::dim_background(frame, area);
             self.hit_map.push(area, HitTarget::ModalDismiss);
@@ -5982,9 +4214,6 @@ impl App {
         }
         if self.pending_question.is_some() {
             self.render_question_prompt(frame, area);
-        }
-        if self.city_overlay.is_open() {
-            self.render_city_overlay(frame, area);
         }
         if let Some(ref ho) = self.help_overlay {
             let entries = help::build_entries(&self.keys);
@@ -6033,23 +4262,6 @@ impl App {
         };
         let deep = self.tree_breadcrumb != "idle";
         let session_short = SessionStore::short_id(&self.session_id).to_string();
-        let attach = self
-            .fleet_attach
-            .as_ref()
-            .map(|a| match a.phase {
-                FleetAttachPhase::Follow => format!("FOLLOW {}", a.seat),
-                FleetAttachPhase::Attaching => format!("ATTACHING {}", a.seat),
-                FleetAttachPhase::Attached => format!("ATTACHED {}", a.seat),
-                FleetAttachPhase::Inspect => format!("INSPECT {}", a.seat),
-            })
-            .or_else(|| {
-                self.fleet_panel
-                    .selected_seat
-                    .as_deref()
-                    .filter(|_| self.show_fleet_panel)
-                    .map(|s| format!("VIEW {s}"))
-            })
-            .unwrap_or_default();
         let mut token_str = if self.token_limit > 0 {
             let pct = self.token_used as f64 / self.token_limit as f64 * 100.0;
             if self.near_limit {
@@ -6086,7 +4298,6 @@ impl App {
             &session_short,
             self.session_title.as_deref(),
             &self.goal_indicator,
-            &attach,
             &token_str,
             &cost_str,
             area.width as usize,
@@ -6129,17 +4340,6 @@ impl App {
             hints = self.keys.hint_line();
         }
 
-        // Refresh beads at most every 2s (was every frame).
-        if self.beads_ready_cache.0.elapsed() >= Duration::from_secs(2) {
-            let n = crate::beads::list_ready(None)
-                .ok()
-                .map(|r| r.len())
-                .unwrap_or(0);
-            self.beads_ready_cache = (Instant::now(), n);
-        }
-        if self.beads_ready_cache.1 > 0 {
-            hints.push_str(&format!(" · beads:{} ready", self.beads_ready_cache.1));
-        }
         if !self.lsp_summary.is_empty() {
             hints.push(' ');
             hints.push_str(&self.lsp_summary);
@@ -6355,7 +4555,7 @@ impl App {
                         .saturating_sub(current_chars)
                         .min(span_chars.len() - i);
                     let segment: String = span_chars[i..i + take].iter().collect();
-                    current_spans.push(Span::styled(segment, span.style.clone()));
+                    current_spans.push(Span::styled(segment, span.style));
                     current_chars += take;
                     i += take;
                     if current_chars >= max_width {
@@ -6376,7 +4576,6 @@ impl App {
         self.chat_rows = area.height as usize;
         let max_width = (area.width as usize).saturating_sub(3).max(20);
         let md = MarkdownStyle::from_palette(&self.palette);
-        let syn = self.theme_name.syntect_theme();
         let mut lines: Vec<Line> = Vec::new();
         self.thinking_targets.clear();
         self.tool_targets.clear();
@@ -6421,7 +4620,7 @@ impl App {
                         let body_style = Style::default()
                             .fg(self.palette.overlay1)
                             .add_modifier(Modifier::ITALIC);
-                        for raw_line in render_markdown(thinking, syn, md) {
+                        for raw_line in render_markdown(thinking, md) {
                             let mut styled_spans = vec![Span::styled(
                                 "│ ".to_string(),
                                 Style::default().fg(self.palette.overlay0),
@@ -6471,7 +4670,7 @@ impl App {
                         Span::styled(format!("{} · collapse", block.name), header_style),
                     ]);
                     lines.extend(Self::wrap_line(&header, max_width));
-                    for raw_line in render_markdown(&block.full, syn, md) {
+                    for raw_line in render_markdown(&block.full, md) {
                         // Keep syntax highlight (don't wipe to muted).
                         let mut styled = vec![Span::styled("  ", Style::default())];
                         if block.is_error {
@@ -6517,13 +4716,13 @@ impl App {
             }
 
             if !msg.text.is_empty() {
-                let rendered = render_markdown(&msg.text, syn, md);
+                let rendered = render_markdown(&msg.text, md);
                 for (i, raw_line) in rendered.into_iter().enumerate() {
                     let mut line = raw_line;
-                    if i == 0 && msg.role == "assistant" {
-                        line.spans
-                            .insert(0, Span::styled(format!("{rail} "), rail_style));
-                    } else if msg.role == "user" || msg.role == "system" {
+                    let wants_rail = (i == 0 && msg.role == "assistant")
+                        || msg.role == "user"
+                        || msg.role == "system";
+                    if wants_rail {
                         line.spans
                             .insert(0, Span::styled(format!("{rail} "), rail_style));
                     }
@@ -6681,7 +4880,7 @@ impl App {
         let picker_height = if empty {
             1
         } else {
-            (self.picker_results.len() as u16).min(10).max(1)
+            (self.picker_results.len() as u16).clamp(1, 10)
         };
         let width = if self.picker_mode == PickerMode::Provider {
             96
@@ -6785,73 +4984,6 @@ impl App {
             ));
         }
         lines
-    }
-
-    fn render_city_overlay(&mut self, frame: &mut Frame, area: Rect) {
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        let (title, border) = match &self.city_overlay {
-            CityOverlay::ConfirmDown { seat } => {
-                let msg = match seat {
-                    Some(s) => format!("Stop worker `{s}`?"),
-                    None => "Stop ALL fleet/crew workers?".into(),
-                };
-                lines.push(Line::from(Span::styled(
-                    msg,
-                    Style::default().fg(self.palette.state_blocked),
-                )));
-                lines.push(Line::from(""));
-                lines.push(widgets::action_hints(
-                    &[("↵", "confirm"), ("esc", "cancel")],
-                    &self.palette,
-                ));
-                ("confirm stop", self.palette.state_blocked)
-            }
-            CityOverlay::ConfirmDelete { target } => {
-                let msg = match target {
-                    CityDeleteTarget::Worker { seat } => {
-                        format!(
-                            "DELETE seat `{seat}`?\nStops process, removes logs/status/profile."
-                        )
-                    }
-                    CityDeleteTarget::Bead { id, title } => {
-                        format!("DELETE bead `{id}`?\n{title}")
-                    }
-                };
-                for line in msg.lines() {
-                    lines.push(Line::from(Span::styled(
-                        line.to_string(),
-                        Style::default().fg(self.palette.state_blocked),
-                    )));
-                }
-                lines.push(Line::from(""));
-                lines.push(widgets::action_hints(
-                    &[("↵", "delete"), ("esc", "cancel")],
-                    &self.palette,
-                ));
-                ("confirm delete", self.palette.state_blocked)
-            }
-            CityOverlay::Assign { bead_id, seat } => {
-                lines.push(Line::from(Span::styled(
-                    format!("Assign bead {bead_id} to seat:"),
-                    Style::default().fg(self.palette.subtext),
-                )));
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    format!("{seat}▌"),
-                    Style::default().fg(self.palette.text),
-                )));
-                lines.push(Line::from(""));
-                lines.push(widgets::action_hints(
-                    &[("↵", "assign"), ("esc", "cancel")],
-                    &self.palette,
-                ));
-                ("marshal assign", self.palette.ok)
-            }
-            CityOverlay::None => return,
-        };
-        let height = (lines.len() as u16 + 2).clamp(6, 14);
-        let rect = widgets::centered_rect(area, 64, height);
-        widgets::render_modal_shell(frame, rect, title, border, &self.palette, lines);
     }
 
     fn render_permission_prompt(&mut self, frame: &mut Frame, area: Rect) {

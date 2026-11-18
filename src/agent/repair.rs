@@ -49,12 +49,6 @@ const NAME_ALIASES: &[(&str, &str)] = &[
     ("subagent", "task"),
     ("agent_query", "task"),
     ("delegate", "task"),
-    ("handoff_notes", "handoff"),
-    ("pass_off", "handoff"),
-    ("beads", "bead"),
-    ("issue", "bead"),
-    ("refuse", "escalate"),
-    ("needs_human", "escalate"),
 ];
 
 /// Heuristic: free/tiny/flash models need stricter harness behavior.
@@ -89,7 +83,7 @@ pub fn weak_model_user_warning(model: &str) -> Option<String> {
     }
     Some(format!(
         "⚠ Weak/free model `{model}`: expect thrash on edits/builds. \
-         Prefer anthropic/claude-sonnet or bedrock opus for real coding. \
+         Prefer anthropic/claude-sonnet for real coding. \
          Weak-model mode (sequential tools + repair) is on."
     ))
 }

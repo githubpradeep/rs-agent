@@ -107,7 +107,7 @@ pub fn discover_agent_commands() -> Vec<ContextFile> {
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
         let path = entry.path();
-        if path.extension().map_or(false, |ext| ext == "md") {
+        if path.extension().is_some_and(|ext| ext == "md") {
             if let Ok(content) = std::fs::read_to_string(&path) {
                 if !content.trim().is_empty() {
                     commands.push(ContextFile { path, content });

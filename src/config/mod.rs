@@ -40,8 +40,6 @@ const USER_CONFIG_TEMPLATE: &str = r#"# rs-agent user config
 # theme = "auto"   # dark | light | forest | auto (COLORFGBG)
 # toast = true
 # toast_sound = false
-# notify = "off"   # off | terminal | system
-# allowed_transitions = ["*"]  # routing handoff allow-list
 
 # [model_aliases]
 # fast = "claude-haiku-4-20250514"
@@ -99,16 +97,11 @@ pub struct Config {
     pub toast: Option<bool>,
     /// Play a short sound with toasts.
     pub toast_sound: Option<bool>,
-    /// External notify when unfocused: off | terminal | system.
-    pub notify: Option<String>,
     /// Remappable single-key actions (see `tui::keys::default_keybindings`).
     pub keybindings: HashMap<String, String>,
     /// MCP stdio servers (`[[mcp.servers]]`).
     #[serde(default)]
     pub mcp: McpConfig,
-    /// Allowed routing handoff transitions (`*` or `from->to`).
-    #[serde(default)]
-    pub allowed_transitions: Vec<String>,
 }
 
 /// MCP client configuration.
@@ -213,9 +206,6 @@ impl Config {
         if other.toast_sound.is_some() {
             self.toast_sound = other.toast_sound;
         }
-        if other.notify.is_some() {
-            self.notify = other.notify;
-        }
         for (k, v) in other.model_aliases {
             self.model_aliases.insert(k, v);
         }
@@ -225,9 +215,6 @@ impl Config {
         if !other.mcp.servers.is_empty() {
             // Project/user overlay replaces the server list when present.
             self.mcp = other.mcp;
-        }
-        if !other.allowed_transitions.is_empty() {
-            self.allowed_transitions = other.allowed_transitions;
         }
     }
 

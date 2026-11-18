@@ -27,7 +27,7 @@ fn select_provider(session_seed: &str) -> &'static str {
     let seed: u64 = session_seed
         .bytes()
         .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-    if seed % 2 == 0 {
+    if seed.is_multiple_of(2) {
         "exa"
     } else {
         "parallel"

@@ -9,6 +9,7 @@ pub struct OpenAIProvider {
     pub base_url: String,
     pub name: String,
     pub key_env: String,
+    pub timeout_secs: u64,
 }
 
 impl Default for OpenAIProvider {
@@ -17,6 +18,7 @@ impl Default for OpenAIProvider {
             base_url: "https://api.openai.com/v1".to_string(),
             name: "openai".to_string(),
             key_env: "OPENAI_API_KEY".to_string(),
+            timeout_secs: 300,
         }
     }
 }
@@ -27,7 +29,13 @@ impl OpenAIProvider {
             base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
             name: name.unwrap_or_else(|| "openai".to_string()),
             key_env: key_env.unwrap_or_else(|| "OPENAI_API_KEY".to_string()),
+            timeout_secs: 300,
         }
+    }
+
+    pub fn with_timeout(mut self, secs: u64) -> Self {
+        self.timeout_secs = if secs == 0 { 300 } else { secs };
+        self
     }
 }
 
@@ -53,11 +61,11 @@ fn convert_message_with_opts(msg: &Message, opts: ConvertOpts) -> serde_json::Va
     match msg.role {
         Role::Tool => {
             let c = &msg.content[0];
-            return serde_json::json!({
+            serde_json::json!({
                 "role": "tool",
                 "tool_call_id": c.tool_use_id.as_deref().unwrap_or(""),
                 "content": c.text.as_deref().unwrap_or("")
-            });
+            })
         }
         Role::Assistant => {
             let text_parts: Vec<&str> = msg
@@ -111,7 +119,7 @@ fn convert_message_with_opts(msg: &Message, opts: ConvertOpts) -> serde_json::Va
             if !reasoning.is_empty() || opts.force_reasoning_content {
                 result["reasoning_content"] = serde_json::json!(reasoning);
             }
-            return result;
+            result
         }
         _ => {
             let text = msg
@@ -121,7 +129,7 @@ fn convert_message_with_opts(msg: &Message, opts: ConvertOpts) -> serde_json::Va
                 .filter_map(|c| c.text.as_deref())
                 .collect::<Vec<_>>()
                 .join("");
-            return serde_json::json!({"role": role_str, "content": text});
+            serde_json::json!({"role": role_str, "content": text})
         }
     }
 }
@@ -185,7 +193,7 @@ impl Provider for OpenAIProvider {
 
     async fn chat(&self, api_key: &str, request: ChatRequest) -> ProviderResult<AssistantMessage> {
         let client = Client::builder()
-            .timeout(Duration::from_secs(300))
+            .timeout(Duration::from_secs(self.timeout_secs))
             .build()
             .map_err(|e| ProviderError::Other(e.to_string()))?;
 
@@ -254,7 +262,7 @@ impl Provider for OpenAIProvider {
 
     async fn chat_stream(&self, api_key: &str, request: ChatRequest) -> ProviderResult<BoxStream> {
         let client = Client::builder()
-            .timeout(Duration::from_secs(300))
+            .timeout(Duration::from_secs(self.timeout_secs))
             .build()
             .map_err(|e| ProviderError::Other(e.to_string()))?;
 
@@ -369,11 +377,11 @@ fn parse_openai_response(data: serde_json::Value) -> ProviderResult<AssistantMes
         .as_object()
         .ok_or_else(|| ProviderError::Parse("no choices".to_string()))?;
 
-    let finish_reason = choice["finish_reason"].as_str().and_then(|r| match r {
-        "stop" => Some(StopReason::EndTurn),
-        "tool_calls" => Some(StopReason::ToolUse),
-        "length" => Some(StopReason::MaxTokens),
-        _ => Some(StopReason::Other(r.to_string())),
+    let finish_reason = choice["finish_reason"].as_str().map(|r| match r {
+        "stop" => StopReason::EndTurn,
+        "tool_calls" => StopReason::ToolUse,
+        "length" => StopReason::MaxTokens,
+        _ => StopReason::Other(r.to_string()),
     });
 
     let message = &choice["message"];

@@ -1,5 +1,6 @@
-//! Built-in model catalog (pi-style), extracted from the reference pi
-//! `*.models.ts` files. Regenerate with `scripts/sync-model-catalog.py`.
+//! Built-in model catalog: curated entries for the providers rs-agent can
+//! drive (anthropic, openai, opencode zen). Hand-maintained JSON at
+//! `data/models.catalog.json`.
 
 use serde::Deserialize;
 use std::sync::OnceLock;
@@ -61,31 +62,23 @@ pub fn find_model(provider: &str, model_id: &str) -> Option<&'static CatalogMode
     })
 }
 
-/// `provider/id` display strings for one provider.
-pub fn displays_for_provider(provider: &str) -> Vec<String> {
-    models_for_provider(provider)
-        .into_iter()
-        .map(|m| format!("{}/{}", m.provider, m.id))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn catalog_is_nonempty() {
-        assert!(all_models().len() > 500, "expected large pi-style catalog");
-        assert!(catalog_providers().len() > 20);
-    }
-
-    #[test]
-    fn openrouter_has_many_models() {
-        assert!(models_for_provider("openrouter").len() > 100);
+        assert!(!all_models().is_empty());
+        assert!(catalog_providers().len() >= 3);
     }
 
     #[test]
     fn anthropic_models_present() {
         assert!(models_for_provider("anthropic").len() > 5);
+    }
+
+    #[test]
+    fn openai_models_present() {
+        assert!(models_for_provider("openai").len() > 5);
     }
 }

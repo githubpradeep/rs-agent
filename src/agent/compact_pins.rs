@@ -152,16 +152,15 @@ pub fn collect_pins_from_messages(messages: &[Message]) -> CompactPins {
                         }
                     }
                 }
-                ContentType::Text => {
+                ContentType::Text
                     // Recover pins from prior compaction system messages
-                    if msg.role == Role::System {
+                    if msg.role == Role::System => {
                         if let Some(t) = c.text.as_deref() {
                             if t.contains(PINNED_MARKER) || t.contains(FAILED_MARKER) {
                                 pins.merge(CompactPins::from_summary_text(t));
                             }
                         }
                     }
-                }
                 _ => {}
             }
         }

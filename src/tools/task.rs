@@ -38,7 +38,6 @@ fn profile_defaults(profile: &str) -> (String, Option<Vec<String>>) {
                 "find".into(),
                 "webfetch".into(),
                 "websearch".into(),
-                "bead".into(),
             ]),
         ),
         "verify" => (
@@ -51,7 +50,6 @@ fn profile_defaults(profile: &str) -> (String, Option<Vec<String>>) {
                 "grep".into(),
                 "ls".into(),
                 "find".into(),
-                "bead".into(),
             ]),
         ),
         "implement" => (
@@ -78,6 +76,7 @@ pub struct TaskTool {
 }
 
 impl TaskTool {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         provider: Arc<dyn Provider>,
         model: String,

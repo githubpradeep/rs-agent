@@ -131,7 +131,7 @@ pub fn track(path: &str) -> Result<(), String> {
     // Persist prior bytes to disk for durability across process if needed.
     let dir = turn_dir(&session, &turn);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let safe_name = key.replace('/', "_").replace('\\', "_");
+    let safe_name = key.replace(['/', '\\'], "_");
     if let Some(ref bytes) = prior_bytes {
         fs::write(dir.join(format!("{safe_name}.bin")), bytes).map_err(|e| e.to_string())?;
     }

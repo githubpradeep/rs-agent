@@ -238,10 +238,8 @@ fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, String> {
     }
 
     let mut out = file_lines.join("\n");
-    if had_trailing_nl || original.is_empty() {
-        if !out.ends_with('\n') && !out.is_empty() {
-            out.push('\n');
-        }
+    if (had_trailing_nl || original.is_empty()) && !out.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
     }
     Ok(out)
 }
@@ -311,12 +309,7 @@ fn find_slice(file: &[String], needle: &[&str]) -> Option<usize> {
     if needle.is_empty() || needle.len() > file.len() {
         return None;
     }
-    for i in 0..=file.len() - needle.len() {
-        if slice_matches(file, i, needle) {
-            return Some(i);
-        }
-    }
-    None
+    (0..=file.len() - needle.len()).find(|&i| slice_matches(file, i, needle))
 }
 
 /// Preview path + would-be diff for permission cards (best-effort).
