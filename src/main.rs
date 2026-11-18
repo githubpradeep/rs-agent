@@ -109,7 +109,8 @@ fn maybe_run_first_launch_wizard(
     eprintln!("(Press Enter to accept defaults; Ctrl-C to cancel)\n");
 
     let provider = {
-        let raw = read_line_prompt("Provider [anthropic/openai/opencode] (anthropic): ")?;
+        let raw =
+            read_line_prompt("Provider [anthropic/openai/opencode/openrouter] (anthropic): ")?;
         if raw.is_empty() {
             "anthropic".to_string()
         } else {

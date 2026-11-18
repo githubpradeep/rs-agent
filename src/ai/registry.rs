@@ -251,7 +251,7 @@ pub fn provider_picker_rows() -> Vec<String> {
         }
     }
     // Ensure core ones always appear even if catalog empty
-    for p in ["anthropic", "openai", "opencode"] {
+    for p in ["anthropic", "openai", "opencode", "openrouter"] {
         if !rows.iter().any(|r| r.starts_with(&format!("{p} "))) && supports_runtime(p) {
             let ready = has_configured_auth(p);
             let mark = if ready { "ready" } else { "needs key" };
@@ -669,7 +669,7 @@ mod tests {
 
     #[test]
     fn core_providers_are_known_and_runnable() {
-        for p in ["anthropic", "openai", "opencode"] {
+        for p in ["anthropic", "openai", "opencode", "openrouter"] {
             assert!(is_known_provider(p), "{p} should be known");
             assert!(supports_runtime(p), "{p} should be runnable");
         }

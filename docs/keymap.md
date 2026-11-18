@@ -64,7 +64,7 @@ Running `/model` with no arguments opens an interactive **cross-provider** picke
 
 - Seeded from the **built-in catalog** for every provider that has credentials
   configured — only models from configured providers are shown
-- Export keys like `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` to unlock those catalog slices
+- Export keys like `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `OPENROUTER_API_KEY` to unlock those catalog slices
 - Background live `fetch_models` merges any extra IDs the API returns
 - **Fuzzy filter** as you type (subsequence + multi-word tokens) — e.g. `sonnet`, `gpt-4o`
 - Selecting an entry switches **provider and model** mid-session when needed (no restart)

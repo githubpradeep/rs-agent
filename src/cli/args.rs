@@ -7,8 +7,8 @@ use clap::Parser;
     about = "Lean terminal coding agent with Deep Context"
 )]
 pub struct Cli {
-    /// Provider: anthropic (recommended), openai, opencode, or any catalog
-    /// OpenAI-compatible provider. Omit to use the last selection from
+    /// Provider: anthropic (recommended), openai, opencode, openrouter, or any
+    /// catalog OpenAI-compatible provider. Omit to use the last selection from
     /// `~/.rs-agent/config.toml` (default: anthropic).
     #[arg(long)]
     pub provider: Option<String>,
