@@ -98,12 +98,15 @@ Secrets do not overwrite env vars that are already set.
 
 Bash/repl/task output goes to a **fixed bottom console** (does not resize the chat column):
 
-- Tabs in the title: `[●bash#1]  ✓bash#2` — **Tab** / ↑↓ to switch
+- The running command is echoed first (`$ cargo test` / `❯ <python preview>`), and streams live
+- Tabs in the title: `[●bash#1]  ✓bash#2` — **Tab** / ↑↓ to switch (any mode while a turn runs)
+- **PgUp/PgDn scrolls the console whenever it is visible — any input mode**
+- Mouse wheel over the console area scrolls it too
 - Lines are clipped to console width; ANSI is stripped
-- Chat only shows a short `↗ console · Exit code: N` chip (expand the tool block for full text)
+- Chat shows a live tool block (`⚙ bash — {"command":…`) that grows while the model streams the call, then collapses to `↗ console · Exit code: N` when it finishes
 - `/output` toggles the console
 
-Esc aborts and kills the bash process group.
+**Esc aborts the running turn from any mode** — Waiting, Normal, or Insert — and kills running bash processes.
 
 ## Global (any mode)
 

@@ -82,6 +82,28 @@ impl App {
                     // Bottom console only — never steal chat width mid-turn.
                     self.show_repl_panel = true;
                 }
+                // Open a live tool block in chat so the command is visible
+                // while the tool runs; input streams in via ToolUseDelta.
+                if self.messages.last().map(|m| m.role.as_str()) != Some("assistant") {
+                    self.messages.push(ChatMessage {
+                        role: "assistant".to_string(),
+                        text: String::new(),
+                        thinking: None,
+                        show_thinking: false,
+                        tool_blocks: Vec::new(),
+                    });
+                }
+                if let Some(last) = self.messages.last_mut() {
+                    last.tool_blocks.push(ToolBlock {
+                        id: Some(id),
+                        name: name.clone(),
+                        preview: "…".to_string(),
+                        full: String::new(),
+                        expanded: false,
+                        is_error: false,
+                    });
+                    self.follow_bottom = true;
+                }
                 self.tool_in_progress = Some((name, Instant::now()));
             }
             AgentEvent::ToolResult { id, name, result } => {
@@ -154,8 +176,31 @@ impl App {
                         tool_blocks: Vec::new(),
                     });
                 }
-                if let Some(last) = self.messages.last_mut() {
+                // Finalize the live block opened at ToolUseStart when present;
+                // otherwise (offline replay, resumed turn) push a fresh block.
+                let live = {
+                    let mut hit = None;
+                    for (mi, msg) in self.messages.iter().enumerate().rev() {
+                        if let Some(bi) = msg
+                            .tool_blocks
+                            .iter()
+                            .rposition(|b| b.id.as_deref() == Some(id.as_str()))
+                        {
+                            hit = Some((mi, bi));
+                            break;
+                        }
+                    }
+                    hit
+                };
+                if let Some((mi, bi)) = live {
+                    let block = &mut self.messages[mi].tool_blocks[bi];
+                    block.preview = preview;
+                    block.full = full.clone();
+                    block.expanded = expand_diag || expand_spill || result.is_error;
+                    block.is_error = result.is_error || expand_diag;
+                } else if let Some(last) = self.messages.last_mut() {
                     last.tool_blocks.push(ToolBlock {
+                        id: Some(id),
                         name,
                         preview,
                         full: full.clone(),
@@ -250,7 +295,32 @@ impl App {
                     self.goal_indicator = format!("◎ /goal {summary}");
                 }
             }
-            AgentEvent::ToolUseDelta { input: _ } => {}
+            AgentEvent::ToolUseDelta { id, input } => {
+                // Stream the tool input (e.g. the bash command) into the live
+                // chat block as it arrives from the model.
+                let mut hit = None;
+                for (mi, msg) in self.messages.iter_mut().enumerate().rev() {
+                    if let Some(bi) = msg
+                        .tool_blocks
+                        .iter()
+                        .rposition(|b| b.id.as_deref() == Some(id.as_str()))
+                    {
+                        hit = Some((mi, bi));
+                        break;
+                    }
+                }
+                if let Some((mi, bi)) = hit {
+                    let block = &mut self.messages[mi].tool_blocks[bi];
+                    if block.preview == "…" {
+                        block.preview.clear();
+                    }
+                    let room = 160usize.saturating_sub(block.preview.chars().count());
+                    if room > 0 {
+                        let add: String = input.chars().take(room).collect();
+                        block.preview.push_str(&add);
+                    }
+                }
+            }
             AgentEvent::ReplOutput { stream, text } => {
                 let cleaned = Self::sanitize_console_text(&text);
                 let mut chunk = String::new();

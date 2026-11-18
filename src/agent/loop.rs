@@ -39,6 +39,7 @@ pub enum AgentEvent {
         name: String,
     },
     ToolUseDelta {
+        id: String,
         input: String,
     },
     ToolResult {
@@ -1584,7 +1585,12 @@ impl AgentLoop {
                                         tool_arg_buf[idx] = input;
                                     }
                                     DeltaType::ToolCallDelta { input } => {
+                                        let id = tool_blocks[idx]
+                                            .as_ref()
+                                            .and_then(|c| c.id.clone())
+                                            .unwrap_or_default();
                                         callback(AgentEvent::ToolUseDelta {
+                                            id,
                                             input: input.clone(),
                                         });
                                         if tool_arg_buf.len() <= idx {
@@ -1966,6 +1972,26 @@ impl AgentLoop {
         Ok(())
     }
 
+    /// Echo the command a tool is about to run into the live console (TUI only —
+    /// a no-op without an installed sink). `bash` shows the command; `repl`
+    /// shows a preview of the Python cell.
+    fn echo_tool_start(name: &str, args: &serde_json::Value) {
+        let line = match name {
+            "bash" => args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .map(|c| format!("$ {c}\n")),
+            "repl" => args.get("context").and_then(|v| v.as_str()).map(|c| {
+                let prev: String = c.chars().take(120).collect();
+                format!("❯ {prev}…\n")
+            }),
+            _ => None,
+        };
+        if let Some(line) = line {
+            crate::tools::output_sink::emit_tool_output(name, "cmd", &line);
+        }
+    }
+
     async fn execute_single_tool(
         &self,
         tool_call_id: &str,
@@ -2001,6 +2027,8 @@ impl AgentLoop {
         if let Err(msg) = self.hooks.before_tool(&resolved_name, &args.to_string()) {
             return ToolExecuteResult::error(msg);
         }
+
+        Self::echo_tool_start(&resolved_name, &args);
 
         let fp = tool_call_fingerprint(&resolved_name, &args);
         if let Ok(mut recent) = self.recent_tool_fps.lock() {

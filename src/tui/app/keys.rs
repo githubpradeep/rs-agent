@@ -289,6 +289,20 @@ impl App {
             return;
         }
         match key.code {
+            // Esc aborts the running turn from any mode (the standard agent-TUI
+            // behavior; without this, Normal/Insert Esc does nothing mid-turn).
+            KeyCode::Esc if self.agent_turn_active => {
+                self.abort_flag.abort();
+                let _ = self.command_tx.send(AppCommand::Abort);
+                self.status = "aborting...".to_string();
+            }
+            // PageUp/PageDown scroll the console whenever it is visible.
+            KeyCode::PageUp if self.show_repl_panel => {
+                self.console_scroll = self.console_scroll.saturating_add(10);
+            }
+            KeyCode::PageDown if self.show_repl_panel => {
+                self.console_scroll = self.console_scroll.saturating_sub(10);
+            }
             KeyCode::Up => {
                 self.follow_bottom = false;
                 self.scroll_offset = self.scroll_offset.saturating_sub(1);
@@ -413,8 +427,20 @@ impl App {
                 self.input.pop();
             }
             KeyCode::Esc => {
-                self.picker_active = false;
-                self.input_mode = InputMode::Normal;
+                if self.agent_turn_active {
+                    self.abort_flag.abort();
+                    let _ = self.command_tx.send(AppCommand::Abort);
+                    self.status = "aborting...".to_string();
+                } else {
+                    self.picker_active = false;
+                    self.input_mode = InputMode::Normal;
+                }
+            }
+            KeyCode::PageUp if self.show_repl_panel => {
+                self.console_scroll = self.console_scroll.saturating_add(10);
+            }
+            KeyCode::PageDown if self.show_repl_panel => {
+                self.console_scroll = self.console_scroll.saturating_sub(10);
             }
             _ => {}
         }

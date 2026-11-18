@@ -68,6 +68,8 @@ struct ChatMessage {
 /// beneath its owning chat message.
 #[derive(Clone)]
 struct ToolBlock {
+    /// Streaming tool-call id — lets the TUI fill a live block as input arrives.
+    id: Option<String>,
     name: String,
     preview: String,
     full: String,
