@@ -203,7 +203,7 @@ Full keymap: [`docs/keymap.md`](docs/keymap.md).
 |----------|-----------|----------|-------|
 | Anthropic | `anthropic` | `ANTHROPIC_API_KEY` | Recommended. |
 | OpenAI | `openai` | `OPENAI_API_KEY` | Any OpenAI-compatible endpoint via `--base-url`. |
-| OpenRouter | `openrouter` | `OPENROUTER_API_KEY` | Aggregator — a curated slice of frontier models (`openrouter/<id>`, incl. `openrouter/auto`). |
+| OpenRouter | `openrouter` | `OPENROUTER_API_KEY` | Aggregator — curated frontier models (`openrouter/<id>`, incl. `openrouter/auto`). Sends prompt-caching markers + sticky `session_id`; cache hits show in the header chip. |
 
 Curated catalog in [`data/models.catalog.json`](data/models.catalog.json).
 `/model` shows models for providers that have credentials. Mid-session:

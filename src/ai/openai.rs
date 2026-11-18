@@ -161,6 +161,63 @@ fn reasoning_effort_from_budget(budget: u32) -> &'static str {
     }
 }
 
+/// Stable per-process id for OpenRouter sticky routing (cache affinity).
+/// OpenRouter pins same-`session_id` requests to one provider endpoint so
+/// the prompt cache stays warm across the turns of a session.
+fn openrouter_session_id() -> String {
+    use std::sync::OnceLock;
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| format!("rs-agent-{}", uuid::Uuid::new_v4()))
+        .clone()
+}
+
+/// OpenRouter prompt caching (openrouter.ai/docs/features/prompt-caching).
+///
+/// - `session_id` enables sticky provider routing: cache-hits keep serving
+///   from the same endpoint.
+/// - `cache_control` breakpoints on the system block and on the final
+///   content block mark the stable prefix (tools + system + prior turns).
+///   OpenRouter translates the markers for whichever provider is routed to
+///   (Anthropic `cache_control`, OpenAI `prompt_cache_breakpoint`, Google).
+///   A block-array content shape is required to carry the marker.
+fn apply_openrouter_caching(name: &str, body: &mut serde_json::Value) {
+    if name != "openrouter" {
+        return;
+    }
+    body["session_id"] = serde_json::json!(openrouter_session_id());
+    let ephemeral = serde_json::json!({"type": "ephemeral"});
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    // System breakpoint: covers the tools + system prefix.
+    if let Some(sys) = messages.first_mut() {
+        if sys["role"] == "system" {
+            if let Some(text) = sys.get("content").and_then(|c| c.as_str()) {
+                sys["content"] = serde_json::json!([{
+                    "type": "text",
+                    "text": text,
+                    "cache_control": ephemeral.clone(),
+                }]);
+            }
+        }
+    }
+    // End-of-conversation breakpoint: covers the full message prefix.
+    for msg in messages.iter_mut().rev() {
+        let Some(text) = msg.get("content").and_then(|c| c.as_str()) else {
+            continue;
+        };
+        if text.is_empty() {
+            continue;
+        }
+        msg["content"] = serde_json::json!([{
+            "type": "text",
+            "text": text,
+            "cache_control": ephemeral.clone(),
+        }]);
+        break;
+    }
+}
+
 /// Apply thinking / temperature fields shared by chat and chat_stream bodies.
 fn apply_openai_sampling(body: &mut serde_json::Value, request: &ChatRequest) {
     if let Some(thinking) = &request.thinking {
@@ -218,6 +275,7 @@ impl Provider for OpenAIProvider {
                 .unwrap()
                 .insert(0, serde_json::json!({"role": "system", "content": system}));
         }
+        apply_openrouter_caching(&self.name, &mut body);
 
         let resp = client
             .post(format!("{}/chat/completions", self.base_url))
@@ -288,6 +346,7 @@ impl Provider for OpenAIProvider {
                 .unwrap()
                 .insert(0, serde_json::json!({"role": "system", "content": system}));
         }
+        apply_openrouter_caching(&self.name, &mut body);
 
         let response = client
             .post(format!("{}/chat/completions", self.base_url))
@@ -454,7 +513,10 @@ fn parse_openai_response(data: serde_json::Value) -> ProviderResult<AssistantMes
         cache_read_input_tokens: u["prompt_tokens_details"]["cached_tokens"]
             .as_u64()
             .map(|v| v as u32),
-        cache_creation_input_tokens: None,
+        // OpenRouter reports cache writes here; upstream OpenAI does not send it.
+        cache_creation_input_tokens: u["prompt_tokens_details"]["cache_write_tokens"]
+            .as_u64()
+            .map(|v| v as u32),
     });
 
     Ok(AssistantMessage {
@@ -651,5 +713,73 @@ mod tests {
         assert!(v["content"].is_null());
         assert!(v["tool_calls"].is_array());
         assert_eq!(v["reasoning_content"], "need bash");
+    }
+}
+
+#[cfg(test)]
+mod openrouter_caching_tests {
+    use super::*;
+
+    fn body_with(system: Option<&str>) -> serde_json::Value {
+        let mut messages = vec![
+            serde_json::json!({"role": "user", "content": "first question"}),
+            serde_json::json!({"role": "assistant", "content": ""}),
+            serde_json::json!({"role": "user", "content": "follow-up"}),
+        ];
+        if let Some(sys) = system {
+            messages.insert(0, serde_json::json!({"role": "system", "content": sys}));
+        }
+        serde_json::json!({
+            "model": "anthropic/claude-sonnet-4.5",
+            "messages": messages,
+            "tools": [{"type": "function", "function": {"name": "bash"}}],
+        })
+    }
+
+    fn stamped(block: &serde_json::Value) -> bool {
+        block["cache_control"]["type"] == "ephemeral"
+    }
+
+    #[test]
+    fn openrouter_stamps_system_and_last_content_block() {
+        let mut body = body_with(Some("You are a coding agent."));
+        apply_openrouter_caching("openrouter", &mut body);
+
+        assert!(
+            body["session_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("rs-agent-"),
+            "sticky-routing session id missing"
+        );
+        let messages = body["messages"].as_array().unwrap();
+        // System block carries the tools+system prefix breakpoint.
+        let sys_blocks = messages[0]["content"].as_array().unwrap();
+        assert_eq!(sys_blocks.len(), 1);
+        assert!(stamped(&sys_blocks[0]));
+        // Assistant with empty content is skipped; the LAST non-empty message
+        // gets the end-of-conversation breakpoint.
+        assert!(messages[2]["content"].is_string());
+        assert!(messages[3]["content"].is_array());
+        let last_blocks = messages[3]["content"].as_array().unwrap();
+        assert_eq!(last_blocks.len(), 1);
+        assert!(stamped(&last_blocks[0]));
+    }
+
+    #[test]
+    fn openrouter_without_system_still_stamps_tail() {
+        let mut body = body_with(None);
+        apply_openrouter_caching("openrouter", &mut body);
+        let messages = body["messages"].as_array().unwrap();
+        assert!(messages[2]["content"].is_array());
+        assert!(stamped(&messages[2]["content"][0]));
+    }
+
+    #[test]
+    fn non_openrouter_providers_are_untouched() {
+        let mut body = body_with(Some("You are a coding agent."));
+        let before = body.clone();
+        apply_openrouter_caching("openai", &mut body);
+        assert_eq!(body, before);
     }
 }
