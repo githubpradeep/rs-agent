@@ -1,40 +1,50 @@
 # rs-agent
 
-**A lean terminal coding agent with Deep Context.**  
-Large logs and repos stay in a persistent Python REPL — the agent peeks,
-slices, and runs `llm_query` / `agent_query` as a call **tree**, so huge
-context never blows the model window.
+**A nimble, minimal terminal coding agent.**  
+One Rust binary. Your shell. Your models. No daemons, no control planes, no
+bloat — just a focused agent loop with Deep Context when files get huge.
 
-**One line:** one binary, your shell, your provider — and big context that
-fits.
+**One line:** OpenRouter (or Anthropic / OpenAI) + a lean TUI that stays out of
+the way.
 
-## Why this, not another chat wrapper
+## Why this
 
+- **Nimble by design.** Curated tool catalog (read / edit / write / bash / grep /
+  find / web / repl / task). Permission prompts, sessions, skills. No city
+  fleets, no factory layers — a single agent that does the job.
+- **OpenRouter-first.** One key unlocks Claude, GPT, Gemini, DeepSeek, Qwen,
+  Grok, and more. Prompt-caching markers + sticky `session_id` keep cache warm;
+  hits show in the header chip. `openrouter/auto` routes for you.
 - **Deep Context when the file is too big.** Large docs load into a persistent
-  `python3` REPL once. The agent reads slices, then `llm_query(prompt)` /
-  `agent_query(task)` run as a **tree** — parents see summaries, not subtree
-  dumps. Huge `read`s auto-escalate (`[rlm_escalate]` → `repl`). Status shows
-  `[D]`; `/tree` visualizes the live call tree.
+  `python3` REPL once. The agent peeks and slices; `llm_query` / `agent_query`
+  run as a **tree** so parents see summaries, not dumps. Huge `read`s
+  auto-escalate (`[rlm_escalate]` → `repl`). Status shows `[D]`; `/tree`
+  visualizes the live call tree.
   Inspired by [Recursive Language Models](https://arxiv.org/abs/2512.24601).
-- **The daily loop you already know.** read / edit / write / bash / grep / find /
-  web, permission prompts, sessions, skills. Drop markdown in `skills/` or
-  `~/.rs-agent/skills/` ([`docs/skills.md`](docs/skills.md)).
-- **Lean by design.** Two provider clients (Anthropic + OpenAI-compatible),
-  a curated catalog, no daemons, no control planes, no C-library highlighting
-  deps. Harness exit gates and crash recovery keep long turns honest.
+- **Daily loop you already know.** Drop markdown in `skills/` or
+  `~/.rs-agent/skills/` ([`docs/skills.md`](docs/skills.md)). Optional MCP
+  servers and LSP diagnostics when you want them.
 
 **Trust:** `repl` is unsandboxed `python3`. Read [`docs/trust.md`](docs/trust.md)
 before running with `-a`.
 
-## Quickstart (Anthropic)
+## Quickstart (OpenRouter)
 
-Requirements: a stable Rust toolchain and `python3` on `PATH` (Deep Context `repl`).
+Requirements: a stable Rust toolchain and `python3` on `PATH` (Deep Context
+`repl`).
 
 ```sh
 git clone https://github.com/githubpradeep/rs-agent.git
 cd rs-agent
-export ANTHROPIC_API_KEY=sk-ant-...
-cargo run --release -- --provider anthropic
+export OPENROUTER_API_KEY=sk-or-...
+cargo run --release -- --provider openrouter
+```
+
+Pick a model mid-session with `/model`, or pin one up front:
+
+```sh
+cargo run --release -- --provider openrouter --model anthropic/claude-sonnet-4.5
+cargo run --release -- --provider openrouter --model openrouter/auto
 ```
 
 Prebuilt install (macOS Apple Silicon / Linux x86_64) **after a `v*` GitHub
@@ -50,16 +60,44 @@ that curl line will 404 — use source.
 One-shot / scripting:
 
 ```sh
-cargo run --release -- -p "summarize example/rlm_long_doc.md via repl"
+cargo run --release -- --provider openrouter -p "summarize example/rlm_long_doc.md via repl"
 cargo run --release -- --mode json -p "list files with ls"
 ```
 
 Deep Context demo (realistic ~180KB outage log):
 
 ```sh
-./scripts/demo-deep-context.sh --provider anthropic
+./scripts/demo-deep-context.sh --provider openrouter
 # Interactive (best for recording): ./scripts/demo-deep-context.sh --tui
 ```
+
+### Other providers
+
+```sh
+export ANTHROPIC_API_KEY=sk-ant-...
+cargo run --release -- --provider anthropic
+
+export OPENAI_API_KEY=sk-...
+cargo run --release -- --provider openai
+# Any OpenAI-compatible endpoint:
+cargo run --release -- --provider openai --base-url https://your-endpoint/v1
+```
+
+## Providers
+
+| Provider | Flag / id | Auth env | Notes |
+|----------|-----------|----------|-------|
+| **OpenRouter** | `openrouter` | `OPENROUTER_API_KEY` | **Recommended.** One key → many models (`anthropic/…`, `openai/…`, `google/…`, `deepseek/…`, `openrouter/auto`, free tiers). Prompt-caching breakpoints + sticky `session_id`; cache hits in the header chip. |
+| Anthropic | `anthropic` | `ANTHROPIC_API_KEY` | Native Messages API + extended thinking. |
+| OpenAI | `openai` | `OPENAI_API_KEY` | Any OpenAI-compatible endpoint via `--base-url`. |
+
+Curated catalog in [`data/models.catalog.json`](data/models.catalog.json).
+`/model` shows models for providers that have credentials. Mid-session:
+`/model`, `Ctrl-P`, `/provider` / `/login`. Last selection is saved to
+`~/.rs-agent/config.toml`.
+
+Paste a key without leaving the TUI: `/login` → writes
+`~/.rs-agent/secrets.toml`.
 
 ## Configuration
 
@@ -68,23 +106,24 @@ Layered config: `~/.rs-agent/config.toml` (user) plus `.rs-agent/settings.toml` 
 
 ```toml
 # ~/.rs-agent/config.toml
-provider = "anthropic"
-model = "claude-sonnet-4-20250514"
+provider = "openrouter"
+model = "anthropic/claude-sonnet-4.5"
 approve = true          # YOLO — see docs/trust.md
 auto_mode = false
 rlm_depth = 2
 rlm_escalate_chars = 10000   # auto Deep Context escalate on huge reads
-thinking_budget = 10000
+thinking_budget = 10000      # Anthropic extended thinking; ignored elsewhere
 max_iterations = 99999
 timeout = 300
-auto_goal = true             # task-like requests keep working until verified done (/goal clear to disable)
-verify_cmd = "cargo test"    # harness runs this before letting the agent stop; failure re-injects
-disable_mouse = false   # true = native text selection; Shift+drag also works with mouse on
-theme = "dark"          # dark | light | forest
+auto_goal = true             # task-like requests keep working until verified (/goal clear to disable)
+verify_cmd = "cargo test"    # harness runs this before letting the agent stop
+disable_mouse = false        # true = native text selection; Shift+drag also works with mouse on
+theme = "dark"               # dark | light | forest | auto
 
 [model_aliases]
-fast = "claude-haiku-4-20250514"
-smart = "claude-opus-4-20250514"
+fast = "google/gemini-3.5-flash"
+smart = "anthropic/claude-opus-4.6"
+auto = "openrouter/auto"
 
 [keybindings]
 # Remap single-key actions (defaults shown):
@@ -97,6 +136,12 @@ smart = "claude-opus-4-20250514"
 # perm_once = "a"
 # perm_always = "t"
 # perm_deny = "d"
+
+# Optional MCP stdio servers — see docs/mcp.md
+# [[mcp.servers]]
+# name = "filesystem"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 ```
 
 State under `~/.rs-agent/`:
@@ -128,11 +173,12 @@ A skill is a markdown file (optionally with YAML frontmatter: `name`,
 ```
 
 Authoring: [`docs/skills.md`](docs/skills.md). Hooks: [`docs/hooks.md`](docs/hooks.md).
+MCP: [`docs/mcp.md`](docs/mcp.md). LSP: [`docs/lsp.md`](docs/lsp.md).
 
 ## TUI
 
 ```
-cargo run --release
+cargo run --release -- --provider openrouter
 ```
 
 | Key | Mode | Action |
@@ -175,15 +221,15 @@ Full keymap: [`docs/keymap.md`](docs/keymap.md).
 
 | Flag | Description |
 |------|-------------|
-| `--provider` | `anthropic` (recommended), `openai`, `openrouter` |
-| `--model` | Model override |
+| `--provider` | `openrouter` (recommended), `anthropic`, `openai` |
+| `--model` | Model override (e.g. `anthropic/claude-sonnet-4.5`, `openrouter/auto`) |
 | `--rlm-depth` | Max Deep Context recursion depth (default 2) |
 | `--rlm-escalate-chars` | Auto Deep Context escalate threshold (default 10000) |
 | `--thinking-budget` | Extended-thinking token budget (Anthropic); `0` disables |
 | `--mode` | `-p` output: `text` (default) or `json` |
 | `-p, --prompt` | One-shot prompt (non-interactive) |
 | `-a, --approve` | **YOLO.** Skip permission prompts. See [`docs/trust.md`](docs/trust.md). |
-| `--auto-mode` | Auto-approve read-only tools only |
+| `--auto-mode` | Auto-approve reads + file edits; still prompt for bash/repl |
 | `-r, --resume <id>` | Resume a saved session |
 | `--list-sessions` | List saved sessions and exit |
 | `--list-models` | List models for the provider and exit |
@@ -196,19 +242,6 @@ Full keymap: [`docs/keymap.md`](docs/keymap.md).
 | `--timeout` | Request timeout in seconds (default 300) |
 
 `cargo run --release -- --help` for the current flag set.
-
-## Providers
-
-| Provider | Flag / id | Auth env | Notes |
-|----------|-----------|----------|-------|
-| Anthropic | `anthropic` | `ANTHROPIC_API_KEY` | Recommended. |
-| OpenAI | `openai` | `OPENAI_API_KEY` | Any OpenAI-compatible endpoint via `--base-url`. |
-| OpenRouter | `openrouter` | `OPENROUTER_API_KEY` | Aggregator — curated frontier models (`openrouter/<id>`, incl. `openrouter/auto`). Sends prompt-caching markers + sticky `session_id`; cache hits show in the header chip. |
-
-Curated catalog in [`data/models.catalog.json`](data/models.catalog.json).
-`/model` shows models for providers that have credentials. Mid-session:
-`/model`, `Ctrl-P`, `/provider` / `/login`. Last selection is saved to
-`~/.rs-agent/config.toml`.
 
 ## Deep Context workflow
 
@@ -246,7 +279,7 @@ User → Root AgentLoop → tools (incl. repl)
 escalate, webfetch). Run one:
 
 ```sh
-./scripts/eval-agent.sh --provider anthropic --only rlm_escalate
+./scripts/eval-agent.sh --provider openrouter --only rlm_escalate
 ```
 
 ## `reference/`
